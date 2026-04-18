@@ -29,6 +29,7 @@ from optimizers import StableAdamW
 import warnings
 import copy
 import logging
+import time
 from sklearn.metrics import roc_auc_score, average_precision_score
 import itertools
 from warmup_diag import load_injected_manifest, parse_warmup_milestones, run_one_warmup_diagnosis
@@ -75,6 +76,8 @@ def train(item_list):
     num_workers = 4
     image_size = 448
     crop_size = 392
+    train_start_time = time.time()
+    final_eval_summary = None
 
     # image_size = 448
     # crop_size = 448
@@ -271,10 +274,27 @@ def train(item_list):
                         '{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
                             item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
 
+                mean_auroc_sp = np.mean(auroc_sp_list)
+                mean_ap_sp = np.mean(ap_sp_list)
+                mean_f1_sp = np.mean(f1_sp_list)
+                mean_auroc_px = np.mean(auroc_px_list)
+                mean_ap_px = np.mean(ap_px_list)
+                mean_f1_px = np.mean(f1_px_list)
+                mean_aupro_px = np.mean(aupro_px_list)
+
                 print_fn(
                     'Mean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
-                        np.mean(auroc_sp_list), np.mean(ap_sp_list), np.mean(f1_sp_list),
-                        np.mean(auroc_px_list), np.mean(ap_px_list), np.mean(f1_px_list), np.mean(aupro_px_list)))
+                        mean_auroc_sp, mean_ap_sp, mean_f1_sp,
+                        mean_auroc_px, mean_ap_px, mean_f1_px, mean_aupro_px))
+                final_eval_summary = {
+                    'I-AUROC': mean_auroc_sp,
+                    'I-AP': mean_ap_sp,
+                    'I-F1': mean_f1_sp,
+                    'P-AUROC': mean_auroc_px,
+                    'P-AP': mean_ap_px,
+                    'P-F1': mean_f1_px,
+                    'P-AUPRO': mean_aupro_px,
+                }
 
                 model.train()
 
@@ -282,6 +302,29 @@ def train(item_list):
             if it == total_iters:
                 break
         print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
+
+    total_time = time.time() - train_start_time
+    time_per_iter = total_time / total_iters
+    iters_per_sec = total_iters / total_time
+    samples_per_sec = batch_size / time_per_iter
+
+    print_fn('Training finished. Total time: {:.2f}s ({:.2f} min), {:.4f} s/iter'.format(
+        total_time, total_time / 60.0, time_per_iter))
+    if final_eval_summary is not None:
+        print_fn('I-AUROC      {:.2f}'.format(final_eval_summary['I-AUROC']))
+        print_fn('I-AP         {:.2f}'.format(final_eval_summary['I-AP']))
+        print_fn('I-F1         {:.2f}'.format(final_eval_summary['I-F1']))
+        print_fn('P-AUROC      {:.2f}'.format(final_eval_summary['P-AUROC']))
+        print_fn('P-AP         {:.2f}'.format(final_eval_summary['P-AP']))
+        print_fn('P-F1         {:.2f}'.format(final_eval_summary['P-F1']))
+        print_fn('P-AUPRO      {:.2f}'.format(final_eval_summary['P-AUPRO']))
+    print_fn('Training efficiency:')
+    print_fn('  total_time_s      {:.2f}'.format(total_time))
+    print_fn('  total_iters       {}'.format(total_iters))
+    print_fn('  batch_size        {}'.format(batch_size))
+    print_fn('  time_per_iter_s   {:.4f}'.format(time_per_iter))
+    print_fn('  iters_per_sec     {:.4f}'.format(iters_per_sec))
+    print_fn('  samples_per_sec   {:.2f}'.format(samples_per_sec))
 
     # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
 
