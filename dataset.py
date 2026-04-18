@@ -48,15 +48,13 @@ def get_strong_transforms(size, isize, mean_train=None, std_train=None):
 
 
 class TrainDiagDataset(Dataset):
-    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0, contaminated_paths=None,
-                 tail_bucket_map=None):
+    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0, contaminated_paths=None):
         self.dataset = dataset
         self.data_root = os.path.abspath(data_root)
         self.class_name = class_name
         self.class_id = class_id
         self.sample_offset = sample_offset
         self.contaminated_paths = contaminated_paths
-        self.tail_bucket_map = tail_bucket_map or {}
 
     def __len__(self):
         return len(self.dataset)
@@ -76,7 +74,6 @@ class TrainDiagDataset(Dataset):
             'class_name': self.class_name,
             'class_id': self.class_id,
             'is_contaminated': -1 if is_contaminated is None else is_contaminated,
-            'tail_bucket': self.tail_bucket_map.get(rel_path, ''),
         }
         return image, label, meta
 

@@ -138,19 +138,6 @@ def compute_warmup_diagnostics(df):
             'train_noise_ap': None,
         })
 
-    bucket_metrics = {}
-    if 'tail_bucket' in df.columns and (df['tail_bucket'].fillna('') != '').any():
-        bucket_df_source = df[df['tail_bucket'].fillna('') != '']
-        for bucket, bucket_df in bucket_df_source.groupby('tail_bucket'):
-            bucket_metrics[str(bucket)] = {
-                'num_samples': int(len(bucket_df)),
-                'train_noise_auroc': _safe_float(_safe_binary_metric(roc_auc_score, bucket_df['is_contaminated'], bucket_df['image_score'])) if 'is_contaminated' in bucket_df.columns else None,
-                'train_noise_ap': _safe_float(_safe_binary_metric(average_precision_score, bucket_df['is_contaminated'], bucket_df['image_score'])) if 'is_contaminated' in bucket_df.columns else None,
-                'clean_mean_score': _safe_float(_safe_mean(bucket_df.loc[bucket_df['is_contaminated'] == 0, 'image_score'])) if 'is_contaminated' in bucket_df.columns else None,
-                'noisy_mean_score': _safe_float(_safe_mean(bucket_df.loc[bucket_df['is_contaminated'] == 1, 'image_score'])) if 'is_contaminated' in bucket_df.columns else None,
-            }
-    summary['bucket_metrics'] = bucket_metrics
-
     class_metrics = {}
     if 'class_name' in df.columns:
         for class_name, class_df in df.groupby('class_name'):
@@ -185,36 +172,6 @@ def plot_global_hist(df, save_path):
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
-    return True
-
-
-def plot_bucket_hist(df, save_path):
-    if 'tail_bucket' not in df.columns or not (df['tail_bucket'].fillna('') != '').any():
-        return False
-
-    buckets = sorted(df.loc[df['tail_bucket'].fillna('') != '', 'tail_bucket'].unique())
-    if len(buckets) == 0:
-        return False
-
-    fig, axes = plt.subplots(len(buckets), 1, figsize=(8, max(4, 3 * len(buckets))), squeeze=False)
-    for axis, bucket in zip(axes.flatten(), buckets):
-        bucket_df = df[df['tail_bucket'] == bucket]
-        if 'is_contaminated' in bucket_df.columns and bucket_df['is_contaminated'].notna().any():
-            clean_scores = bucket_df.loc[bucket_df['is_contaminated'] == 0, 'image_score']
-            noisy_scores = bucket_df.loc[bucket_df['is_contaminated'] == 1, 'image_score']
-            if len(clean_scores) > 0:
-                axis.hist(clean_scores, bins=20, alpha=0.6, label='clean')
-            if len(noisy_scores) > 0:
-                axis.hist(noisy_scores, bins=20, alpha=0.6, label='noisy')
-            axis.legend()
-        else:
-            axis.hist(bucket_df['image_score'], bins=20, alpha=0.8)
-        axis.set_title(str(bucket))
-        axis.set_xlabel('image_score')
-        axis.set_ylabel('count')
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close(fig)
     return True
 
 
@@ -274,7 +231,6 @@ def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, prin
         json.dump(_make_json_safe(summary), file, indent=2)
 
     plot_global_hist(df, os.path.join(iter_dir, 'hist_global.png'))
-    plot_bucket_hist(df, os.path.join(iter_dir, 'hist_buckets.png'))
     plot_class_gap(df, os.path.join(iter_dir, 'class_gap.png'))
 
     if print_fn is not None:

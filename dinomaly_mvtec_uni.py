@@ -301,6 +301,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_milestones', type=str, default='500,1000,2000,4000')
     parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
     parser.add_argument('--diag_manifest_path', type=str, default=None)
+    parser.add_argument('--gpus', type=int, default=0)
     parser.add_argument('--diag_batch_size', type=int, default=16)
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
@@ -316,7 +317,7 @@ if __name__ == '__main__':
     if not os.path.isabs(args.diag_save_dir):
         args.diag_save_dir = os.path.join(args.save_dir, args.save_name, args.diag_save_dir)
 
-    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:{}'.format(args.gpu_id) if torch.cuda.is_available() else 'cpu'
     print_fn(device)
 
     train(item_list)
