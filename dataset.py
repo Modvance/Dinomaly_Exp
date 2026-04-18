@@ -9,6 +9,7 @@ from torchvision.datasets import MNIST, CIFAR10, FashionMNIST, ImageFolder
 import numpy as np
 import torch.multiprocessing
 import json
+from torch.utils.data import Dataset
 
 # import imgaug.augmenters as iaa
 # from perlin import rand_perlin_2d_np
@@ -44,6 +45,40 @@ def get_strong_transforms(size, isize, mean_train=None, std_train=None):
         transforms.Normalize(mean=mean_train,
                              std=std_train)])
     return data_transforms
+
+
+class TrainDiagDataset(Dataset):
+    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0, contaminated_paths=None,
+                 tail_bucket_map=None):
+        self.dataset = dataset
+        self.data_root = os.path.abspath(data_root)
+        self.class_name = class_name
+        self.class_id = class_id
+        self.sample_offset = sample_offset
+        self.contaminated_paths = contaminated_paths
+        self.tail_bucket_map = tail_bucket_map or {}
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        img_path = self.dataset.samples[idx][0]
+        rel_path = os.path.relpath(img_path, self.data_root).replace('\\', '/')
+
+        is_contaminated = None
+        if self.contaminated_paths is not None:
+            is_contaminated = int(rel_path in self.contaminated_paths)
+
+        meta = {
+            'sample_idx': self.sample_offset + idx,
+            'img_path': img_path,
+            'class_name': self.class_name,
+            'class_id': self.class_id,
+            'is_contaminated': -1 if is_contaminated is None else is_contaminated,
+            'tail_bucket': self.tail_bucket_map.get(rel_path, ''),
+        }
+        return image, label, meta
 
 
 class MVTecDataset(torch.utils.data.Dataset):

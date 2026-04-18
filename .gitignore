@@ -2,3 +2,5 @@ backbones/
 *.pth
 __pycache__/
 saved_results/
+*.md
+!README.md

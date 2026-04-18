@@ -5,7 +5,7 @@
 
 import torch
 import torch.nn as nn
-from dataset import get_data_transforms, get_strong_transforms
+from dataset import get_data_transforms, get_strong_transforms, TrainDiagDataset
 from torchvision.datasets import ImageFolder
 import numpy as np
 import random
@@ -31,6 +31,7 @@ import copy
 import logging
 from sklearn.metrics import roc_auc_score, average_precision_score
 import itertools
+from warmup_diag import load_injected_manifest, parse_warmup_milestones, run_one_warmup_diagnosis
 
 warnings.filterwarnings("ignore")
 
@@ -71,6 +72,7 @@ def train(item_list):
 
     total_iters = 10000
     batch_size = 16
+    num_workers = 4
     image_size = 448
     crop_size = 392
 
@@ -81,6 +83,16 @@ def train(item_list):
 
     train_data_list = []
     test_data_list = []
+    train_eval_data_list = []
+    sample_offset = 0
+    contaminated_paths, manifest_path = (None, None)
+    if args.warmup_diag:
+        contaminated_paths, manifest_path = load_injected_manifest(args.data_path, os.path.dirname(__file__))
+        if contaminated_paths is None:
+            print_fn('warmup diagnosis: inject_defects manifest not found, contamination-aware metrics will be skipped.')
+        else:
+            print_fn('warmup diagnosis: loaded contamination manifest {}.'.format(manifest_path))
+
     for i, item in enumerate(item_list):
         train_path = os.path.join(args.data_path, item, 'train')
         test_path = os.path.join(args.data_path, item)
@@ -94,9 +106,32 @@ def train(item_list):
         train_data_list.append(train_data)
         test_data_list.append(test_data)
 
+        if args.warmup_diag:
+            train_eval_data = TrainDiagDataset(
+                train_data,
+                data_root=args.data_path,
+                class_name=item,
+                class_id=i,
+                sample_offset=sample_offset,
+                contaminated_paths=contaminated_paths,
+            )
+            train_eval_data_list.append(train_eval_data)
+            sample_offset += len(train_eval_data)
+
     train_data = ConcatDataset(train_data_list)
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=4,
+    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=num_workers,
                                                    drop_last=True)
+
+    train_eval_dataloader = None
+    if args.warmup_diag:
+        train_eval_data = ConcatDataset(train_eval_data_list)
+        train_eval_dataloader = torch.utils.data.DataLoader(
+            train_eval_data,
+            batch_size=args.diag_batch_size,
+            shuffle=False,
+            num_workers=args.diag_num_workers,
+            drop_last=False,
+        )
     # test_dataloader_list = [torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=4)
     #                         for test_data in test_data_list]
 
@@ -194,7 +229,21 @@ def train(item_list):
             loss_list.append(loss.item())
             lr_scheduler.step()
 
-            if (it + 1) % 5000 == 0:
+            current_iter = it + 1
+            if args.warmup_diag and current_iter in args.warmup_milestones:
+                run_one_warmup_diagnosis(
+                    model,
+                    train_eval_dataloader,
+                    device,
+                    save_dir=args.diag_save_dir,
+                    current_iter=current_iter,
+                    print_fn=print_fn,
+                    max_ratio=args.diag_max_ratio,
+                    resize_mask=args.diag_resize_mask,
+                    manifest_path=manifest_path,
+                )
+
+            if current_iter % 5000 == 0:
                 # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
 
                 auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
@@ -244,12 +293,23 @@ if __name__ == '__main__':
     parser.add_argument('--save_dir', type=str, default='./saved_results')
     parser.add_argument('--save_name', type=str,
                         default='vitill_mvtec_uni_dinov2br_c392_en29_bn4dp2_de8_laelu_md2_i1_it10k_sams2e3_wd1e4_w1hcosa2e4_ghmp09f01w01_b16_s1')
+    parser.add_argument('--warmup_diag', action='store_true')
+    parser.add_argument('--warmup_milestones', type=str, default='500,1000,2000,4000')
+    parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
+    parser.add_argument('--diag_batch_size', type=int, default=16)
+    parser.add_argument('--diag_num_workers', type=int, default=4)
+    parser.add_argument('--diag_max_ratio', type=float, default=0.01)
+    parser.add_argument('--diag_resize_mask', type=int, default=256)
     args = parser.parse_args()
+    args.warmup_milestones = parse_warmup_milestones(args.warmup_milestones)
     #
     item_list = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',
                  'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper']
     logger = get_logger(args.save_name, os.path.join(args.save_dir, args.save_name))
     print_fn = logger.info
+
+    if not os.path.isabs(args.diag_save_dir):
+        args.diag_save_dir = os.path.join(args.save_dir, args.save_name, args.diag_save_dir)
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     print_fn(device)

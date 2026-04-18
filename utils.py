@@ -344,6 +344,30 @@ def evaluation(model, dataloader, device, _class_=None, calc_pro=True, norm_fact
     return auroc_px, auroc_sp, round(np.mean(aupro_list), 4)
 
 
+def compute_image_level_scores(anomaly_map, max_ratio=0):
+    if max_ratio == 0:
+        return torch.max(anomaly_map.flatten(1), dim=1)[0]
+
+    flat_anomaly_map = anomaly_map.flatten(1)
+    topk = max(1, int(flat_anomaly_map.shape[1] * max_ratio))
+    scores = torch.sort(flat_anomaly_map, dim=1, descending=True)[0][:, :topk]
+    return scores.mean(dim=1)
+
+
+def infer_anomaly_map_batch(model, img, gaussian_kernel, resize_mask=None, gt=None):
+    output = model(img)
+    en, de = output[0], output[1]
+
+    anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
+    if resize_mask is not None:
+        anomaly_map = F.interpolate(anomaly_map, size=resize_mask, mode='bilinear', align_corners=False)
+        if gt is not None:
+            gt = F.interpolate(gt, size=resize_mask, mode='nearest')
+
+    anomaly_map = gaussian_kernel(anomaly_map)
+    return anomaly_map, gt
+
+
 def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resize_mask=None):
     model.eval()
     gt_list_px = []
@@ -357,21 +381,7 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
     with torch.no_grad():
         for img, gt, label, img_path in dataloader:
             img = img.to(device)
-            # starter.record()
-            output = model(img)
-            # ender.record()
-            # torch.cuda.synchronize()
-            # curr_time = starter.elapsed_time(ender)
-            en, de = output[0], output[1]
-
-            anomaly_map, _ = cal_anomaly_maps(en, de, img.shape[-1])
-            # anomaly_map = anomaly_map - anomaly_map.mean(dim=[1, 2, 3]).view(-1, 1, 1, 1)
-
-            if resize_mask is not None:
-                anomaly_map = F.interpolate(anomaly_map, size=resize_mask, mode='bilinear', align_corners=False)
-                gt = F.interpolate(gt, size=resize_mask, mode='nearest')
-
-            anomaly_map = gaussian_kernel(anomaly_map)
+            anomaly_map, gt = infer_anomaly_map_batch(model, img, gaussian_kernel, resize_mask=resize_mask, gt=gt)
 
             gt = gt.bool()
             if gt.shape[1] > 1:
@@ -380,14 +390,7 @@ def evaluation_batch(model, dataloader, device, _class_=None, max_ratio=0, resiz
             gt_list_px.append(gt)
             pr_list_px.append(anomaly_map)
             gt_list_sp.append(label)
-
-            if max_ratio == 0:
-                sp_score = torch.max(anomaly_map.flatten(1), dim=1)[0]
-            else:
-                anomaly_map = anomaly_map.flatten(1)
-                sp_score = torch.sort(anomaly_map, dim=1, descending=True)[0][:, :int(anomaly_map.shape[1] * max_ratio)]
-                sp_score = sp_score.mean(dim=1)
-            pr_list_sp.append(sp_score)
+            pr_list_sp.append(compute_image_level_scores(anomaly_map, max_ratio=max_ratio))
 
         gt_list_px = torch.cat(gt_list_px, dim=0)[:, 0].cpu().numpy()
         pr_list_px = torch.cat(pr_list_px, dim=0)[:, 0].cpu().numpy()

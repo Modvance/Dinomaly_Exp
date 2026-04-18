@@ -1,3 +1,7 @@
+## conda create -n dinomaly python=3.8.12
+## conda activate dinomaly
+## pip install -r requirements.txt
+
 --find-links https://download.pytorch.org/whl/torch_stable.html
 
 matplotlib==3.2.1
