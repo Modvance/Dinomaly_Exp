@@ -87,7 +87,11 @@ def train(item_list):
     sample_offset = 0
     contaminated_paths, manifest_path = (None, None)
     if args.warmup_diag:
-        contaminated_paths, manifest_path = load_injected_manifest(args.data_path, os.path.dirname(__file__))
+        contaminated_paths, manifest_path = load_injected_manifest(
+            args.data_path,
+            os.path.dirname(__file__),
+            manifest_path=args.diag_manifest_path,
+        )
         if contaminated_paths is None:
             print_fn('warmup diagnosis: inject_defects manifest not found, contamination-aware metrics will be skipped.')
         else:
@@ -296,6 +300,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_diag', action='store_true')
     parser.add_argument('--warmup_milestones', type=str, default='500,1000,2000,4000')
     parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
+    parser.add_argument('--diag_manifest_path', type=str, default=None)
     parser.add_argument('--diag_batch_size', type=int, default=16)
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)

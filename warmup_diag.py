@@ -64,8 +64,13 @@ def _resolve_manifest_candidates(data_path, repo_root):
     return candidates
 
 
-def load_injected_manifest(data_path, repo_root):
-    for candidate in _resolve_manifest_candidates(data_path, repo_root):
+def load_injected_manifest(data_path, repo_root, manifest_path=None):
+    candidates = []
+    if manifest_path is not None:
+        candidates.append(Path(manifest_path))
+    candidates.extend(_resolve_manifest_candidates(data_path, repo_root))
+
+    for candidate in candidates:
         if candidate.is_file():
             with open(candidate) as file:
                 paths = {line.strip().replace('\\', '/') for line in file if line.strip()}
