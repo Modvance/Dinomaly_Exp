@@ -360,7 +360,7 @@ if __name__ == '__main__':
     if not os.path.isabs(args.diag_save_dir):
         args.diag_save_dir = os.path.join(args.save_dir, args.save_name, args.diag_save_dir)
 
-    device = 'cuda:{}'.format(args.gpu_id) if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:{}'.format(args.gpus) if torch.cuda.is_available() else 'cpu'
     print_fn(device)
 
     train(item_list)
