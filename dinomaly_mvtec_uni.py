@@ -341,7 +341,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_name', type=str,
                         default='vitill_mvtec_uni_dinov2br_c392_en29_bn4dp2_de8_laelu_md2_i1_it10k_sams2e3_wd1e4_w1hcosa2e4_ghmp09f01w01_b16_s1')
     parser.add_argument('--warmup_diag', action='store_true')
-    parser.add_argument('--warmup_milestones', type=str, default='500,1000,2000,4000')
+    parser.add_argument('--warmup_milestones', type=str, default='50, 100, 200, 400, 600,1000,2000,4000')
     parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
     parser.add_argument('--diag_manifest_path', type=str, default=None)
     parser.add_argument('--gpus', type=int, default=0)

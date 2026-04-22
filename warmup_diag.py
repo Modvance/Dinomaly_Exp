@@ -202,6 +202,42 @@ def plot_class_gap(df, save_path):
     return True
 
 
+def plot_class_hists(df, save_dir):
+    if 'class_name' not in df.columns or 'is_contaminated' not in df.columns:
+        return []
+
+    saved_paths = []
+    class_hist_dir = os.path.join(save_dir, 'class_hists')
+    os.makedirs(class_hist_dir, exist_ok=True)
+
+    for class_name, class_df in df.groupby('class_name'):
+        if not class_df['is_contaminated'].isin([0, 1]).any():
+            continue
+
+        clean_scores = class_df.loc[class_df['is_contaminated'] == 0, 'image_score']
+        noisy_scores = class_df.loc[class_df['is_contaminated'] == 1, 'image_score']
+        if len(clean_scores) == 0 and len(noisy_scores) == 0:
+            continue
+
+        plt.figure(figsize=(8, 5))
+        if len(clean_scores) > 0:
+            plt.hist(clean_scores, bins=30, alpha=0.6, label='clean')
+        if len(noisy_scores) > 0:
+            plt.hist(noisy_scores, bins=30, alpha=0.6, label='noisy')
+        plt.title(str(class_name))
+        plt.xlabel('image_score')
+        plt.ylabel('count')
+        plt.legend()
+        plt.tight_layout()
+
+        save_path = os.path.join(class_hist_dir, '{}_hist_global.png'.format(str(class_name)))
+        plt.savefig(save_path)
+        plt.close()
+        saved_paths.append(save_path)
+
+    return saved_paths
+
+
 def _make_json_safe(value):
     if isinstance(value, dict):
         return {key: _make_json_safe(item) for key, item in value.items()}
@@ -231,6 +267,7 @@ def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, prin
         json.dump(_make_json_safe(summary), file, indent=2)
 
     plot_global_hist(df, os.path.join(iter_dir, 'hist_global.png'))
+    plot_class_hists(df, iter_dir)
     plot_class_gap(df, os.path.join(iter_dir, 'class_gap.png'))
 
     if print_fn is not None:
