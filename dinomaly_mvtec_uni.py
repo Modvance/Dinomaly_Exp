@@ -8,9 +8,10 @@ import torch.nn as nn
 from dataset import get_data_transforms, get_strong_transforms, TrainDiagDataset
 from torchvision.datasets import ImageFolder
 import numpy as np
+import pandas as pd
 import random
 import os
-from torch.utils.data import DataLoader, ConcatDataset
+from torch.utils.data import DataLoader, ConcatDataset, Subset
 
 from models.uad import ViTill, ViTillv2
 from models import vit_encoder
@@ -32,7 +33,7 @@ import logging
 import time
 from sklearn.metrics import roc_auc_score, average_precision_score
 import itertools
-from warmup_diag import load_injected_manifest, parse_warmup_milestones, run_one_warmup_diagnosis
+from warmup_diag import load_injected_manifest, parse_warmup_milestones, run_one_warmup_diagnosis, build_prune_plan, save_prune_plan
 
 warnings.filterwarnings("ignore")
 
@@ -68,6 +69,44 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
+def build_train_dataloader(train_datasets, batch_size, num_workers):
+    train_data = ConcatDataset(train_datasets)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+    )
+    return train_data, train_dataloader
+
+
+def build_train_eval_dataloader(train_datasets, data_root, contaminated_paths, batch_size, num_workers, item_list):
+    train_eval_data_list = []
+    sample_offset = 0
+    for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
+        train_eval_data = TrainDiagDataset(
+            train_data,
+            data_root=data_root,
+            class_name=item,
+            class_id=class_id,
+            sample_offset=sample_offset,
+            contaminated_paths=contaminated_paths,
+        )
+        train_eval_data_list.append(train_eval_data)
+        sample_offset += len(train_eval_data)
+
+    train_eval_data = ConcatDataset(train_eval_data_list)
+    train_eval_dataloader = torch.utils.data.DataLoader(
+        train_eval_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+    )
+    return train_eval_dataloader
+
+
 def train(item_list):
     setup_seed(1)
 
@@ -86,10 +125,8 @@ def train(item_list):
 
     train_data_list = []
     test_data_list = []
-    train_eval_data_list = []
-    sample_offset = 0
     contaminated_paths, manifest_path = (None, None)
-    if args.warmup_diag:
+    if args.warmup_diag or args.warmup_denoise:
         contaminated_paths, manifest_path = load_injected_manifest(
             args.data_path,
             os.path.dirname(__file__),
@@ -113,31 +150,17 @@ def train(item_list):
         train_data_list.append(train_data)
         test_data_list.append(test_data)
 
-        if args.warmup_diag:
-            train_eval_data = TrainDiagDataset(
-                train_data,
-                data_root=args.data_path,
-                class_name=item,
-                class_id=i,
-                sample_offset=sample_offset,
-                contaminated_paths=contaminated_paths,
-            )
-            train_eval_data_list.append(train_eval_data)
-            sample_offset += len(train_eval_data)
-
-    train_data = ConcatDataset(train_data_list)
-    train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-                                                   drop_last=True)
+    train_data, train_dataloader = build_train_dataloader(train_data_list, batch_size=batch_size, num_workers=num_workers)
 
     train_eval_dataloader = None
-    if args.warmup_diag:
-        train_eval_data = ConcatDataset(train_eval_data_list)
-        train_eval_dataloader = torch.utils.data.DataLoader(
-            train_eval_data,
+    if args.warmup_diag or args.warmup_denoise:
+        train_eval_dataloader = build_train_eval_dataloader(
+            train_data_list,
+            data_root=args.data_path,
+            contaminated_paths=contaminated_paths,
             batch_size=args.diag_batch_size,
-            shuffle=False,
             num_workers=args.diag_num_workers,
-            drop_last=False,
+            item_list=item_list,
         )
     # test_dataloader_list = [torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=4)
     #                         for test_data in test_data_list]
@@ -211,6 +234,8 @@ def train(item_list):
 
     print_fn('train image number:{}'.format(len(train_data)))
 
+    has_pruned = False
+
     it = 0
     for epoch in range(int(np.ceil(total_iters / len(train_dataloader)))):
         model.train()
@@ -237,7 +262,7 @@ def train(item_list):
             lr_scheduler.step()
 
             current_iter = it + 1
-            if args.warmup_diag and current_iter in args.warmup_milestones:
+            if args.warmup_diag and current_iter in args.warmup_milestones and not (args.warmup_denoise and current_iter == args.warmup_end_iter):
                 run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -249,6 +274,69 @@ def train(item_list):
                     resize_mask=args.diag_resize_mask,
                     manifest_path=manifest_path,
                 )
+
+            if args.warmup_denoise and (not has_pruned) and current_iter == args.warmup_end_iter:
+                diagnosis_result = run_one_warmup_diagnosis(
+                    model,
+                    train_eval_dataloader,
+                    device,
+                    save_dir=args.diag_save_dir,
+                    current_iter=current_iter,
+                    print_fn=print_fn,
+                    max_ratio=args.diag_max_ratio,
+                    resize_mask=args.diag_resize_mask,
+                    manifest_path=manifest_path,
+                    save_scores=args.warmup_save_scores_before_prune,
+                )
+                scored_df = diagnosis_result['df'].copy()
+
+                class_offsets = {}
+                offset = 0
+                for class_id, dataset in enumerate(train_data_list):
+                    class_offsets[class_id] = offset
+                    offset += len(dataset)
+                scored_df['local_idx'] = scored_df.apply(lambda row: int(row['sample_idx']) - class_offsets[int(row['class_id'])], axis=1)
+
+                prune_plan = build_prune_plan(
+                    scored_df,
+                    prune_ratio=args.warmup_prune_ratio,
+                    min_keep_per_class=args.warmup_min_keep_per_class,
+                )
+                save_prune_plan(diagnosis_result['iter_dir'], prune_plan, current_iter)
+
+                pruned_train_data_list = []
+                for class_id, train_dataset in enumerate(train_data_list):
+                    retained_indices = prune_plan['retained_index_map'].get(class_id)
+                    if retained_indices is None:
+                        retained_indices = list(range(len(train_dataset)))
+                    pruned_train_data_list.append(Subset(train_dataset, retained_indices))
+
+                train_data_list = pruned_train_data_list
+                train_data, train_dataloader = build_train_dataloader(
+                    train_data_list,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                )
+                train_eval_dataloader = build_train_eval_dataloader(
+                    train_data_list,
+                    data_root=args.data_path,
+                    contaminated_paths=contaminated_paths,
+                    batch_size=args.diag_batch_size,
+                    num_workers=args.diag_num_workers,
+                    item_list=item_list,
+                )
+                has_pruned = True
+                print_fn('warmup denoise iter {}: pruned {} / {} training samples.'.format(
+                    current_iter,
+                    prune_plan['summary']['num_pruned'],
+                    prune_plan['summary']['num_samples_before_prune']))
+                for class_name, class_stats in prune_plan['summary']['class_counts'].items():
+                    print_fn('  {}: removed {}, retained {}'.format(
+                        class_name,
+                        class_stats['removed'],
+                        class_stats['retained']))
+                print_fn('train image number after prune:{}'.format(len(train_data)))
+                model.train()
 
             if current_iter % 5000 == 0:
                 # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
@@ -341,10 +429,15 @@ if __name__ == '__main__':
     parser.add_argument('--save_name', type=str,
                         default='vitill_mvtec_uni_dinov2br_c392_en29_bn4dp2_de8_laelu_md2_i1_it10k_sams2e3_wd1e4_w1hcosa2e4_ghmp09f01w01_b16_s1')
     parser.add_argument('--warmup_diag', action='store_true')
+    parser.add_argument('--warmup_denoise', action='store_true')
     parser.add_argument('--warmup_milestones', type=str, default='50, 100, 200, 400, 600,1000,2000,4000')
+    parser.add_argument('--warmup_end_iter', type=int, default=1000)
+    parser.add_argument('--warmup_prune_ratio', type=float, default=0.05)
+    parser.add_argument('--warmup_min_keep_per_class', type=int, default=20)
+    parser.add_argument('--warmup_save_scores_before_prune', action='store_true')
     parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
     parser.add_argument('--diag_manifest_path', type=str, default=None)
-    parser.add_argument('--gpus', type=int, default=0)
+    parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--diag_batch_size', type=int, default=16)
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
@@ -360,7 +453,7 @@ if __name__ == '__main__':
     if not os.path.isabs(args.diag_save_dir):
         args.diag_save_dir = os.path.join(args.save_dir, args.save_name, args.diag_save_dir)
 
-    device = 'cuda:{}'.format(args.gpus) if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:{}'.format(args.gpu_id) if torch.cuda.is_available() else 'cpu'
     print_fn(device)
 
     train(item_list)

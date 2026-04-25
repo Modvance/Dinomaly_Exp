@@ -9,7 +9,7 @@ from torchvision.datasets import MNIST, CIFAR10, FashionMNIST, ImageFolder
 import numpy as np
 import torch.multiprocessing
 import json
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset
 
 # import imgaug.augmenters as iaa
 # from perlin import rand_perlin_2d_np
@@ -59,9 +59,19 @@ class TrainDiagDataset(Dataset):
     def __len__(self):
         return len(self.dataset)
 
+    def _resolve_base_sample(self, idx):
+        if isinstance(self.dataset, Subset):
+            base_idx = self.dataset.indices[idx]
+            base_dataset = self.dataset.dataset
+        else:
+            base_idx = idx
+            base_dataset = self.dataset
+        return base_dataset, base_idx
+
     def __getitem__(self, idx):
         image, label = self.dataset[idx]
-        img_path = self.dataset.samples[idx][0]
+        base_dataset, base_idx = self._resolve_base_sample(idx)
+        img_path = base_dataset.samples[base_idx][0]
         rel_path = os.path.relpath(img_path, self.data_root).replace('\\', '/')
 
         is_contaminated = None

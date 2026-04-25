@@ -277,8 +277,65 @@ def _make_json_safe(value):
     return value
 
 
+def build_prune_plan(df, prune_ratio, min_keep_per_class):
+    if 'class_id' not in df.columns or 'image_score' not in df.columns:
+        raise ValueError('build_prune_plan requires class_id and image_score columns')
+
+    pruned_frames = []
+    retained_index_map = {}
+    class_counts = {}
+
+    grouped = df.groupby('class_id', sort=True)
+    for class_id, class_df in grouped:
+        class_df = class_df.sort_values('image_score', ascending=False).reset_index(drop=True)
+        num_samples = int(len(class_df))
+        requested_remove = int(math.floor(num_samples * float(prune_ratio)))
+        max_removable = max(0, num_samples - int(min_keep_per_class))
+        remove_count = min(requested_remove, max_removable)
+
+        pruned_df = class_df.iloc[:remove_count].copy()
+        retained_df = class_df.iloc[remove_count:].copy()
+
+        retained_index_map[int(class_id)] = [int(local_idx) for local_idx in retained_df['local_idx'].tolist()]
+        class_name = str(class_df['class_name'].iloc[0]) if 'class_name' in class_df.columns and num_samples > 0 else str(class_id)
+        class_counts[str(class_name)] = {
+            'class_id': int(class_id),
+            'num_samples': num_samples,
+            'removed': int(remove_count),
+            'retained': int(len(retained_df)),
+            'requested_remove': int(requested_remove),
+        }
+        if remove_count > 0:
+            pruned_frames.append(pruned_df)
+
+    pruned_samples = pd.concat(pruned_frames, ignore_index=True) if len(pruned_frames) > 0 else pd.DataFrame(columns=df.columns)
+    summary = {
+        'num_samples_before_prune': int(len(df)),
+        'num_pruned': int(len(pruned_samples)),
+        'num_retained': int(sum(len(indices) for indices in retained_index_map.values())),
+        'prune_ratio': float(prune_ratio),
+        'min_keep_per_class': int(min_keep_per_class),
+        'class_counts': class_counts,
+    }
+    return {
+        'pruned_samples': pruned_samples,
+        'retained_index_map': retained_index_map,
+        'summary': summary,
+    }
+
+
+def save_prune_plan(iter_dir, prune_plan, current_iter):
+    prune_summary = dict(prune_plan['summary'])
+    prune_summary['iteration'] = int(current_iter)
+
+    with open(os.path.join(iter_dir, 'prune_summary.json'), 'w') as file:
+        json.dump(_make_json_safe(prune_summary), file, indent=2)
+
+    prune_plan['pruned_samples'].to_csv(os.path.join(iter_dir, 'pruned_samples.csv'), index=False)
+
+
 def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, print_fn=None, max_ratio=0.01,
-                             resize_mask=256, manifest_path=None):
+                             resize_mask=256, manifest_path=None, save_scores=True):
     iter_dir = os.path.join(save_dir, 'iter_{:05d}'.format(current_iter))
     os.makedirs(iter_dir, exist_ok=True)
 
@@ -287,7 +344,8 @@ def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, prin
     summary['iteration'] = int(current_iter)
     summary['manifest_path'] = manifest_path
 
-    df.to_csv(os.path.join(iter_dir, 'train_scores.csv'), index=False)
+    if save_scores:
+        df.to_csv(os.path.join(iter_dir, 'train_scores.csv'), index=False)
     with open(os.path.join(iter_dir, 'summary.json'), 'w') as file:
         json.dump(_make_json_safe(summary), file, indent=2)
 
@@ -302,4 +360,8 @@ def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, prin
             summary.get('train_noise_auroc'),
             summary.get('train_noise_ap')))
 
-    return summary
+    return {
+        'summary': summary,
+        'df': df,
+        'iter_dir': iter_dir,
+    }
