@@ -115,41 +115,66 @@ def compute_warmup_diagnostics(df):
     }
 
     has_contamination = 'is_contaminated' in df.columns and df['is_contaminated'].isin([0, 1]).any()
+    clean_mask = df['is_contaminated'] == 0 if has_contamination else None
+    noisy_mask = df['is_contaminated'] == 1 if has_contamination else None
+
+    summary['num_clean'] = int(clean_mask.sum()) if has_contamination else None
+    summary['num_noisy'] = int(noisy_mask.sum()) if has_contamination else None
+
+    class_metrics = {}
+    macro_clean_means = []
+    macro_noisy_means = []
+    macro_score_gaps = []
+    macro_aurocs = []
+    macro_aps = []
+
+    if 'class_name' in df.columns:
+        for class_name, class_df in df.groupby('class_name'):
+            clean_mean = _safe_mean(class_df.loc[class_df['is_contaminated'] == 0, 'image_score']) if has_contamination else float('nan')
+            noisy_mean = _safe_mean(class_df.loc[class_df['is_contaminated'] == 1, 'image_score']) if has_contamination else float('nan')
+            score_gap = noisy_mean - clean_mean
+            class_auroc = _safe_binary_metric(roc_auc_score, class_df['is_contaminated'], class_df['image_score']) if has_contamination else float('nan')
+            class_ap = _safe_binary_metric(average_precision_score, class_df['is_contaminated'], class_df['image_score']) if has_contamination else float('nan')
+
+            class_metrics[str(class_name)] = {
+                'num_samples': int(len(class_df)),
+                'clean_mean_score': _safe_float(clean_mean),
+                'noisy_mean_score': _safe_float(noisy_mean),
+                'score_gap': _safe_float(score_gap),
+                'train_noise_auroc': _safe_float(class_auroc),
+                'train_noise_ap': _safe_float(class_ap),
+            }
+
+            if not np.isnan(clean_mean):
+                macro_clean_means.append(clean_mean)
+            if not np.isnan(noisy_mean):
+                macro_noisy_means.append(noisy_mean)
+            if not np.isnan(score_gap):
+                macro_score_gaps.append(score_gap)
+            if not np.isnan(class_auroc):
+                macro_aurocs.append(class_auroc)
+            if not np.isnan(class_ap):
+                macro_aps.append(class_ap)
+
     if has_contamination:
-        clean_mask = df['is_contaminated'] == 0
-        noisy_mask = df['is_contaminated'] == 1
         summary.update({
-            'num_clean': int(clean_mask.sum()),
-            'num_noisy': int(noisy_mask.sum()),
-            'clean_mean_score': _safe_float(_safe_mean(df.loc[clean_mask, 'image_score'])),
-            'noisy_mean_score': _safe_float(_safe_mean(df.loc[noisy_mask, 'image_score'])),
-            'score_gap': _safe_float(_safe_mean(df.loc[noisy_mask, 'image_score']) - _safe_mean(df.loc[clean_mask, 'image_score'])),
-            'train_noise_auroc': _safe_float(_safe_binary_metric(roc_auc_score, df['is_contaminated'], df['image_score'])),
-            'train_noise_ap': _safe_float(_safe_binary_metric(average_precision_score, df['is_contaminated'], df['image_score'])),
+            'clean_mean_score': _safe_float(_safe_mean(pd.Series(macro_clean_means))) if len(macro_clean_means) > 0 else None,
+            'noisy_mean_score': _safe_float(_safe_mean(pd.Series(macro_noisy_means))) if len(macro_noisy_means) > 0 else None,
+            'score_gap': _safe_float(_safe_mean(pd.Series(macro_score_gaps))) if len(macro_score_gaps) > 0 else None,
+            'train_noise_auroc': _safe_float(_safe_mean(pd.Series(macro_aurocs))) if len(macro_aurocs) > 0 else None,
+            'train_noise_ap': _safe_float(_safe_mean(pd.Series(macro_aps))) if len(macro_aps) > 0 else None,
+            'metric_averaging': 'macro_over_classes',
         })
     else:
         summary.update({
-            'num_clean': None,
-            'num_noisy': None,
             'clean_mean_score': None,
             'noisy_mean_score': None,
             'score_gap': None,
             'train_noise_auroc': None,
             'train_noise_ap': None,
+            'metric_averaging': 'macro_over_classes',
         })
 
-    class_metrics = {}
-    if 'class_name' in df.columns:
-        for class_name, class_df in df.groupby('class_name'):
-            clean_mean = _safe_mean(class_df.loc[class_df['is_contaminated'] == 0, 'image_score']) if 'is_contaminated' in class_df.columns else float('nan')
-            noisy_mean = _safe_mean(class_df.loc[class_df['is_contaminated'] == 1, 'image_score']) if 'is_contaminated' in class_df.columns else float('nan')
-            class_metrics[str(class_name)] = {
-                'num_samples': int(len(class_df)),
-                'clean_mean_score': _safe_float(clean_mean),
-                'noisy_mean_score': _safe_float(noisy_mean),
-                'score_gap': _safe_float(noisy_mean - clean_mean),
-                'train_noise_auroc': _safe_float(_safe_binary_metric(roc_auc_score, class_df['is_contaminated'], class_df['image_score'])) if 'is_contaminated' in class_df.columns else None,
-            }
     summary['class_metrics'] = class_metrics
 
     return summary
