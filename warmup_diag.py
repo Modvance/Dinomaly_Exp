@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -48,18 +49,55 @@ def _safe_binary_metric(metric_fn, y_true, y_score):
     return float(metric_fn(y_true.astype(int), y_score.astype(float)))
 
 
+def _append_manifest_candidate(candidates, seen, candidate):
+    candidate = Path(candidate)
+    candidate_str = str(candidate)
+    if candidate_str not in seen:
+        seen.add(candidate_str)
+        candidates.append(candidate)
+
+
+def _extract_scheme_and_seed(name):
+    direct_match = re.match(r'^(step_k\d+|pareto)[-_](seed\d+)$', name)
+    if direct_match is not None:
+        return direct_match.group(1), direct_match.group(2)
+
+    visa_match = re.match(r'^visa-(step_k\d+|pareto)-(seed\d+)$', name)
+    if visa_match is not None:
+        return visa_match.group(1), visa_match.group(2)
+
+    return None, None
+
+
 def _resolve_manifest_candidates(data_path, repo_root):
-    data_parts = Path(os.path.abspath(data_path)).parts
-    manifest_root = Path(repo_root) / 'manifest' / 'mvtecad-nlt'
+    data_path = os.path.abspath(data_path)
+    data_parts = Path(data_path).parts
     candidates = []
+    seen = set()
+    manifest_roots = [
+        Path(repo_root) / 'manifest' / 'mvtecad-nlt',
+        Path(repo_root) / 'manifest' / 'visa-nlt',
+    ]
 
     for index, part in enumerate(data_parts):
+        scheme, seed = _extract_scheme_and_seed(part)
+        if scheme is not None and seed is not None:
+            for manifest_root in manifest_roots:
+                _append_manifest_candidate(candidates, seen, manifest_root / scheme / seed / 'inject_defects.txt')
+
         if part.startswith('step_k') or part == 'pareto':
             if index + 1 < len(data_parts) and data_parts[index + 1].startswith('seed'):
-                candidates.append(manifest_root / part / data_parts[index + 1] / 'inject_defects.txt')
+                for manifest_root in manifest_roots:
+                    _append_manifest_candidate(candidates, seen, manifest_root / part / data_parts[index + 1] / 'inject_defects.txt')
+
+    data_name = os.path.basename(os.path.normpath(data_path))
+    scheme, seed = _extract_scheme_and_seed(data_name)
+    if scheme is not None and seed is not None:
+        for manifest_root in manifest_roots:
+            _append_manifest_candidate(candidates, seen, manifest_root / scheme / seed / 'inject_defects.txt')
 
     if os.path.isfile(data_path):
-        candidates.append(Path(data_path))
+        _append_manifest_candidate(candidates, seen, data_path)
 
     return candidates
 
