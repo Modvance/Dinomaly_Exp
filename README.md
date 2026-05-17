@@ -46,3 +46,7 @@ python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 -
 python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/Postprocessing/ --save_name hybrid_k4 --gpus 5 --warmup_postprocess_mode hybrid --warmup_end_iter 150 --warmup_hybrid_prune_ratio 0.05 --warmup_min_keep_per_class 5 --warmup_weight_beta 1.0 --warmup_min_weight 0.2 --warmup_weight_scope class --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt --warmup_save_scores_before_prune
 python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/Postprocessing/ --save_name hybrid_k1 --gpus 6 --warmup_postprocess_mode hybrid --warmup_end_iter 110 --warmup_hybrid_prune_ratio 0.05 --warmup_min_keep_per_class 5 --warmup_weight_beta 1.0 --warmup_min_weight 0.2 --warmup_weight_scope class --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt --warmup_save_scores_before_prune
 ```
+
+```bash
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/phase2/ --save_name mvtec --gpus 1 --warmup_auto_end --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt
+```
