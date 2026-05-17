@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.mixture import GaussianMixture
 
 from utils import compute_image_level_scores, get_gaussian_kernel, infer_anomaly_map_batch
 
@@ -333,10 +334,10 @@ def _build_kept_df(df, removed_df):
     return df.loc[keep_mask].copy().reset_index(drop=True)
 
 
-def _build_weight_map(df):
+def _build_weight_map(df, weight_col='sample_weight'):
     sample_weight_map = {}
     for _, row in df.iterrows():
-        sample_weight_map[(int(row['class_id']), int(row['base_idx']))] = float(row['sample_weight'])
+        sample_weight_map[(int(row['class_id']), int(row['base_idx']))] = float(row[weight_col])
     return sample_weight_map
 
 
@@ -352,6 +353,184 @@ def _compute_group_weights(class_df, beta, min_weight, eps):
     class_df['z_score'] = z_score.astype(float)
     class_df['sample_weight'] = sample_weight.astype(float)
     return class_df
+
+
+def _build_identity_keys(df):
+    _require_identity_columns(df)
+    return [
+        (int(class_id), int(base_idx))
+        for class_id, base_idx in zip(df['class_id'].tolist(), df['base_idx'].tolist())
+    ]
+
+
+def _compute_jaccard(keys_a, keys_b):
+    if keys_a is None or keys_b is None:
+        return None
+    union = keys_a | keys_b
+    if len(union) == 0:
+        return 1.0
+    return float(len(keys_a & keys_b) / len(union))
+
+
+def _robust_normalize_scores(df, eps=1e-6):
+    _require_identity_columns(df)
+    df = df.copy()
+    scores = df['image_score'].to_numpy(dtype=float)
+    median = float(np.median(scores))
+    mad = float(np.median(np.abs(scores - median))) + float(eps)
+    z_score = (scores - median) / mad
+    df['score_median'] = median
+    df['score_mad'] = mad
+    df['z_score'] = z_score.astype(float)
+    return df, {'score_median': median, 'score_mad': mad}
+
+
+def _fit_two_component_gmm(z_values, eps=1e-6, random_state=0):
+    z_values = np.asarray(z_values, dtype=float).reshape(-1)
+    if z_values.size == 0:
+        raise ValueError('cannot fit GMM on empty scores')
+
+    if z_values.size < 2 or np.allclose(z_values, z_values[0]):
+        mean_value = float(np.mean(z_values))
+        sigma_value = float(np.std(z_values) + eps)
+        posterior_high = np.full(z_values.shape[0], 0.5, dtype=float)
+        return {
+            'mu_1': mean_value,
+            'mu_2': mean_value,
+            'sigma_1': sigma_value,
+            'sigma_2': sigma_value,
+            'weight_1': 0.5,
+            'weight_2': 0.5,
+            'D_t': 0.0,
+            'posterior_high': posterior_high,
+        }
+
+    try:
+        gmm = GaussianMixture(n_components=2, covariance_type='full', reg_covar=eps, random_state=random_state)
+        gmm.fit(z_values.reshape(-1, 1))
+        means = gmm.means_.reshape(-1)
+        variances = gmm.covariances_.reshape(2, -1)[:, 0]
+        sigmas = np.sqrt(np.maximum(variances, eps))
+        weights = gmm.weights_.reshape(-1)
+        order = np.argsort(means)
+        low_idx, high_idx = int(order[0]), int(order[1])
+        posterior_high = gmm.predict_proba(z_values.reshape(-1, 1))[:, high_idx]
+        mu_1 = float(means[low_idx])
+        mu_2 = float(means[high_idx])
+        sigma_1 = float(sigmas[low_idx])
+        sigma_2 = float(sigmas[high_idx])
+        D_t = float((mu_2 - mu_1) / max(sigma_1 + sigma_2, eps))
+        return {
+            'mu_1': mu_1,
+            'mu_2': mu_2,
+            'sigma_1': sigma_1,
+            'sigma_2': sigma_2,
+            'weight_1': float(weights[low_idx]),
+            'weight_2': float(weights[high_idx]),
+            'D_t': D_t,
+            'posterior_high': posterior_high.astype(float),
+        }
+    except Exception:
+        mean_value = float(np.mean(z_values))
+        sigma_value = float(np.std(z_values) + eps)
+        posterior_high = np.full(z_values.shape[0], 0.5, dtype=float)
+        return {
+            'mu_1': mean_value,
+            'mu_2': mean_value,
+            'sigma_1': sigma_value,
+            'sigma_2': sigma_value,
+            'weight_1': 0.5,
+            'weight_2': 0.5,
+            'D_t': 0.0,
+            'posterior_high': posterior_high,
+        }
+
+
+def annotate_scores_with_gmm(df, eps=1e-6, random_state=0):
+    normalized_df, robust_stats = _robust_normalize_scores(df, eps=eps)
+    gmm_stats = _fit_two_component_gmm(normalized_df['z_score'].to_numpy(dtype=float), eps=eps, random_state=random_state)
+    annotated_df = normalized_df.copy()
+    annotated_df['gmm_posterior_high'] = gmm_stats['posterior_high']
+    annotated_df['gmm_posterior_low'] = 1.0 - annotated_df['gmm_posterior_high']
+    stats = {
+        'score_median': robust_stats['score_median'],
+        'score_mad': robust_stats['score_mad'],
+        'gmm_mu_1': gmm_stats['mu_1'],
+        'gmm_mu_2': gmm_stats['mu_2'],
+        'gmm_sigma_1': gmm_stats['sigma_1'],
+        'gmm_sigma_2': gmm_stats['sigma_2'],
+        'gmm_weight_1': gmm_stats['weight_1'],
+        'gmm_weight_2': gmm_stats['weight_2'],
+        'D_t': gmm_stats['D_t'],
+    }
+    return annotated_df, stats
+
+
+def build_top_suspicious_samples(df, top_p):
+    _require_identity_columns(df)
+    if len(df) == 0:
+        return df.copy(), set(), 0
+    top_count = max(1, int(math.ceil(len(df) * float(top_p))))
+    suspicious_df = df.sort_values('image_score', ascending=False).head(top_count).copy().reset_index(drop=True)
+    suspicious_keys = set(_build_identity_keys(suspicious_df))
+    return suspicious_df, suspicious_keys, top_count
+
+
+def evaluate_warmup_trigger(scored_df, best_D, no_improve_count, last_suspicious_keys, current_iter,
+                            top_p, jaccard_threshold, patience, plateau_ratio, eps=1e-6,
+                            random_state=0, force_trigger=False):
+    annotated_df, gmm_stats = annotate_scores_with_gmm(scored_df, eps=eps, random_state=random_state)
+    suspicious_df, suspicious_keys, top_count = build_top_suspicious_samples(annotated_df, top_p=top_p)
+    J_t = _compute_jaccard(last_suspicious_keys, suspicious_keys)
+    D_t = float(gmm_stats['D_t'])
+
+    previous_best_D = None if best_D is None else float(best_D)
+    improved = previous_best_D is None or D_t > previous_best_D
+    if improved:
+        best_D = D_t
+        no_improve_count = 0
+    else:
+        no_improve_count = int(no_improve_count) + 1
+
+    plateau_ready = (
+        previous_best_D is not None
+        and D_t >= float(plateau_ratio) * float(best_D)
+        and int(no_improve_count) >= int(patience)
+        and J_t is not None
+        and J_t >= float(jaccard_threshold)
+    )
+
+    triggered = bool(force_trigger or plateau_ready)
+    trigger_reason = 'forced' if force_trigger else ('plateau' if plateau_ready else 'none')
+    summary = {
+        'stage': 'warmup',
+        'iteration': int(current_iter),
+        'top_p': float(top_p),
+        'top_count': int(top_count),
+        'D_t': D_t,
+        'J_t': _safe_float(J_t),
+        'best_D': _safe_float(best_D),
+        'previous_best_D': _safe_float(previous_best_D),
+        'no_improve_count': int(no_improve_count),
+        'improved_D': bool(improved),
+        'jaccard_threshold': float(jaccard_threshold),
+        'patience': int(patience),
+        'plateau_ratio': float(plateau_ratio),
+        'triggered': bool(triggered),
+        'trigger_reason': trigger_reason,
+    }
+    summary.update(gmm_stats)
+
+    return {
+        'scored_df': annotated_df,
+        'suspicious_df': suspicious_df,
+        'suspicious_keys': suspicious_keys,
+        'triggered': triggered,
+        'trigger_reason': trigger_reason,
+        'best_D': best_D,
+        'no_improve_count': no_improve_count,
+        'summary': summary,
+    }
 
 
 def build_prune_plan(df, prune_ratio, min_keep_per_class):
@@ -510,6 +689,108 @@ def build_warmup_postprocess_plan(df, mode, prune_ratio, min_keep_per_class, wei
     raise ValueError('unsupported warmup postprocess mode {}'.format(mode))
 
 
+def build_phase2_weight_update(scored_df, reliability_map, old_weight_map, min_weight, weight_beta,
+                               weight_scope='class', reliability_ema=0.9, weight_ema=0.8,
+                               clip_delta=0.1, top_p=0.1, eps=1e-6, random_state=0):
+    annotated_df, gmm_stats = annotate_scores_with_gmm(scored_df, eps=eps, random_state=random_state)
+    suspicious_df, suspicious_keys, top_count = build_top_suspicious_samples(annotated_df, top_p=top_p)
+    soft_plan = build_soft_plan(annotated_df, beta=weight_beta, min_weight=min_weight, weight_scope=weight_scope, eps=eps)
+    weighted_df = soft_plan['weighted_samples'].copy().reset_index(drop=True)
+
+    new_reliability_map = {}
+    new_sample_weight_map = {}
+    reliability_values = []
+    weight_values = []
+    weight_deltas = []
+    clipped_count = 0
+
+    rows = []
+    for _, row in weighted_df.iterrows():
+        key = (int(row['class_id']), int(row['base_idx']))
+        instant_reliability = float(np.clip(1.0 - row['gmm_posterior_high'], 0.0, 1.0))
+        previous_reliability = reliability_map.get(key)
+        if previous_reliability is None:
+            reliability_value = instant_reliability
+        else:
+            reliability_value = float(reliability_ema) * float(previous_reliability) + (1.0 - float(reliability_ema)) * instant_reliability
+        reliability_value = float(np.clip(reliability_value, 0.0, 1.0))
+
+        score_weight = float(row['sample_weight'])
+        instant_weight = float(min_weight) + (score_weight - float(min_weight)) * reliability_value
+        previous_weight = old_weight_map.get(key)
+        if previous_weight is None:
+            blended_weight = instant_weight
+            clipped_weight = instant_weight
+            weight_delta = 0.0
+        else:
+            blended_weight = float(weight_ema) * float(previous_weight) + (1.0 - float(weight_ema)) * instant_weight
+            if clip_delta is None:
+                clipped_weight = blended_weight
+            else:
+                lower = float(previous_weight) - float(clip_delta)
+                upper = float(previous_weight) + float(clip_delta)
+                clipped_weight = float(np.clip(blended_weight, lower, upper))
+                if abs(clipped_weight - blended_weight) > 1e-12:
+                    clipped_count += 1
+            weight_delta = abs(clipped_weight - float(previous_weight))
+
+        final_weight = float(np.clip(clipped_weight, float(min_weight), 1.0))
+
+        new_reliability_map[key] = reliability_value
+        new_sample_weight_map[key] = final_weight
+        reliability_values.append(reliability_value)
+        weight_values.append(final_weight)
+        weight_deltas.append(weight_delta)
+
+        row_data = row.to_dict()
+        row_data['instant_reliability'] = instant_reliability
+        row_data['reliability'] = reliability_value
+        row_data['previous_reliability'] = None if previous_reliability is None else float(previous_reliability)
+        row_data['score_weight'] = score_weight
+        row_data['instant_weight'] = instant_weight
+        row_data['previous_weight'] = None if previous_weight is None else float(previous_weight)
+        row_data['sample_weight'] = final_weight
+        rows.append(row_data)
+
+    final_weight_df = pd.DataFrame(rows)
+    reliability_df = final_weight_df[[
+        'class_id', 'class_name', 'base_idx', 'img_path', 'image_score', 'z_score', 'gmm_posterior_high',
+        'instant_reliability', 'previous_reliability', 'reliability'
+    ]].copy() if len(final_weight_df) > 0 else pd.DataFrame()
+
+    summary = {
+        'weight_scope': weight_scope,
+        'weight_beta': float(weight_beta),
+        'min_weight': float(min_weight),
+        'top_p': float(top_p),
+        'top_count': int(top_count),
+        'num_samples': int(len(final_weight_df)),
+        'reliability_mean': _safe_float(np.mean(reliability_values)) if len(reliability_values) > 0 else None,
+        'reliability_std': _safe_float(np.std(reliability_values)) if len(reliability_values) > 0 else None,
+        'reliability_min': _safe_float(np.min(reliability_values)) if len(reliability_values) > 0 else None,
+        'reliability_max': _safe_float(np.max(reliability_values)) if len(reliability_values) > 0 else None,
+        'weight_mean': _safe_float(np.mean(weight_values)) if len(weight_values) > 0 else None,
+        'weight_std': _safe_float(np.std(weight_values)) if len(weight_values) > 0 else None,
+        'weight_min': _safe_float(np.min(weight_values)) if len(weight_values) > 0 else None,
+        'weight_max': _safe_float(np.max(weight_values)) if len(weight_values) > 0 else None,
+        'weight_delta_mean_abs': _safe_float(np.mean(weight_deltas)) if len(weight_deltas) > 0 else None,
+        'weight_delta_max_abs': _safe_float(np.max(weight_deltas)) if len(weight_deltas) > 0 else None,
+        'clipped_sample_count': int(clipped_count),
+    }
+    summary.update(gmm_stats)
+
+    return {
+        'scored_df': annotated_df,
+        'suspicious_df': suspicious_df,
+        'suspicious_keys': suspicious_keys,
+        'weight_df': final_weight_df,
+        'reliability_df': reliability_df,
+        'sample_weight_map': new_sample_weight_map,
+        'reliability_map': new_reliability_map,
+        'summary': summary,
+    }
+
+
 def save_prune_plan(iter_dir, prune_plan, current_iter):
     prune_summary = dict(prune_plan['summary'])
     prune_summary['iteration'] = int(current_iter)
@@ -524,6 +805,25 @@ def save_prune_plan(iter_dir, prune_plan, current_iter):
         prune_plan['kept_samples'].to_csv(os.path.join(iter_dir, 'kept_samples.csv'), index=False)
     if 'weighted_samples' in prune_plan and len(prune_plan['weighted_samples']) > 0:
         prune_plan['weighted_samples'].to_csv(os.path.join(iter_dir, 'sample_weights.csv'), index=False)
+
+
+def save_phase2_artifacts(iter_dir, extra_summary=None, suspicious_df=None, weight_df=None, reliability_df=None):
+    summary_path = os.path.join(iter_dir, 'summary.json')
+    summary = {}
+    if os.path.isfile(summary_path):
+        with open(summary_path) as file:
+            summary = json.load(file)
+    if extra_summary is not None:
+        summary.update(_make_json_safe(extra_summary))
+    with open(summary_path, 'w') as file:
+        json.dump(_make_json_safe(summary), file, indent=2)
+
+    if suspicious_df is not None and len(suspicious_df) > 0:
+        suspicious_df.to_csv(os.path.join(iter_dir, 'suspicious_samples.csv'), index=False)
+    if weight_df is not None and len(weight_df) > 0:
+        weight_df.to_csv(os.path.join(iter_dir, 'sample_weights.csv'), index=False)
+    if reliability_df is not None and len(reliability_df) > 0:
+        reliability_df.to_csv(os.path.join(iter_dir, 'reliability_bank.csv'), index=False)
 
 
 def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, print_fn=None, max_ratio=0.01,

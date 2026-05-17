@@ -19,10 +19,13 @@ from models.vision_transformer import Block as VitBlock, LinearAttention2, bMlp
 from optimizers import StableAdamW
 from utils import WarmCosineScheduler, evaluation_batch, global_cosine_hm_percent
 from warmup_diag import (
+    build_phase2_weight_update,
     build_warmup_postprocess_plan,
+    evaluate_warmup_trigger,
     load_injected_manifest,
     parse_warmup_milestones,
     run_one_warmup_diagnosis,
+    save_phase2_artifacts,
     save_prune_plan,
 )
 
@@ -126,6 +129,31 @@ def build_batch_sample_weight(meta, sample_weight_map, device):
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
+def should_run_warmup_check(current_iter, total_iters, args):
+    if not args.warmup_auto_end:
+        return False
+    t_min = max(1, int(total_iters * args.warmup_check_start_ratio))
+    t_max = max(t_min, int(total_iters * args.warmup_check_end_ratio))
+    if current_iter < t_min or current_iter > t_max:
+        return False
+    return (current_iter - t_min) % args.warmup_check_interval == 0 or current_iter == t_max
+
+
+def run_phase2_diagnosis(model, train_eval_dataloader, current_iter, manifest_path):
+    return run_one_warmup_diagnosis(
+        model,
+        train_eval_dataloader,
+        device,
+        save_dir=args.diag_save_dir,
+        current_iter=current_iter,
+        print_fn=print_fn,
+        max_ratio=args.diag_max_ratio,
+        resize_mask=args.diag_resize_mask,
+        manifest_path=manifest_path,
+        save_scores=True,
+    )
+
+
 def train(item_list):
     setup_seed(1)
 
@@ -137,14 +165,15 @@ def train(item_list):
     train_start_time = time.time()
     final_eval_summary = None
     postprocess_mode = resolve_postprocess_mode(args)
-    use_sample_weight = postprocess_mode in ['soft', 'hybrid']
+    phase2_enabled = args.warmup_auto_end
+    use_sample_weight = phase2_enabled or postprocess_mode in ['soft', 'hybrid']
 
     data_transform, gt_transform = get_data_transforms(image_size, crop_size)
 
     train_data_list = []
     test_data_list = []
     contaminated_paths, manifest_path = (None, None)
-    if args.warmup_diag or postprocess_mode != 'none':
+    if args.warmup_diag or postprocess_mode != 'none' or phase2_enabled:
         contaminated_paths, manifest_path = load_injected_manifest(
             args.data_path,
             os.path.dirname(__file__),
@@ -178,7 +207,7 @@ def train(item_list):
     )
 
     train_eval_dataloader = None
-    if args.warmup_diag or postprocess_mode != 'none':
+    if args.warmup_diag or postprocess_mode != 'none' or phase2_enabled:
         train_eval_dataloader = build_train_eval_dataloader(
             train_data_list,
             data_root=args.data_path,
@@ -261,6 +290,16 @@ def train(item_list):
 
     has_postprocessed = False
     sample_weight_map = {}
+    reliability_map = {}
+    stage = 'warmup' if phase2_enabled else 'baseline'
+    warmup_end_iter = None
+    freeze_iter = None
+    warmup_trigger_reason = None
+    best_D = None
+    no_improve_count = 0
+    last_suspicious_keys = None
+    last_refresh_iter = None
+
     it = 0
     for _ in range(int(np.ceil(total_iters / len(train_dataloader)))):
         model.train()
@@ -293,7 +332,10 @@ def train(item_list):
             lr_scheduler.step()
 
             current_iter = it + 1
-            if args.warmup_diag and current_iter in args.warmup_milestones and not (postprocess_mode != 'none' and current_iter == args.warmup_end_iter):
+            if args.warmup_diag and current_iter in args.warmup_milestones and not (
+                (postprocess_mode != 'none' and current_iter == args.warmup_end_iter) or
+                (phase2_enabled and stage == 'warmup' and should_run_warmup_check(current_iter, total_iters, args))
+            ):
                 run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -306,7 +348,129 @@ def train(item_list):
                     manifest_path=manifest_path,
                 )
 
-            if postprocess_mode != 'none' and (not has_postprocessed) and current_iter == args.warmup_end_iter:
+            if phase2_enabled and stage == 'warmup' and should_run_warmup_check(current_iter, total_iters, args):
+                diagnosis_result = run_phase2_diagnosis(model, train_eval_dataloader, current_iter, manifest_path)
+                t_max = max(1, int(total_iters * args.warmup_check_end_ratio))
+                trigger_result = evaluate_warmup_trigger(
+                    diagnosis_result['df'].copy(),
+                    best_D=best_D,
+                    no_improve_count=no_improve_count,
+                    last_suspicious_keys=last_suspicious_keys,
+                    current_iter=current_iter,
+                    top_p=args.warmup_gmm_top_p,
+                    jaccard_threshold=args.warmup_jaccard_threshold,
+                    patience=args.warmup_gmm_patience,
+                    plateau_ratio=args.warmup_gmm_plateau_ratio,
+                    force_trigger=current_iter >= t_max,
+                )
+                save_phase2_artifacts(
+                    diagnosis_result['iter_dir'],
+                    extra_summary=trigger_result['summary'],
+                    suspicious_df=trigger_result['suspicious_df'],
+                )
+                best_D = trigger_result['best_D']
+                no_improve_count = trigger_result['no_improve_count']
+                last_suspicious_keys = trigger_result['suspicious_keys']
+                if trigger_result['triggered']:
+                    weight_update = build_phase2_weight_update(
+                        trigger_result['scored_df'],
+                        reliability_map=reliability_map,
+                        old_weight_map=sample_weight_map,
+                        min_weight=args.denoise_min_weight,
+                        weight_beta=args.warmup_weight_beta,
+                        weight_scope=args.denoise_weight_scope,
+                        reliability_ema=args.denoise_reliability_ema,
+                        weight_ema=args.denoise_weight_ema,
+                        clip_delta=args.denoise_weight_clip_delta,
+                        top_p=args.warmup_gmm_top_p,
+                    )
+                    save_phase2_artifacts(
+                        diagnosis_result['iter_dir'],
+                        extra_summary={
+                            'stage': 'denoise',
+                            'warmup_end_iter': int(current_iter),
+                            'warmup_trigger_reason': trigger_result['trigger_reason'],
+                            'freeze_iter': int(max(current_iter, int(total_iters * args.denoise_freeze_ratio))),
+                            **weight_update['summary'],
+                        },
+                        suspicious_df=weight_update['suspicious_df'],
+                        weight_df=weight_update['weight_df'],
+                        reliability_df=weight_update['reliability_df'],
+                    )
+                    sample_weight_map = weight_update['sample_weight_map']
+                    reliability_map = weight_update['reliability_map']
+                    stage = 'denoise'
+                    warmup_end_iter = current_iter
+                    freeze_iter = max(current_iter, int(total_iters * args.denoise_freeze_ratio))
+                    warmup_trigger_reason = trigger_result['trigger_reason']
+                    last_refresh_iter = current_iter
+                    print_fn('phase2 warmup end iter {}: reason={}, freeze_iter={}, weight_mean={}, weight_min={}, weight_max={}'.format(
+                        current_iter,
+                        warmup_trigger_reason,
+                        freeze_iter,
+                        weight_update['summary'].get('weight_mean'),
+                        weight_update['summary'].get('weight_min'),
+                        weight_update['summary'].get('weight_max'),
+                    ))
+
+            if phase2_enabled and stage == 'denoise' and current_iter > warmup_end_iter:
+                if current_iter >= freeze_iter:
+                    diagnosis_result = run_phase2_diagnosis(model, train_eval_dataloader, current_iter, manifest_path)
+                    save_phase2_artifacts(
+                        diagnosis_result['iter_dir'],
+                        extra_summary={
+                            'stage': 'freeze',
+                            'warmup_end_iter': int(warmup_end_iter),
+                            'freeze_iter': int(freeze_iter),
+                            'warmup_trigger_reason': warmup_trigger_reason,
+                            'weight_mean': float(np.mean(list(sample_weight_map.values()))) if len(sample_weight_map) > 0 else None,
+                            'weight_min': float(np.min(list(sample_weight_map.values()))) if len(sample_weight_map) > 0 else None,
+                            'weight_max': float(np.max(list(sample_weight_map.values()))) if len(sample_weight_map) > 0 else None,
+                            'reliability_mean': float(np.mean(list(reliability_map.values()))) if len(reliability_map) > 0 else None,
+                            'reliability_min': float(np.min(list(reliability_map.values()))) if len(reliability_map) > 0 else None,
+                            'reliability_max': float(np.max(list(reliability_map.values()))) if len(reliability_map) > 0 else None,
+                        },
+                    )
+                    stage = 'freeze'
+                    print_fn('phase2 freeze iter {}: weights frozen.'.format(current_iter))
+                elif last_refresh_iter is None or (current_iter - last_refresh_iter) >= args.denoise_refresh_interval:
+                    diagnosis_result = run_phase2_diagnosis(model, train_eval_dataloader, current_iter, manifest_path)
+                    weight_update = build_phase2_weight_update(
+                        diagnosis_result['df'].copy(),
+                        reliability_map=reliability_map,
+                        old_weight_map=sample_weight_map,
+                        min_weight=args.denoise_min_weight,
+                        weight_beta=args.warmup_weight_beta,
+                        weight_scope=args.denoise_weight_scope,
+                        reliability_ema=args.denoise_reliability_ema,
+                        weight_ema=args.denoise_weight_ema,
+                        clip_delta=args.denoise_weight_clip_delta,
+                        top_p=args.warmup_gmm_top_p,
+                    )
+                    save_phase2_artifacts(
+                        diagnosis_result['iter_dir'],
+                        extra_summary={
+                            'stage': 'denoise',
+                            'warmup_end_iter': int(warmup_end_iter),
+                            'freeze_iter': int(freeze_iter),
+                            'last_refresh_iter': int(current_iter),
+                            **weight_update['summary'],
+                        },
+                        suspicious_df=weight_update['suspicious_df'],
+                        weight_df=weight_update['weight_df'],
+                        reliability_df=weight_update['reliability_df'],
+                    )
+                    sample_weight_map = weight_update['sample_weight_map']
+                    reliability_map = weight_update['reliability_map']
+                    last_refresh_iter = current_iter
+                    print_fn('phase2 refresh iter {}: weight_mean={}, delta_mean_abs={}, clipped={}'.format(
+                        current_iter,
+                        weight_update['summary'].get('weight_mean'),
+                        weight_update['summary'].get('weight_delta_mean_abs'),
+                        weight_update['summary'].get('clipped_sample_count'),
+                    ))
+
+            if (not phase2_enabled) and postprocess_mode != 'none' and (not has_postprocessed) and current_iter == args.warmup_end_iter:
                 diagnosis_result = run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -484,6 +648,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_diag', action='store_true')
     parser.add_argument('--warmup_denoise', action='store_true')
     parser.add_argument('--warmup_postprocess_mode', type=str, default='none', choices=['none', 'remove', 'soft', 'hybrid'])
+    parser.add_argument('--warmup_auto_end', action='store_true')
     parser.add_argument('--warmup_milestones', type=str, default='50, 100, 200, 400, 600,1000,2000,4000')
     parser.add_argument('--warmup_end_iter', type=int, default=1000)
     parser.add_argument('--warmup_prune_ratio', type=float, default=0.05)
@@ -493,6 +658,20 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_min_weight', type=float, default=0.2)
     parser.add_argument('--warmup_weight_scope', type=str, default='class', choices=['class', 'global'])
     parser.add_argument('--warmup_save_scores_before_prune', action='store_true')
+    parser.add_argument('--warmup_check_start_ratio', type=float, default=0.1)
+    parser.add_argument('--warmup_check_end_ratio', type=float, default=0.4)
+    parser.add_argument('--warmup_check_interval', type=int, default=200)
+    parser.add_argument('--warmup_gmm_top_p', type=float, default=0.1)
+    parser.add_argument('--warmup_jaccard_threshold', type=float, default=0.7)
+    parser.add_argument('--warmup_gmm_patience', type=int, default=2)
+    parser.add_argument('--warmup_gmm_plateau_ratio', type=float, default=0.95)
+    parser.add_argument('--denoise_refresh_interval', type=int, default=500)
+    parser.add_argument('--denoise_reliability_ema', type=float, default=0.9)
+    parser.add_argument('--denoise_weight_ema', type=float, default=0.8)
+    parser.add_argument('--denoise_weight_clip_delta', type=float, default=0.1)
+    parser.add_argument('--denoise_min_weight', type=float, default=0.2)
+    parser.add_argument('--denoise_weight_scope', type=str, default='class', choices=['class', 'global'])
+    parser.add_argument('--denoise_freeze_ratio', type=float, default=0.7)
     parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
     parser.add_argument('--diag_manifest_path', type=str, default=None)
     parser.add_argument('--gpus', type=int, default=0)
