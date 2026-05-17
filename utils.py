@@ -67,20 +67,25 @@ def global_cosine_hm(a, b, alpha=1., factor=0.):
     return loss
 
 
-def global_cosine_hm_percent(a, b, p=0.9, factor=0.):
+def global_cosine_hm_percent(a, b, p=0.9, factor=0., sample_weight=None):
     cos_loss = torch.nn.CosineSimilarity()
     loss = 0
+    if sample_weight is not None:
+        sample_weight = sample_weight.reshape(-1).to(a[0].device)
     for item in range(len(a)):
         a_ = a[item].detach()
         b_ = b[item]
         with torch.no_grad():
             point_dist = 1 - cos_loss(a_, b_).unsqueeze(1)
-        # mean_dist = point_dist.mean()
-        # std_dist = point_dist.reshape(-1).std()
         thresh = torch.topk(point_dist.reshape(-1), k=int(point_dist.numel() * (1 - p)))[0][-1]
 
-        loss += torch.mean(1 - cos_loss(a_.reshape(a_.shape[0], -1),
-                                        b_.reshape(b_.shape[0], -1)))
+        sample_loss = 1 - cos_loss(a_.reshape(a_.shape[0], -1),
+                                   b_.reshape(b_.shape[0], -1))
+        if sample_weight is None:
+            loss += torch.mean(sample_loss)
+        else:
+            weight_sum = sample_weight.sum().clamp_min(1e-12)
+            loss += torch.sum(sample_weight * sample_loss) / weight_sum
 
         partial_func = partial(modify_grad, inds=point_dist < thresh, factor=factor)
         b_.register_hook(partial_func)

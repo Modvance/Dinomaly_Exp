@@ -47,14 +47,12 @@ def get_strong_transforms(size, isize, mean_train=None, std_train=None):
     return data_transforms
 
 
-class TrainDiagDataset(Dataset):
-    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0, contaminated_paths=None):
+class _BaseImageFolderMetaDataset(Dataset):
+    def __init__(self, dataset, data_root, class_name, class_id):
         self.dataset = dataset
         self.data_root = os.path.abspath(data_root)
         self.class_name = class_name
         self.class_id = class_id
-        self.sample_offset = sample_offset
-        self.contaminated_paths = contaminated_paths
 
     def __len__(self):
         return len(self.dataset)
@@ -68,23 +66,46 @@ class TrainDiagDataset(Dataset):
             base_dataset = self.dataset
         return base_dataset, base_idx
 
-    def __getitem__(self, idx):
-        image, label = self.dataset[idx]
+    def _build_base_meta(self, idx):
         base_dataset, base_idx = self._resolve_base_sample(idx)
         img_path = base_dataset.samples[base_idx][0]
         rel_path = os.path.relpath(img_path, self.data_root).replace('\\', '/')
+        return {
+            'img_path': img_path,
+            'rel_path': rel_path,
+            'class_name': self.class_name,
+            'class_id': self.class_id,
+            'base_idx': int(base_idx),
+        }
+
+
+class TrainDiagDataset(_BaseImageFolderMetaDataset):
+    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0, contaminated_paths=None):
+        super().__init__(dataset, data_root, class_name, class_id)
+        self.sample_offset = sample_offset
+        self.contaminated_paths = contaminated_paths
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        meta = self._build_base_meta(idx)
 
         is_contaminated = None
         if self.contaminated_paths is not None:
-            is_contaminated = int(rel_path in self.contaminated_paths)
+            is_contaminated = int(meta['rel_path'] in self.contaminated_paths)
 
-        meta = {
+        meta.update({
             'sample_idx': self.sample_offset + idx,
-            'img_path': img_path,
-            'class_name': self.class_name,
-            'class_id': self.class_id,
             'is_contaminated': -1 if is_contaminated is None else is_contaminated,
-        }
+        })
+        meta.pop('rel_path', None)
+        return image, label, meta
+
+
+class TrainWeightDataset(_BaseImageFolderMetaDataset):
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        meta = self._build_base_meta(idx)
+        meta.pop('rel_path', None)
         return image, label, meta
 
 

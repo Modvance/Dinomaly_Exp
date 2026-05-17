@@ -1,40 +1,32 @@
-# This is a sample Python script.
+import argparse
+import logging
+import os
+import random
+import time
+from functools import partial
 
-# Press ⌃R to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
-
+import numpy as np
 import torch
 import torch.nn as nn
-from dataset import get_data_transforms, get_strong_transforms, TrainDiagDataset
+from torch.utils.data import ConcatDataset, Subset
 from torchvision.datasets import ImageFolder
-import numpy as np
-import pandas as pd
-import random
-import os
-from torch.utils.data import DataLoader, ConcatDataset, Subset
 
-from models.uad import ViTill, ViTillv2
-from models import vit_encoder
+from dataset import MVTecDataset, TrainDiagDataset, TrainWeightDataset, get_data_transforms
 from dinov1.utils import trunc_normal_
-from models.vision_transformer import Block as VitBlock, bMlp, Attention, LinearAttention, \
-    LinearAttention2, ConvBlock, FeatureJitter
-from dataset import MVTecDataset
-import torch.backends.cudnn as cudnn
-import argparse
-from utils import evaluation_batch, global_cosine, regional_cosine_hm_percent, global_cosine_hm_percent, \
-    WarmCosineScheduler
-from torch.nn import functional as F
-from functools import partial
-from ptflops import get_model_complexity_info
+from models import vit_encoder
+from models.uad import ViTill
+from models.vision_transformer import Block as VitBlock, LinearAttention2, bMlp
 from optimizers import StableAdamW
-import warnings
-import copy
-import logging
-import time
-from sklearn.metrics import roc_auc_score, average_precision_score
-import itertools
-from warmup_diag import load_injected_manifest, parse_warmup_milestones, run_one_warmup_diagnosis, build_prune_plan, save_prune_plan
+from utils import WarmCosineScheduler, evaluation_batch, global_cosine_hm_percent
+from warmup_diag import (
+    build_warmup_postprocess_plan,
+    load_injected_manifest,
+    parse_warmup_milestones,
+    run_one_warmup_diagnosis,
+    save_prune_plan,
+)
 
+warnings = __import__('warnings')
 warnings.filterwarnings("ignore")
 
 
@@ -43,21 +35,17 @@ def get_logger(name, save_path=None, level='INFO'):
     logger.setLevel(getattr(logging, level))
 
     log_format = logging.Formatter('%(message)s')
-    streamHandler = logging.StreamHandler()
-    streamHandler.setFormatter(log_format)
-    logger.addHandler(streamHandler)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(log_format)
+    logger.addHandler(stream_handler)
 
-    if not save_path is None:
+    if save_path is not None:
         os.makedirs(save_path, exist_ok=True)
-        fileHandler = logging.FileHandler(os.path.join(save_path, 'log.txt'))
-        fileHandler.setFormatter(log_format)
-        logger.addHandler(fileHandler)
+        file_handler = logging.FileHandler(os.path.join(save_path, 'log.txt'))
+        file_handler.setFormatter(log_format)
+        logger.addHandler(file_handler)
 
     return logger
-
-
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def setup_seed(seed):
@@ -69,8 +57,22 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def build_train_dataloader(train_datasets, batch_size, num_workers):
-    train_data = ConcatDataset(train_datasets)
+def build_train_dataloader(train_datasets, batch_size, num_workers, data_root=None, item_list=None, with_meta=False):
+    if with_meta:
+        wrapped_datasets = []
+        for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
+            wrapped_datasets.append(
+                TrainWeightDataset(
+                    train_data,
+                    data_root=data_root,
+                    class_name=item,
+                    class_id=class_id,
+                )
+            )
+        train_data = ConcatDataset(wrapped_datasets)
+    else:
+        train_data = ConcatDataset(train_datasets)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_data,
         batch_size=batch_size,
@@ -107,6 +109,23 @@ def build_train_eval_dataloader(train_datasets, data_root, contaminated_paths, b
     return train_eval_dataloader
 
 
+def resolve_postprocess_mode(args):
+    if args.warmup_denoise and args.warmup_postprocess_mode == 'none':
+        return 'remove'
+    return args.warmup_postprocess_mode
+
+
+def build_batch_sample_weight(meta, sample_weight_map, device):
+    weights = []
+    for class_id, base_idx in zip(meta['class_id'], meta['base_idx']):
+        if torch.is_tensor(class_id):
+            class_id = class_id.item()
+        if torch.is_tensor(base_idx):
+            base_idx = base_idx.item()
+        weights.append(float(sample_weight_map.get((int(class_id), int(base_idx)), 1.0)))
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
 def train(item_list):
     setup_seed(1)
 
@@ -117,16 +136,15 @@ def train(item_list):
     crop_size = 392
     train_start_time = time.time()
     final_eval_summary = None
-
-    # image_size = 448
-    # crop_size = 448
+    postprocess_mode = resolve_postprocess_mode(args)
+    use_sample_weight = postprocess_mode in ['soft', 'hybrid']
 
     data_transform, gt_transform = get_data_transforms(image_size, crop_size)
 
     train_data_list = []
     test_data_list = []
     contaminated_paths, manifest_path = (None, None)
-    if args.warmup_diag or args.warmup_denoise:
+    if args.warmup_diag or postprocess_mode != 'none':
         contaminated_paths, manifest_path = load_injected_manifest(
             args.data_path,
             os.path.dirname(__file__),
@@ -150,10 +168,17 @@ def train(item_list):
         train_data_list.append(train_data)
         test_data_list.append(test_data)
 
-    train_data, train_dataloader = build_train_dataloader(train_data_list, batch_size=batch_size, num_workers=num_workers)
+    train_data, train_dataloader = build_train_dataloader(
+        train_data_list,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        data_root=args.data_path,
+        item_list=item_list,
+        with_meta=use_sample_weight,
+    )
 
     train_eval_dataloader = None
-    if args.warmup_diag or args.warmup_denoise:
+    if args.warmup_diag or postprocess_mode != 'none':
         train_eval_dataloader = build_train_eval_dataloader(
             train_data_list,
             data_root=args.data_path,
@@ -162,27 +187,11 @@ def train(item_list):
             num_workers=args.diag_num_workers,
             item_list=item_list,
         )
-    # test_dataloader_list = [torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False, num_workers=4)
-    #                         for test_data in test_data_list]
 
-    # encoder_name = 'dinov2reg_vit_small_14'
     encoder_name = 'dinov2reg_vit_base_14'
-    # encoder_name = 'dinov2reg_vit_large_14'
-
-    # encoder_name = 'dinov2_vit_base_14'
-    # encoder_name = 'dino_vit_base_16'
-    # encoder_name = 'ibot_vit_base_16'
-    # encoder_name = 'mae_vit_base_16'
-    # encoder_name = 'beitv2_vit_base_16'
-    # encoder_name = 'beit_vit_base_16'
-    # encoder_name = 'digpt_vit_base_16'
-    # encoder_name = 'deit_vit_base_16'
-
     target_layers = [2, 3, 4, 5, 6, 7, 8, 9]
     fuse_layer_encoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
     fuse_layer_decoder = [[0, 1, 2, 3], [4, 5, 6, 7]]
-
-    # target_layers = list(range(4, 19))
 
     encoder = vit_encoder.load(encoder_name)
 
@@ -194,75 +203,97 @@ def train(item_list):
         embed_dim, num_heads = 1024, 16
         target_layers = [4, 6, 8, 10, 12, 14, 16, 18]
     else:
-        raise "Architecture not in small, base, large."
+        raise RuntimeError('Architecture not in small, base, large.')
 
-    bottleneck = []
+    bottleneck = nn.ModuleList([bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.2)])
+
     decoder = []
-
-    bottleneck.append(bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.2))
-    # bottleneck.append(nn.Sequential(FeatureJitter(scale=40),
-    #                                 bMlp(embed_dim, embed_dim * 4, embed_dim, drop=0.)))
-
-    bottleneck = nn.ModuleList(bottleneck)
-
-    for i in range(8):
-        blk = VitBlock(dim=embed_dim, num_heads=num_heads, mlp_ratio=4.,
-                       qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-8),
-                       attn=LinearAttention2)
-        # blk = ConvBlock(dim=embed_dim, kernel_size=7, mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-8))
+    for _ in range(8):
+        blk = VitBlock(
+            dim=embed_dim,
+            num_heads=num_heads,
+            mlp_ratio=4.,
+            qkv_bias=True,
+            norm_layer=partial(nn.LayerNorm, eps=1e-8),
+            attn=LinearAttention2,
+        )
         decoder.append(blk)
     decoder = nn.ModuleList(decoder)
 
-    model = ViTill(encoder=encoder, bottleneck=bottleneck, decoder=decoder, target_layers=target_layers,
-                   mask_neighbor_size=0, fuse_layer_encoder=fuse_layer_encoder, fuse_layer_decoder=fuse_layer_decoder)
+    model = ViTill(
+        encoder=encoder,
+        bottleneck=bottleneck,
+        decoder=decoder,
+        target_layers=target_layers,
+        mask_neighbor_size=0,
+        fuse_layer_encoder=fuse_layer_encoder,
+        fuse_layer_decoder=fuse_layer_decoder,
+    )
     model = model.to(device)
     trainable = nn.ModuleList([bottleneck, decoder])
 
-    for m in trainable.modules():
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=0.01, a=-0.03, b=0.03)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
+    for module in trainable.modules():
+        if isinstance(module, nn.Linear):
+            trunc_normal_(module.weight, std=0.01, a=-0.03, b=0.03)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
 
-    optimizer = StableAdamW([{'params': trainable.parameters()}],
-                            lr=2e-3, betas=(0.9, 0.999), weight_decay=1e-4, amsgrad=True, eps=1e-10)
-    lr_scheduler = WarmCosineScheduler(optimizer, base_value=2e-3, final_value=2e-4, total_iters=total_iters,
-                                       warmup_iters=100)
+    optimizer = StableAdamW(
+        [{'params': trainable.parameters()}],
+        lr=2e-3,
+        betas=(0.9, 0.999),
+        weight_decay=1e-4,
+        amsgrad=True,
+        eps=1e-10,
+    )
+    lr_scheduler = WarmCosineScheduler(
+        optimizer,
+        base_value=2e-3,
+        final_value=2e-4,
+        total_iters=total_iters,
+        warmup_iters=100,
+    )
 
     print_fn('train image number:{}'.format(len(train_data)))
 
-    has_pruned = False
-
+    has_postprocessed = False
+    sample_weight_map = {}
     it = 0
-    for epoch in range(int(np.ceil(total_iters / len(train_dataloader)))):
+    for _ in range(int(np.ceil(total_iters / len(train_dataloader)))):
         model.train()
-
         loss_list = []
-        for img, label in train_dataloader:
+
+        for batch in train_dataloader:
+            if use_sample_weight:
+                img, label, meta = batch
+                batch_sample_weight = build_batch_sample_weight(meta, sample_weight_map, device)
+            else:
+                img, label = batch
+                meta = None
+                batch_sample_weight = None
+
             img = img.to(device)
             label = label.to(device)
 
             en, de = model(img)
-            # loss = global_cosine(en, de)
 
             p_final = 0.9
             p = min(p_final * it / 1000, p_final)
-            loss = global_cosine_hm_percent(en, de, p=p, factor=0.1)
-            # loss = global_cosine(en, de)
+            loss = global_cosine_hm_percent(en, de, p=p, factor=0.1, sample_weight=batch_sample_weight)
 
             optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm(trainable.parameters(), max_norm=0.1)
+            nn.utils.clip_grad_norm_(trainable.parameters(), max_norm=0.1)
 
             optimizer.step()
             loss_list.append(loss.item())
             lr_scheduler.step()
 
             current_iter = it + 1
-            if args.warmup_diag and current_iter in args.warmup_milestones and not (args.warmup_denoise and current_iter == args.warmup_end_iter):
+            if args.warmup_diag and current_iter in args.warmup_milestones and not (postprocess_mode != 'none' and current_iter == args.warmup_end_iter):
                 run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -275,7 +306,7 @@ def train(item_list):
                     manifest_path=manifest_path,
                 )
 
-            if args.warmup_denoise and (not has_pruned) and current_iter == args.warmup_end_iter:
+            if postprocess_mode != 'none' and (not has_postprocessed) and current_iter == args.warmup_end_iter:
                 diagnosis_result = run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -286,36 +317,40 @@ def train(item_list):
                     max_ratio=args.diag_max_ratio,
                     resize_mask=args.diag_resize_mask,
                     manifest_path=manifest_path,
-                    save_scores=args.warmup_save_scores_before_prune,
+                    save_scores=args.warmup_save_scores_before_prune or postprocess_mode in ['soft', 'hybrid'],
                 )
                 scored_df = diagnosis_result['df'].copy()
 
-                class_offsets = {}
-                offset = 0
-                for class_id, dataset in enumerate(train_data_list):
-                    class_offsets[class_id] = offset
-                    offset += len(dataset)
-                scored_df['local_idx'] = scored_df.apply(lambda row: int(row['sample_idx']) - class_offsets[int(row['class_id'])], axis=1)
-
-                prune_plan = build_prune_plan(
+                postprocess_prune_ratio = args.warmup_hybrid_prune_ratio if postprocess_mode == 'hybrid' else args.warmup_prune_ratio
+                postprocess_plan = build_warmup_postprocess_plan(
                     scored_df,
-                    prune_ratio=args.warmup_prune_ratio,
+                    mode=postprocess_mode,
+                    prune_ratio=postprocess_prune_ratio,
                     min_keep_per_class=args.warmup_min_keep_per_class,
+                    weight_beta=args.warmup_weight_beta,
+                    min_weight=args.warmup_min_weight,
+                    weight_scope=args.warmup_weight_scope,
                 )
-                save_prune_plan(diagnosis_result['iter_dir'], prune_plan, current_iter)
+                save_prune_plan(diagnosis_result['iter_dir'], postprocess_plan, current_iter)
 
-                pruned_train_data_list = []
-                for class_id, train_dataset in enumerate(train_data_list):
-                    retained_indices = prune_plan['retained_index_map'].get(class_id)
-                    if retained_indices is None:
-                        retained_indices = list(range(len(train_dataset)))
-                    pruned_train_data_list.append(Subset(train_dataset, retained_indices))
+                if postprocess_mode in ['remove', 'hybrid']:
+                    pruned_train_data_list = []
+                    for class_id, train_dataset in enumerate(train_data_list):
+                        retained_indices = postprocess_plan['retained_index_map'].get(class_id)
+                        if retained_indices is None:
+                            retained_indices = list(range(len(train_dataset)))
+                        pruned_train_data_list.append(Subset(train_dataset, retained_indices))
+                    train_data_list = pruned_train_data_list
 
-                train_data_list = pruned_train_data_list
+                sample_weight_map = postprocess_plan['sample_weight_map']
+                use_sample_weight = postprocess_mode in ['soft', 'hybrid']
                 train_data, train_dataloader = build_train_dataloader(
                     train_data_list,
                     batch_size=batch_size,
                     num_workers=num_workers,
+                    data_root=args.data_path,
+                    item_list=item_list,
+                    with_meta=use_sample_weight,
                 )
                 train_eval_dataloader = build_train_eval_dataloader(
                     train_data_list,
@@ -325,28 +360,33 @@ def train(item_list):
                     num_workers=args.diag_num_workers,
                     item_list=item_list,
                 )
-                has_pruned = True
-                print_fn('warmup denoise iter {}: pruned {} / {} training samples.'.format(
+                has_postprocessed = True
+                print_fn('warmup postprocess iter {}: mode={}, pruned {} / {} training samples.'.format(
                     current_iter,
-                    prune_plan['summary']['num_pruned'],
-                    prune_plan['summary']['num_samples_before_prune']))
-                for class_name, class_stats in prune_plan['summary']['class_counts'].items():
-                    print_fn('  {}: removed {}, retained {}'.format(
-                        class_name,
-                        class_stats['removed'],
-                        class_stats['retained']))
-                print_fn('train image number after prune:{}'.format(len(train_data)))
+                    postprocess_mode,
+                    postprocess_plan['summary'].get('num_pruned', 0),
+                    postprocess_plan['summary'].get('num_samples_before_prune', len(scored_df)),
+                ))
+                if 'weight_mean' in postprocess_plan['summary']:
+                    print_fn('warmup weights: mean={}, min={}, max={}'.format(
+                        postprocess_plan['summary'].get('weight_mean'),
+                        postprocess_plan['summary'].get('weight_min'),
+                        postprocess_plan['summary'].get('weight_max'),
+                    ))
+                print_fn('train image number after postprocess:{}'.format(len(train_data)))
                 model.train()
 
             if current_iter % 5000 == 0:
-                # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
-
                 auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
                 auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
 
                 for item, test_data in zip(item_list, test_data_list):
-                    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=batch_size, shuffle=False,
-                                                                  num_workers=4)
+                    test_dataloader = torch.utils.data.DataLoader(
+                        test_data,
+                        batch_size=batch_size,
+                        shuffle=False,
+                        num_workers=4,
+                    )
                     results = evaluation_batch(model, test_dataloader, device, max_ratio=0.01, resize_mask=256)
                     auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px = results
 
@@ -360,7 +400,16 @@ def train(item_list):
 
                     print_fn(
                         '{}: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
-                            item, auroc_sp, ap_sp, f1_sp, auroc_px, ap_px, f1_px, aupro_px))
+                            item,
+                            auroc_sp,
+                            ap_sp,
+                            f1_sp,
+                            auroc_px,
+                            ap_px,
+                            f1_px,
+                            aupro_px,
+                        )
+                    )
 
                 mean_auroc_sp = np.mean(auroc_sp_list)
                 mean_ap_sp = np.mean(ap_sp_list)
@@ -372,8 +421,15 @@ def train(item_list):
 
                 print_fn(
                     'Mean: I-Auroc:{:.4f}, I-AP:{:.4f}, I-F1:{:.4f}, P-AUROC:{:.4f}, P-AP:{:.4f}, P-F1:{:.4f}, P-AUPRO:{:.4f}'.format(
-                        mean_auroc_sp, mean_ap_sp, mean_f1_sp,
-                        mean_auroc_px, mean_ap_px, mean_f1_px, mean_aupro_px))
+                        mean_auroc_sp,
+                        mean_ap_sp,
+                        mean_f1_sp,
+                        mean_auroc_px,
+                        mean_ap_px,
+                        mean_f1_px,
+                        mean_aupro_px,
+                    )
+                )
                 final_eval_summary = {
                     'I-AUROC': mean_auroc_sp,
                     'I-AP': mean_ap_sp,
@@ -383,7 +439,6 @@ def train(item_list):
                     'P-F1': mean_f1_px,
                     'P-AUPRO': mean_aupro_px,
                 }
-
                 model.train()
 
             it += 1
@@ -397,7 +452,10 @@ def train(item_list):
     samples_per_sec = batch_size / time_per_iter
 
     print_fn('Training finished. Total time: {:.2f}s ({:.2f} min), {:.4f} s/iter'.format(
-        total_time, total_time / 60.0, time_per_iter))
+        total_time,
+        total_time / 60.0,
+        time_per_iter,
+    ))
     if final_eval_summary is not None:
         print_fn('I-AUROC      {:.2f}'.format(final_eval_summary['I-AUROC']))
         print_fn('I-AP         {:.2f}'.format(final_eval_summary['I-AP']))
@@ -414,14 +472,9 @@ def train(item_list):
     print_fn('  iters_per_sec     {:.4f}'.format(iters_per_sec))
     print_fn('  samples_per_sec   {:.2f}'.format(samples_per_sec))
 
-    # torch.save(model.state_dict(), os.path.join(args.save_dir, args.save_name, 'model.pth'))
-
-    return
-
 
 if __name__ == '__main__':
     os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-    import argparse
 
     parser = argparse.ArgumentParser(description='')
     parser.add_argument('--data_path', type=str, default='../mvtec_anomaly_detection')
@@ -430,10 +483,15 @@ if __name__ == '__main__':
                         default='vitill_mvtec_uni_dinov2br_c392_en29_bn4dp2_de8_laelu_md2_i1_it10k_sams2e3_wd1e4_w1hcosa2e4_ghmp09f01w01_b16_s1')
     parser.add_argument('--warmup_diag', action='store_true')
     parser.add_argument('--warmup_denoise', action='store_true')
+    parser.add_argument('--warmup_postprocess_mode', type=str, default='none', choices=['none', 'remove', 'soft', 'hybrid'])
     parser.add_argument('--warmup_milestones', type=str, default='50, 100, 200, 400, 600,1000,2000,4000')
     parser.add_argument('--warmup_end_iter', type=int, default=1000)
     parser.add_argument('--warmup_prune_ratio', type=float, default=0.05)
+    parser.add_argument('--warmup_hybrid_prune_ratio', type=float, default=0.05)
     parser.add_argument('--warmup_min_keep_per_class', type=int, default=20)
+    parser.add_argument('--warmup_weight_beta', type=float, default=1.0)
+    parser.add_argument('--warmup_min_weight', type=float, default=0.2)
+    parser.add_argument('--warmup_weight_scope', type=str, default='class', choices=['class', 'global'])
     parser.add_argument('--warmup_save_scores_before_prune', action='store_true')
     parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
     parser.add_argument('--diag_manifest_path', type=str, default=None)
@@ -444,7 +502,7 @@ if __name__ == '__main__':
     parser.add_argument('--diag_resize_mask', type=int, default=256)
     args = parser.parse_args()
     args.warmup_milestones = parse_warmup_milestones(args.warmup_milestones)
-    #
+
     item_list = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',
                  'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper']
     logger = get_logger(args.save_name, os.path.join(args.save_dir, args.save_name))

@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 import random
@@ -11,15 +12,20 @@ from torch.nn.init import trunc_normal_
 from torch.utils.data import ConcatDataset, Subset
 from torchvision.datasets import ImageFolder
 
-from dataset import MVTecDataset, TrainDiagDataset, get_data_transforms
+from dataset import MVTecDataset, TrainDiagDataset, TrainWeightDataset, get_data_transforms
 from models import vit_encoder
 from models.uad import ViTill
 from models.vision_transformer import Block as VitBlock, LinearAttention2, bMlp
 from optimizers import StableAdamW
 from utils import WarmCosineScheduler, evaluation_batch, global_cosine_hm_percent
-from warmup_diag import build_prune_plan, load_injected_manifest, parse_warmup_milestones, run_one_warmup_diagnosis, save_prune_plan
+from warmup_diag import (
+    build_warmup_postprocess_plan,
+    load_injected_manifest,
+    parse_warmup_milestones,
+    run_one_warmup_diagnosis,
+    save_prune_plan,
+)
 
-import argparse
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -52,8 +58,22 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def build_train_dataloader(train_datasets, batch_size, num_workers):
-    train_data = ConcatDataset(train_datasets)
+def build_train_dataloader(train_datasets, batch_size, num_workers, data_root=None, item_list=None, with_meta=False):
+    if with_meta:
+        wrapped_datasets = []
+        for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
+            wrapped_datasets.append(
+                TrainWeightDataset(
+                    train_data,
+                    data_root=data_root,
+                    class_name=item,
+                    class_id=class_id,
+                )
+            )
+        train_data = ConcatDataset(wrapped_datasets)
+    else:
+        train_data = ConcatDataset(train_datasets)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_data,
         batch_size=batch_size,
@@ -90,6 +110,23 @@ def build_train_eval_dataloader(train_datasets, data_root, contaminated_paths, b
     return train_eval_dataloader
 
 
+def resolve_postprocess_mode(args):
+    if args.warmup_denoise and args.warmup_postprocess_mode == 'none':
+        return 'remove'
+    return args.warmup_postprocess_mode
+
+
+def build_batch_sample_weight(meta, sample_weight_map, device):
+    weights = []
+    for class_id, base_idx in zip(meta['class_id'], meta['base_idx']):
+        if torch.is_tensor(class_id):
+            class_id = class_id.item()
+        if torch.is_tensor(base_idx):
+            base_idx = base_idx.item()
+        weights.append(float(sample_weight_map.get((int(class_id), int(base_idx)), 1.0)))
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
 def train(item_list):
     setup_seed(1)
 
@@ -100,13 +137,15 @@ def train(item_list):
     crop_size = 392
     train_start_time = time.time()
     final_eval_summary = None
+    postprocess_mode = resolve_postprocess_mode(args)
+    use_sample_weight = postprocess_mode in ['soft', 'hybrid']
 
     data_transform, gt_transform = get_data_transforms(image_size, crop_size)
 
     train_data_list = []
     test_data_list = []
     contaminated_paths, manifest_path = (None, None)
-    if args.warmup_diag or args.warmup_denoise:
+    if args.warmup_diag or postprocess_mode != 'none':
         contaminated_paths, manifest_path = load_injected_manifest(
             args.data_path,
             os.path.dirname(__file__),
@@ -130,10 +169,17 @@ def train(item_list):
         train_data_list.append(train_data)
         test_data_list.append(test_data)
 
-    train_data, train_dataloader = build_train_dataloader(train_data_list, batch_size=batch_size, num_workers=num_workers)
+    train_data, train_dataloader = build_train_dataloader(
+        train_data_list,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        data_root=args.data_path,
+        item_list=item_list,
+        with_meta=use_sample_weight,
+    )
 
     train_eval_dataloader = None
-    if args.warmup_diag or args.warmup_denoise:
+    if args.warmup_diag or postprocess_mode != 'none':
         train_eval_dataloader = build_train_eval_dataloader(
             train_data_list,
             data_root=args.data_path,
@@ -216,13 +262,22 @@ def train(item_list):
 
     print_fn('train image number:{}'.format(len(train_data)))
 
-    has_pruned = False
+    has_postprocessed = False
+    sample_weight_map = {}
     it = 0
     for _ in range(int(np.ceil(total_iters / len(train_dataloader)))):
         model.train()
         loss_list = []
 
-        for img, label in train_dataloader:
+        for batch in train_dataloader:
+            if use_sample_weight:
+                img, label, meta = batch
+                batch_sample_weight = build_batch_sample_weight(meta, sample_weight_map, device)
+            else:
+                img, label = batch
+                meta = None
+                batch_sample_weight = None
+
             img = img.to(device)
             label = label.to(device)
 
@@ -230,7 +285,7 @@ def train(item_list):
 
             p_final = 0.9
             p = min(p_final * it / 1000, p_final)
-            loss = global_cosine_hm_percent(en, de, p=p, factor=0.1)
+            loss = global_cosine_hm_percent(en, de, p=p, factor=0.1, sample_weight=batch_sample_weight)
 
             optimizer.zero_grad()
             loss.backward()
@@ -241,7 +296,7 @@ def train(item_list):
             lr_scheduler.step()
 
             current_iter = it + 1
-            if args.warmup_diag and current_iter in args.warmup_milestones and not (args.warmup_denoise and current_iter == args.warmup_end_iter):
+            if args.warmup_diag and current_iter in args.warmup_milestones and not (postprocess_mode != 'none' and current_iter == args.warmup_end_iter):
                 run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -254,7 +309,7 @@ def train(item_list):
                     manifest_path=manifest_path,
                 )
 
-            if args.warmup_denoise and (not has_pruned) and current_iter == args.warmup_end_iter:
+            if postprocess_mode != 'none' and (not has_postprocessed) and current_iter == args.warmup_end_iter:
                 diagnosis_result = run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -265,39 +320,40 @@ def train(item_list):
                     max_ratio=args.diag_max_ratio,
                     resize_mask=args.diag_resize_mask,
                     manifest_path=manifest_path,
-                    save_scores=args.warmup_save_scores_before_prune,
+                    save_scores=args.warmup_save_scores_before_prune or postprocess_mode in ['soft', 'hybrid'],
                 )
                 scored_df = diagnosis_result['df'].copy()
 
-                class_offsets = {}
-                offset = 0
-                for class_id, dataset in enumerate(train_data_list):
-                    class_offsets[class_id] = offset
-                    offset += len(dataset)
-                scored_df['local_idx'] = scored_df.apply(
-                    lambda row: int(row['sample_idx']) - class_offsets[int(row['class_id'])],
-                    axis=1,
-                )
-
-                prune_plan = build_prune_plan(
+                postprocess_prune_ratio = args.warmup_hybrid_prune_ratio if postprocess_mode == 'hybrid' else args.warmup_prune_ratio
+                postprocess_plan = build_warmup_postprocess_plan(
                     scored_df,
-                    prune_ratio=args.warmup_prune_ratio,
+                    mode=postprocess_mode,
+                    prune_ratio=postprocess_prune_ratio,
                     min_keep_per_class=args.warmup_min_keep_per_class,
+                    weight_beta=args.warmup_weight_beta,
+                    min_weight=args.warmup_min_weight,
+                    weight_scope=args.warmup_weight_scope,
                 )
-                save_prune_plan(diagnosis_result['iter_dir'], prune_plan, current_iter)
+                save_prune_plan(diagnosis_result['iter_dir'], postprocess_plan, current_iter)
 
-                pruned_train_data_list = []
-                for class_id, train_dataset in enumerate(train_data_list):
-                    retained_indices = prune_plan['retained_index_map'].get(class_id)
-                    if retained_indices is None:
-                        retained_indices = list(range(len(train_dataset)))
-                    pruned_train_data_list.append(Subset(train_dataset, retained_indices))
+                if postprocess_mode in ['remove', 'hybrid']:
+                    pruned_train_data_list = []
+                    for class_id, train_dataset in enumerate(train_data_list):
+                        retained_indices = postprocess_plan['retained_index_map'].get(class_id)
+                        if retained_indices is None:
+                            retained_indices = list(range(len(train_dataset)))
+                        pruned_train_data_list.append(Subset(train_dataset, retained_indices))
+                    train_data_list = pruned_train_data_list
 
-                train_data_list = pruned_train_data_list
+                sample_weight_map = postprocess_plan['sample_weight_map']
+                use_sample_weight = postprocess_mode in ['soft', 'hybrid']
                 train_data, train_dataloader = build_train_dataloader(
                     train_data_list,
                     batch_size=batch_size,
                     num_workers=num_workers,
+                    data_root=args.data_path,
+                    item_list=item_list,
+                    with_meta=use_sample_weight,
                 )
                 train_eval_dataloader = build_train_eval_dataloader(
                     train_data_list,
@@ -307,19 +363,20 @@ def train(item_list):
                     num_workers=args.diag_num_workers,
                     item_list=item_list,
                 )
-                has_pruned = True
-                print_fn('warmup denoise iter {}: pruned {} / {} training samples.'.format(
+                has_postprocessed = True
+                print_fn('warmup postprocess iter {}: mode={}, pruned {} / {} training samples.'.format(
                     current_iter,
-                    prune_plan['summary']['num_pruned'],
-                    prune_plan['summary']['num_samples_before_prune'],
+                    postprocess_mode,
+                    postprocess_plan['summary'].get('num_pruned', 0),
+                    postprocess_plan['summary'].get('num_samples_before_prune', len(scored_df)),
                 ))
-                for class_name, class_stats in prune_plan['summary']['class_counts'].items():
-                    print_fn('  {}: removed {}, retained {}'.format(
-                        class_name,
-                        class_stats['removed'],
-                        class_stats['retained'],
+                if 'weight_mean' in postprocess_plan['summary']:
+                    print_fn('warmup weights: mean={}, min={}, max={}'.format(
+                        postprocess_plan['summary'].get('weight_mean'),
+                        postprocess_plan['summary'].get('weight_min'),
+                        postprocess_plan['summary'].get('weight_max'),
                     ))
-                print_fn('train image number after prune:{}'.format(len(train_data)))
+                print_fn('train image number after postprocess:{}'.format(len(train_data)))
                 model.train()
 
             if current_iter % 5000 == 0:
@@ -435,14 +492,19 @@ if __name__ == '__main__':
     )
     parser.add_argument('--warmup_diag', action='store_true')
     parser.add_argument('--warmup_denoise', action='store_true')
+    parser.add_argument('--warmup_postprocess_mode', type=str, default='none', choices=['none', 'remove', 'soft', 'hybrid'])
     parser.add_argument('--warmup_milestones', type=str, default='50, 100, 200, 400, 600,1000,2000,4000')
     parser.add_argument('--warmup_end_iter', type=int, default=1000)
     parser.add_argument('--warmup_prune_ratio', type=float, default=0.05)
+    parser.add_argument('--warmup_hybrid_prune_ratio', type=float, default=0.05)
     parser.add_argument('--warmup_min_keep_per_class', type=int, default=20)
+    parser.add_argument('--warmup_weight_beta', type=float, default=1.0)
+    parser.add_argument('--warmup_min_weight', type=float, default=0.2)
+    parser.add_argument('--warmup_weight_scope', type=str, default='class', choices=['class', 'global'])
     parser.add_argument('--warmup_save_scores_before_prune', action='store_true')
     parser.add_argument('--diag_save_dir', type=str, default='./warmup_diag')
     parser.add_argument('--diag_manifest_path', type=str, default=None)
-    parser.add_argument('--gpus', type=int, default=0)
+    parser.add_argument('--gpu_id', type=int, default=0)
     parser.add_argument('--diag_batch_size', type=int, default=16)
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
@@ -458,7 +520,7 @@ if __name__ == '__main__':
     if not os.path.isabs(args.diag_save_dir):
         args.diag_save_dir = os.path.join(args.save_dir, args.save_name, args.diag_save_dir)
 
-    device = 'cuda:{}'.format(args.gpus) if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:{}'.format(args.gpu_id) if torch.cuda.is_available() else 'cpu'
     print_fn(device)
 
     train(item_list)

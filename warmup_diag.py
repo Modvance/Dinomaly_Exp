@@ -315,9 +315,47 @@ def _make_json_safe(value):
     return value
 
 
+def _require_identity_columns(df):
+    required_columns = ['class_id', 'image_score', 'base_idx']
+    missing_columns = [column for column in required_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError('missing required columns: {}'.format(', '.join(missing_columns)))
+
+
+def _build_kept_df(df, removed_df):
+    if len(removed_df) == 0:
+        return df.copy()
+    removed_keys = set(zip(removed_df['class_id'].tolist(), removed_df['base_idx'].tolist()))
+    keep_mask = [
+        (class_id, base_idx) not in removed_keys
+        for class_id, base_idx in zip(df['class_id'].tolist(), df['base_idx'].tolist())
+    ]
+    return df.loc[keep_mask].copy().reset_index(drop=True)
+
+
+def _build_weight_map(df):
+    sample_weight_map = {}
+    for _, row in df.iterrows():
+        sample_weight_map[(int(row['class_id']), int(row['base_idx']))] = float(row['sample_weight'])
+    return sample_weight_map
+
+
+def _compute_group_weights(class_df, beta, min_weight, eps):
+    class_df = class_df.copy()
+    median = float(class_df['image_score'].median())
+    mad = float(np.median(np.abs(class_df['image_score'].to_numpy() - median))) + float(eps)
+    z_score = (class_df['image_score'] - median) / mad
+    raw_weight = 1.0 / (1.0 + np.exp(float(beta) * z_score.to_numpy()))
+    sample_weight = np.clip(raw_weight, float(min_weight), 1.0)
+    class_df['score_median'] = median
+    class_df['score_mad'] = mad
+    class_df['z_score'] = z_score.astype(float)
+    class_df['sample_weight'] = sample_weight.astype(float)
+    return class_df
+
+
 def build_prune_plan(df, prune_ratio, min_keep_per_class):
-    if 'class_id' not in df.columns or 'image_score' not in df.columns:
-        raise ValueError('build_prune_plan requires class_id and image_score columns')
+    _require_identity_columns(df)
 
     pruned_frames = []
     retained_index_map = {}
@@ -334,7 +372,7 @@ def build_prune_plan(df, prune_ratio, min_keep_per_class):
         pruned_df = class_df.iloc[:remove_count].copy()
         retained_df = class_df.iloc[remove_count:].copy()
 
-        retained_index_map[int(class_id)] = [int(local_idx) for local_idx in retained_df['local_idx'].tolist()]
+        retained_index_map[int(class_id)] = [int(base_idx) for base_idx in retained_df['base_idx'].tolist()]
         class_name = str(class_df['class_name'].iloc[0]) if 'class_name' in class_df.columns and num_samples > 0 else str(class_id)
         class_counts[str(class_name)] = {
             'class_id': int(class_id),
@@ -347,7 +385,9 @@ def build_prune_plan(df, prune_ratio, min_keep_per_class):
             pruned_frames.append(pruned_df)
 
     pruned_samples = pd.concat(pruned_frames, ignore_index=True) if len(pruned_frames) > 0 else pd.DataFrame(columns=df.columns)
+    kept_samples = _build_kept_df(df, pruned_samples)
     summary = {
+        'mode': 'remove',
         'num_samples_before_prune': int(len(df)),
         'num_pruned': int(len(pruned_samples)),
         'num_retained': int(sum(len(indices) for indices in retained_index_map.values())),
@@ -356,10 +396,118 @@ def build_prune_plan(df, prune_ratio, min_keep_per_class):
         'class_counts': class_counts,
     }
     return {
+        'mode': 'remove',
         'pruned_samples': pruned_samples,
+        'kept_samples': kept_samples,
         'retained_index_map': retained_index_map,
+        'sample_weight_map': {},
+        'weighted_samples': pd.DataFrame(columns=df.columns),
         'summary': summary,
     }
+
+
+def build_soft_plan(df, beta, min_weight, weight_scope='class', eps=1e-6):
+    _require_identity_columns(df)
+
+    if weight_scope == 'class':
+        weighted_samples = pd.concat([
+            _compute_group_weights(class_df, beta=beta, min_weight=min_weight, eps=eps)
+            for _, class_df in df.groupby('class_id', sort=True)
+        ], ignore_index=True)
+    elif weight_scope == 'global':
+        weighted_samples = _compute_group_weights(df, beta=beta, min_weight=min_weight, eps=eps)
+    else:
+        raise ValueError('unsupported weight_scope {}'.format(weight_scope))
+
+    weighted_samples = weighted_samples.reset_index(drop=True)
+    retained_index_map = {
+        int(class_id): [int(base_idx) for base_idx in class_df['base_idx'].tolist()]
+        for class_id, class_df in weighted_samples.groupby('class_id', sort=True)
+    }
+    summary = {
+        'mode': 'soft',
+        'weight_scope': weight_scope,
+        'weight_beta': float(beta),
+        'min_weight': float(min_weight),
+        'num_samples_before_prune': int(len(df)),
+        'num_pruned': 0,
+        'num_retained': int(len(weighted_samples)),
+        'weight_mean': _safe_float(weighted_samples['sample_weight'].mean()),
+        'weight_std': _safe_float(weighted_samples['sample_weight'].std()),
+        'weight_min': _safe_float(weighted_samples['sample_weight'].min()),
+        'weight_max': _safe_float(weighted_samples['sample_weight'].max()),
+    }
+    return {
+        'mode': 'soft',
+        'pruned_samples': pd.DataFrame(columns=df.columns),
+        'kept_samples': weighted_samples.copy(),
+        'retained_index_map': retained_index_map,
+        'sample_weight_map': _build_weight_map(weighted_samples),
+        'weighted_samples': weighted_samples,
+        'summary': summary,
+    }
+
+
+def build_hybrid_plan(df, prune_ratio, min_keep_per_class, beta, min_weight, weight_scope='class', eps=1e-6):
+    prune_plan = build_prune_plan(df, prune_ratio=prune_ratio, min_keep_per_class=min_keep_per_class)
+    kept_samples = prune_plan['kept_samples'].copy()
+    soft_plan = build_soft_plan(kept_samples, beta=beta, min_weight=min_weight, weight_scope=weight_scope, eps=eps)
+    summary = dict(soft_plan['summary'])
+    summary.update({
+        'mode': 'hybrid',
+        'hybrid_prune_ratio': float(prune_ratio),
+        'min_keep_per_class': int(min_keep_per_class),
+        'num_samples_before_prune': int(len(df)),
+        'num_pruned': int(len(prune_plan['pruned_samples'])),
+        'num_retained': int(len(soft_plan['weighted_samples'])),
+        'class_counts': prune_plan['summary']['class_counts'],
+    })
+    return {
+        'mode': 'hybrid',
+        'pruned_samples': prune_plan['pruned_samples'],
+        'kept_samples': soft_plan['kept_samples'],
+        'retained_index_map': prune_plan['retained_index_map'],
+        'sample_weight_map': soft_plan['sample_weight_map'],
+        'weighted_samples': soft_plan['weighted_samples'],
+        'summary': summary,
+    }
+
+
+def build_warmup_postprocess_plan(df, mode, prune_ratio, min_keep_per_class, weight_beta, min_weight,
+                                  weight_scope='class', eps=1e-6):
+    if mode == 'none':
+        return {
+            'mode': 'none',
+            'pruned_samples': pd.DataFrame(columns=df.columns),
+            'kept_samples': df.copy(),
+            'retained_index_map': {
+                int(class_id): [int(base_idx) for base_idx in class_df['base_idx'].tolist()]
+                for class_id, class_df in df.groupby('class_id', sort=True)
+            },
+            'sample_weight_map': {},
+            'weighted_samples': pd.DataFrame(columns=df.columns),
+            'summary': {
+                'mode': 'none',
+                'num_samples_before_prune': int(len(df)),
+                'num_pruned': 0,
+                'num_retained': int(len(df)),
+            },
+        }
+    if mode == 'remove':
+        return build_prune_plan(df, prune_ratio=prune_ratio, min_keep_per_class=min_keep_per_class)
+    if mode == 'soft':
+        return build_soft_plan(df, beta=weight_beta, min_weight=min_weight, weight_scope=weight_scope, eps=eps)
+    if mode == 'hybrid':
+        return build_hybrid_plan(
+            df,
+            prune_ratio=prune_ratio,
+            min_keep_per_class=min_keep_per_class,
+            beta=weight_beta,
+            min_weight=min_weight,
+            weight_scope=weight_scope,
+            eps=eps,
+        )
+    raise ValueError('unsupported warmup postprocess mode {}'.format(mode))
 
 
 def save_prune_plan(iter_dir, prune_plan, current_iter):
@@ -369,7 +517,13 @@ def save_prune_plan(iter_dir, prune_plan, current_iter):
     with open(os.path.join(iter_dir, 'prune_summary.json'), 'w') as file:
         json.dump(_make_json_safe(prune_summary), file, indent=2)
 
-    prune_plan['pruned_samples'].to_csv(os.path.join(iter_dir, 'pruned_samples.csv'), index=False)
+    if len(prune_plan['pruned_samples']) > 0:
+        prune_plan['pruned_samples'].to_csv(os.path.join(iter_dir, 'removed_samples.csv'), index=False)
+        prune_plan['pruned_samples'].to_csv(os.path.join(iter_dir, 'pruned_samples.csv'), index=False)
+    if 'kept_samples' in prune_plan and len(prune_plan['kept_samples']) > 0:
+        prune_plan['kept_samples'].to_csv(os.path.join(iter_dir, 'kept_samples.csv'), index=False)
+    if 'weighted_samples' in prune_plan and len(prune_plan['weighted_samples']) > 0:
+        prune_plan['weighted_samples'].to_csv(os.path.join(iter_dir, 'sample_weights.csv'), index=False)
 
 
 def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, print_fn=None, max_ratio=0.01,
