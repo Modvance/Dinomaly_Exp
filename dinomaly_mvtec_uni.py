@@ -369,6 +369,7 @@ def train(item_list):
                     patience=args.warmup_gmm_patience,
                     plateau_ratio=args.warmup_gmm_plateau_ratio,
                     primary_metric_name=args.warmup_primary_metric,
+                    trigger_mode=args.warmup_trigger_mode,
                     force_trigger=current_iter >= t_max,
                 )
                 save_phase2_artifacts(
@@ -427,10 +428,11 @@ def train(item_list):
                     stage = 'denoise'
                     warmup_trigger_reason = trigger_result['trigger_reason']
                     last_refresh_iter = current_iter
-                    print_fn('phase2 warmup end iter {} (trigger iter {}): metric={}, reason={}, freeze_iter={}, weight_mean={}, weight_min={}, weight_max={}'.format(
+                    print_fn('phase2 warmup end iter {} (trigger iter {}): metric={}, mode={}, reason={}, freeze_iter={}, weight_mean={}, weight_min={}, weight_max={}'.format(
                         warmup_end_iter,
                         warmup_trigger_iter,
                         args.warmup_primary_metric,
+                        args.warmup_trigger_mode,
                         warmup_trigger_reason,
                         freeze_iter,
                         weight_update['summary'].get('weight_mean'),
@@ -688,6 +690,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_check_interval', type=int, default=20)
     parser.add_argument('--warmup_gmm_top_p', type=float, default=0.1)
     parser.add_argument('--warmup_primary_metric', type=str, default='D_t', choices=['D_t', 'score_gap'])
+    parser.add_argument('--warmup_trigger_mode', type=str, default='plateau', choices=['plateau', 'peak_patience'])
     parser.add_argument('--warmup_jaccard_threshold', type=float, default=0.7)
     parser.add_argument('--warmup_gmm_patience', type=int, default=2)
     parser.add_argument('--warmup_gmm_plateau_ratio', type=float, default=0.95)

@@ -476,9 +476,60 @@ def build_top_suspicious_samples(df, top_p):
     return suspicious_df, suspicious_keys, top_count
 
 
+def _evaluate_trigger_policy(trigger_mode, current_primary_value, best_primary_value, previous_best_primary_value,
+                             no_improve_count, J_t, patience, plateau_ratio, jaccard_threshold,
+                             force_trigger=False):
+    patience_exhausted = int(no_improve_count) >= int(patience)
+    plateau_ready = (
+        previous_best_primary_value is not None
+        and current_primary_value >= float(plateau_ratio) * float(best_primary_value)
+        and patience_exhausted
+        and J_t is not None
+        and J_t >= float(jaccard_threshold)
+    )
+    peak_patience_ready = previous_best_primary_value is not None and patience_exhausted
+
+    if trigger_mode == 'plateau':
+        mode_triggered = plateau_ready
+        trigger_reason = 'plateau' if plateau_ready else 'none'
+        trigger_uses_aux_jaccard = True
+        trigger_uses_plateau_ratio = True
+    elif trigger_mode == 'peak_patience':
+        mode_triggered = peak_patience_ready
+        trigger_reason = 'peak_patience' if peak_patience_ready else 'none'
+        trigger_uses_aux_jaccard = False
+        trigger_uses_plateau_ratio = False
+    else:
+        raise ValueError(f'unsupported warm-up trigger mode: {trigger_mode}')
+
+    if force_trigger:
+        return {
+            'triggered': True,
+            'trigger_reason': 'forced',
+            'force_triggered': True,
+            'patience_exhausted': bool(patience_exhausted),
+            'trigger_uses_aux_jaccard': trigger_uses_aux_jaccard,
+            'trigger_uses_plateau_ratio': trigger_uses_plateau_ratio,
+            'plateau_ready': bool(plateau_ready),
+            'peak_patience_ready': bool(peak_patience_ready),
+        }
+
+    return {
+        'triggered': bool(mode_triggered),
+        'trigger_reason': trigger_reason,
+        'force_triggered': False,
+        'patience_exhausted': bool(patience_exhausted),
+        'trigger_uses_aux_jaccard': trigger_uses_aux_jaccard,
+        'trigger_uses_plateau_ratio': trigger_uses_plateau_ratio,
+        'plateau_ready': bool(plateau_ready),
+        'peak_patience_ready': bool(peak_patience_ready),
+    }
+
+
+
 def evaluate_warmup_trigger(scored_df, best_primary_value, best_primary_iter, no_improve_count,
                             last_suspicious_keys, current_iter, top_p, jaccard_threshold,
-                            patience, plateau_ratio, primary_metric_name='D_t', eps=1e-6,
+                            patience, plateau_ratio, primary_metric_name='D_t', trigger_mode='plateau', eps=1e-6,
                             random_state=0, force_trigger=False):
     annotated_df, gmm_stats = annotate_scores_with_gmm(scored_df, eps=eps, random_state=random_state)
     diagnosis_summary = compute_warmup_diagnostics(annotated_df)
@@ -506,16 +557,19 @@ def evaluate_warmup_trigger(scored_df, best_primary_value, best_primary_iter, no
     else:
         no_improve_count = int(no_improve_count) + 1
 
-    plateau_ready = (
-        previous_best_primary_value is not None
-        and current_primary_value >= float(plateau_ratio) * float(best_primary_value)
-        and int(no_improve_count) >= int(patience)
-        and J_t is not None
-        and J_t >= float(jaccard_threshold)
+    trigger_eval = _evaluate_trigger_policy(
+        trigger_mode=trigger_mode,
+        current_primary_value=current_primary_value,
+        best_primary_value=best_primary_value,
+        previous_best_primary_value=previous_best_primary_value,
+        no_improve_count=no_improve_count,
+        J_t=J_t,
+        patience=patience,
+        plateau_ratio=plateau_ratio,
+        jaccard_threshold=jaccard_threshold,
+        force_trigger=force_trigger,
     )
 
-    triggered = bool(force_trigger or plateau_ready)
-    trigger_reason = 'forced' if force_trigger else ('plateau' if plateau_ready else 'none')
     summary = {
         'stage': 'warmup',
         'iteration': int(current_iter),
@@ -525,6 +579,7 @@ def evaluate_warmup_trigger(scored_df, best_primary_value, best_primary_iter, no
         'score_gap': _safe_float(score_gap),
         'J_t': _safe_float(J_t),
         'warmup_primary_metric': str(primary_metric_name),
+        'warmup_trigger_mode': str(trigger_mode),
         'primary_metric_value': _safe_float(current_primary_value),
         'best_primary_value': _safe_float(best_primary_value),
         'best_primary_iter': None if best_primary_iter is None else int(best_primary_iter),
@@ -534,10 +589,15 @@ def evaluate_warmup_trigger(scored_df, best_primary_value, best_primary_iter, no
         'jaccard_threshold': float(jaccard_threshold),
         'patience': int(patience),
         'plateau_ratio': float(plateau_ratio),
-        'triggered': bool(triggered),
-        'trigger_reason': trigger_reason,
+        'triggered': bool(trigger_eval['triggered']),
+        'trigger_reason': trigger_eval['trigger_reason'],
         'warmup_trigger_iter': int(current_iter),
-        'trigger_uses_aux_jaccard': True,
+        'force_triggered': bool(trigger_eval['force_triggered']),
+        'patience_exhausted': bool(trigger_eval['patience_exhausted']),
+        'trigger_uses_aux_jaccard': bool(trigger_eval['trigger_uses_aux_jaccard']),
+        'trigger_uses_plateau_ratio': bool(trigger_eval['trigger_uses_plateau_ratio']),
+        'plateau_ready': bool(trigger_eval['plateau_ready']),
+        'peak_patience_ready': bool(trigger_eval['peak_patience_ready']),
         'best_D': _safe_float(best_primary_value) if primary_metric_name == 'D_t' else None,
         'previous_best_D': _safe_float(previous_best_primary_value) if primary_metric_name == 'D_t' else None,
         'improved_D': bool(improved_primary_metric) if primary_metric_name == 'D_t' else None,
@@ -548,8 +608,8 @@ def evaluate_warmup_trigger(scored_df, best_primary_value, best_primary_iter, no
         'scored_df': annotated_df,
         'suspicious_df': suspicious_df,
         'suspicious_keys': suspicious_keys,
-        'triggered': triggered,
-        'trigger_reason': trigger_reason,
+        'triggered': trigger_eval['triggered'],
+        'trigger_reason': trigger_eval['trigger_reason'],
         'best_primary_value': best_primary_value,
         'best_primary_iter': best_primary_iter,
         'no_improve_count': no_improve_count,
