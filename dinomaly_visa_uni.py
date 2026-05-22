@@ -23,6 +23,7 @@ from warmup_diag import (
     build_warmup_postprocess_plan,
     evaluate_warmup_trigger,
     load_injected_manifest,
+    load_saved_train_scores,
     parse_warmup_milestones,
     run_one_warmup_diagnosis,
     save_phase2_artifacts,
@@ -185,6 +186,9 @@ def train(item_list):
         else:
             print_fn('warmup diagnosis: loaded contamination manifest {}.'.format(manifest_path))
 
+    if phase2_enabled and args.warmup_primary_metric == 'score_gap' and contaminated_paths is None:
+        raise ValueError('--warmup_primary_metric score_gap requires contamination-aware metrics. Please provide a valid inject_defects manifest via --diag_manifest_path.')
+
     for i, item in enumerate(item_list):
         train_path = os.path.join(args.data_path, item, 'train')
         test_path = os.path.join(args.data_path, item)
@@ -296,9 +300,11 @@ def train(item_list):
     reliability_map = {}
     stage = 'warmup' if phase2_enabled else 'baseline'
     warmup_end_iter = None
+    warmup_trigger_iter = None
     freeze_iter = None
     warmup_trigger_reason = None
-    best_D = None
+    best_primary_value = None
+    best_primary_iter = None
     no_improve_count = 0
     last_suspicious_keys = None
     last_refresh_iter = None
@@ -356,7 +362,8 @@ def train(item_list):
                 t_max = max(1, int(total_iters * args.warmup_check_end_ratio))
                 trigger_result = evaluate_warmup_trigger(
                     diagnosis_result['df'].copy(),
-                    best_D=best_D,
+                    best_primary_value=best_primary_value,
+                    best_primary_iter=best_primary_iter,
                     no_improve_count=no_improve_count,
                     last_suspicious_keys=last_suspicious_keys,
                     current_iter=current_iter,
@@ -364,6 +371,7 @@ def train(item_list):
                     jaccard_threshold=args.warmup_jaccard_threshold,
                     patience=args.warmup_gmm_patience,
                     plateau_ratio=args.warmup_gmm_plateau_ratio,
+                    primary_metric_name=args.warmup_primary_metric,
                     force_trigger=current_iter >= t_max,
                 )
                 save_phase2_artifacts(
@@ -371,12 +379,25 @@ def train(item_list):
                     extra_summary=trigger_result['summary'],
                     suspicious_df=trigger_result['suspicious_df'],
                 )
-                best_D = trigger_result['best_D']
+                best_primary_value = trigger_result['best_primary_value']
+                best_primary_iter = trigger_result['best_primary_iter']
                 no_improve_count = trigger_result['no_improve_count']
                 last_suspicious_keys = trigger_result['suspicious_keys']
                 if trigger_result['triggered']:
+                    warmup_trigger_iter = current_iter
+                    warmup_end_iter = trigger_result['best_primary_iter']
+                    if warmup_end_iter is None:
+                        raise ValueError('warm-up trigger fired without a best_primary_iter')
+
+                    if warmup_end_iter == current_iter:
+                        weight_scored_df = trigger_result['scored_df']
+                        weight_source_iter = current_iter
+                    else:
+                        weight_scored_df, _ = load_saved_train_scores(args.diag_save_dir, warmup_end_iter)
+                        weight_source_iter = warmup_end_iter
+
                     weight_update = build_phase2_weight_update(
-                        trigger_result['scored_df'],
+                        weight_scored_df,
                         reliability_map=reliability_map,
                         old_weight_map=sample_weight_map,
                         min_weight=args.denoise_min_weight,
@@ -387,13 +408,17 @@ def train(item_list):
                         clip_delta=args.denoise_weight_clip_delta,
                         top_p=args.warmup_gmm_top_p,
                     )
+                    freeze_iter = max(warmup_end_iter, int(total_iters * args.denoise_freeze_ratio))
                     save_phase2_artifacts(
                         diagnosis_result['iter_dir'],
                         extra_summary={
                             'stage': 'denoise',
-                            'warmup_end_iter': int(current_iter),
+                            'warmup_trigger_iter': int(warmup_trigger_iter),
+                            'warmup_end_iter': int(warmup_end_iter),
+                            'weight_init_source_iter': int(weight_source_iter),
+                            'best_iter_less_than_trigger_iter': bool(warmup_end_iter < warmup_trigger_iter),
                             'warmup_trigger_reason': trigger_result['trigger_reason'],
-                            'freeze_iter': int(max(current_iter, int(total_iters * args.denoise_freeze_ratio))),
+                            'freeze_iter': int(freeze_iter),
                             **weight_update['summary'],
                         },
                         suspicious_df=weight_update['suspicious_df'],
@@ -403,12 +428,12 @@ def train(item_list):
                     sample_weight_map = weight_update['sample_weight_map']
                     reliability_map = weight_update['reliability_map']
                     stage = 'denoise'
-                    warmup_end_iter = current_iter
-                    freeze_iter = max(current_iter, int(total_iters * args.denoise_freeze_ratio))
                     warmup_trigger_reason = trigger_result['trigger_reason']
                     last_refresh_iter = current_iter
-                    print_fn('phase2 warmup end iter {}: reason={}, freeze_iter={}, weight_mean={}, weight_min={}, weight_max={}'.format(
-                        current_iter,
+                    print_fn('phase2 warmup end iter {} (trigger iter {}): metric={}, reason={}, freeze_iter={}, weight_mean={}, weight_min={}, weight_max={}'.format(
+                        warmup_end_iter,
+                        warmup_trigger_iter,
+                        args.warmup_primary_metric,
                         warmup_trigger_reason,
                         freeze_iter,
                         weight_update['summary'].get('weight_mean'),
@@ -671,6 +696,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_check_end_ratio', type=float, default=0.4)
     parser.add_argument('--warmup_check_interval', type=int, default=200)
     parser.add_argument('--warmup_gmm_top_p', type=float, default=0.1)
+    parser.add_argument('--warmup_primary_metric', type=str, default='D_t', choices=['D_t', 'score_gap'])
     parser.add_argument('--warmup_jaccard_threshold', type=float, default=0.7)
     parser.add_argument('--warmup_gmm_patience', type=int, default=2)
     parser.add_argument('--warmup_gmm_plateau_ratio', type=float, default=0.95)

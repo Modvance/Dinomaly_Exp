@@ -49,4 +49,12 @@ python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 
 
 ```bash
 python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/phase2/ --save_name mvtec --gpus 1 --warmup_auto_end --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/phase2/ --save_name k4 --gpus 1 --warmup_auto_end --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/phase2/ --save_name k1 --gpus 1 --warmup_auto_end --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt
+```
+
+```bash
+python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_0 --warmup_diag --warmup_milestones 50,100,150,200,250,300,350,400,450,500,550,600,650,700,750,800,850,900,950,1000 --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --gpus 1
+python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_hard --gpus 2 --warmup_postprocess_mode remove --warmup_end_iter 150 --warmup_prune_ratio 0.10 --warmup_min_keep_per_class 20 --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --warmup_save_scores_before_prune
+python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_soft --gpus 3 --warmup_postprocess_mode soft --warmup_end_iter 150 --warmup_weight_beta 1.0 --warmup_min_weight 0.2 --warmup_weight_scope class --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --warmup_save_scores_before_prune
 ```

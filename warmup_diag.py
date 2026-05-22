@@ -476,25 +476,39 @@ def build_top_suspicious_samples(df, top_p):
     return suspicious_df, suspicious_keys, top_count
 
 
-def evaluate_warmup_trigger(scored_df, best_D, no_improve_count, last_suspicious_keys, current_iter,
-                            top_p, jaccard_threshold, patience, plateau_ratio, eps=1e-6,
+def evaluate_warmup_trigger(scored_df, best_primary_value, best_primary_iter, no_improve_count,
+                            last_suspicious_keys, current_iter, top_p, jaccard_threshold,
+                            patience, plateau_ratio, primary_metric_name='D_t', eps=1e-6,
                             random_state=0, force_trigger=False):
     annotated_df, gmm_stats = annotate_scores_with_gmm(scored_df, eps=eps, random_state=random_state)
+    diagnosis_summary = compute_warmup_diagnostics(annotated_df)
     suspicious_df, suspicious_keys, top_count = build_top_suspicious_samples(annotated_df, top_p=top_p)
     J_t = _compute_jaccard(last_suspicious_keys, suspicious_keys)
     D_t = float(gmm_stats['D_t'])
+    score_gap = diagnosis_summary.get('score_gap')
 
-    previous_best_D = None if best_D is None else float(best_D)
-    improved = previous_best_D is None or D_t > previous_best_D
-    if improved:
-        best_D = D_t
+    if primary_metric_name == 'D_t':
+        current_primary_value = D_t
+    elif primary_metric_name == 'score_gap':
+        current_primary_value = score_gap
+        if current_primary_value is None:
+            raise ValueError('warmup_primary_metric=score_gap requires contamination-aware score_gap metrics. Please provide a valid inject_defects manifest via --diag_manifest_path.')
+        current_primary_value = float(current_primary_value)
+    else:
+        raise ValueError(f'unsupported warm-up primary metric: {primary_metric_name}')
+
+    previous_best_primary_value = None if best_primary_value is None else float(best_primary_value)
+    improved_primary_metric = previous_best_primary_value is None or current_primary_value > previous_best_primary_value
+    if improved_primary_metric:
+        best_primary_value = current_primary_value
+        best_primary_iter = int(current_iter)
         no_improve_count = 0
     else:
         no_improve_count = int(no_improve_count) + 1
 
     plateau_ready = (
-        previous_best_D is not None
-        and D_t >= float(plateau_ratio) * float(best_D)
+        previous_best_primary_value is not None
+        and current_primary_value >= float(plateau_ratio) * float(best_primary_value)
         and int(no_improve_count) >= int(patience)
         and J_t is not None
         and J_t >= float(jaccard_threshold)
@@ -508,16 +522,25 @@ def evaluate_warmup_trigger(scored_df, best_D, no_improve_count, last_suspicious
         'top_p': float(top_p),
         'top_count': int(top_count),
         'D_t': D_t,
+        'score_gap': _safe_float(score_gap),
         'J_t': _safe_float(J_t),
-        'best_D': _safe_float(best_D),
-        'previous_best_D': _safe_float(previous_best_D),
+        'warmup_primary_metric': str(primary_metric_name),
+        'primary_metric_value': _safe_float(current_primary_value),
+        'best_primary_value': _safe_float(best_primary_value),
+        'best_primary_iter': None if best_primary_iter is None else int(best_primary_iter),
+        'previous_best_primary_value': _safe_float(previous_best_primary_value),
         'no_improve_count': int(no_improve_count),
-        'improved_D': bool(improved),
+        'improved_primary_metric': bool(improved_primary_metric),
         'jaccard_threshold': float(jaccard_threshold),
         'patience': int(patience),
         'plateau_ratio': float(plateau_ratio),
         'triggered': bool(triggered),
         'trigger_reason': trigger_reason,
+        'warmup_trigger_iter': int(current_iter),
+        'trigger_uses_aux_jaccard': True,
+        'best_D': _safe_float(best_primary_value) if primary_metric_name == 'D_t' else None,
+        'previous_best_D': _safe_float(previous_best_primary_value) if primary_metric_name == 'D_t' else None,
+        'improved_D': bool(improved_primary_metric) if primary_metric_name == 'D_t' else None,
     }
     summary.update(gmm_stats)
 
@@ -527,8 +550,11 @@ def evaluate_warmup_trigger(scored_df, best_D, no_improve_count, last_suspicious
         'suspicious_keys': suspicious_keys,
         'triggered': triggered,
         'trigger_reason': trigger_reason,
-        'best_D': best_D,
+        'best_primary_value': best_primary_value,
+        'best_primary_iter': best_primary_iter,
         'no_improve_count': no_improve_count,
+        'current_primary_value': current_primary_value,
+        'primary_metric_name': primary_metric_name,
         'summary': summary,
     }
 
@@ -824,6 +850,13 @@ def save_phase2_artifacts(iter_dir, extra_summary=None, suspicious_df=None, weig
         weight_df.to_csv(os.path.join(iter_dir, 'sample_weights.csv'), index=False)
     if reliability_df is not None and len(reliability_df) > 0:
         reliability_df.to_csv(os.path.join(iter_dir, 'reliability_bank.csv'), index=False)
+
+
+def load_saved_train_scores(save_dir, iteration):
+    score_path = os.path.join(save_dir, 'iter_{:05d}'.format(int(iteration)), 'train_scores.csv')
+    if not os.path.isfile(score_path):
+        raise FileNotFoundError('saved train scores not found for iter {}: {}'.format(int(iteration), score_path))
+    return pd.read_csv(score_path), score_path
 
 
 def run_one_warmup_diagnosis(model, loader, device, save_dir, current_iter, print_fn=None, max_ratio=0.01,
