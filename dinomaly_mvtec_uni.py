@@ -660,7 +660,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_save_scores_before_prune', action='store_true')
     parser.add_argument('--warmup_check_start_ratio', type=float, default=0.01)
     parser.add_argument('--warmup_check_end_ratio', type=float, default=0.15)
-    parser.add_argument('--warmup_check_interval', type=int, default=200)
+    parser.add_argument('--warmup_check_interval', type=int, default=20)
     parser.add_argument('--warmup_gmm_top_p', type=float, default=0.1)
     parser.add_argument('--warmup_jaccard_threshold', type=float, default=0.7)
     parser.add_argument('--warmup_gmm_patience', type=int, default=2)
