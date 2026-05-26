@@ -156,6 +156,66 @@ def run_phase2_diagnosis(model, train_eval_dataloader, current_iter, manifest_pa
     )
 
 
+def resolve_warmup_scored_df(trigger_result, current_iter, save_dir):
+    warmup_end_iter = trigger_result['best_primary_iter']
+    if warmup_end_iter is None:
+        raise ValueError('warm-up trigger fired without a best_primary_iter')
+    if int(warmup_end_iter) == int(current_iter):
+        return trigger_result['scored_df'].copy(), int(current_iter), None
+    scored_df, score_path = load_saved_train_scores(save_dir, warmup_end_iter)
+    return scored_df.copy(), int(warmup_end_iter), score_path
+
+
+def apply_warmup_postprocess(train_data_list, scored_df, postprocess_mode, contaminated_paths):
+    postprocess_prune_ratio = args.warmup_hybrid_prune_ratio if postprocess_mode == 'hybrid' else args.warmup_prune_ratio
+    postprocess_plan = build_warmup_postprocess_plan(
+        scored_df,
+        mode=postprocess_mode,
+        prune_ratio=postprocess_prune_ratio,
+        min_keep_per_class=args.warmup_min_keep_per_class,
+        weight_beta=args.warmup_weight_beta,
+        min_weight=args.warmup_min_weight,
+        weight_scope=args.warmup_weight_scope,
+    )
+
+    if postprocess_mode in ['remove', 'hybrid']:
+        pruned_train_data_list = []
+        for class_id, train_dataset in enumerate(train_data_list):
+            retained_indices = postprocess_plan['retained_index_map'].get(class_id)
+            if retained_indices is None:
+                retained_indices = list(range(len(train_dataset)))
+            pruned_train_data_list.append(Subset(train_dataset, retained_indices))
+        train_data_list = pruned_train_data_list
+
+    updated_sample_weight_map = postprocess_plan['sample_weight_map']
+    updated_use_sample_weight = postprocess_mode in ['soft', 'hybrid']
+    train_data, train_dataloader = build_train_dataloader(
+        train_data_list,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        data_root=args.data_path,
+        item_list=item_list,
+        with_meta=updated_use_sample_weight,
+    )
+    train_eval_dataloader = build_train_eval_dataloader(
+        train_data_list,
+        data_root=args.data_path,
+        contaminated_paths=contaminated_paths,
+        batch_size=args.diag_batch_size,
+        num_workers=args.diag_num_workers,
+        item_list=item_list,
+    )
+    return {
+        'train_data_list': train_data_list,
+        'train_data': train_data,
+        'train_dataloader': train_dataloader,
+        'train_eval_dataloader': train_eval_dataloader,
+        'sample_weight_map': updated_sample_weight_map,
+        'use_sample_weight': updated_use_sample_weight,
+        'postprocess_plan': postprocess_plan,
+    }
+
+
 def train(item_list):
     setup_seed(1)
 
@@ -167,15 +227,19 @@ def train(item_list):
     train_start_time = time.time()
     final_eval_summary = None
     postprocess_mode = resolve_postprocess_mode(args)
-    phase2_enabled = args.warmup_auto_end
-    use_sample_weight = phase2_enabled or postprocess_mode in ['soft', 'hybrid']
+    auto_warmup_end_enabled = args.warmup_auto_end
+    dynamic_denoise_enabled = args.warmup_dynamic_denoise
+    if dynamic_denoise_enabled and postprocess_mode != 'none':
+        raise ValueError('--warmup_dynamic_denoise cannot be combined with one-shot warmup postprocess modes. Please choose either dynamic denoise or remove/soft/hybrid.')
+    use_sample_weight = dynamic_denoise_enabled or postprocess_mode in ['soft', 'hybrid']
+    needs_warmup_diagnosis = args.warmup_diag or postprocess_mode != 'none' or auto_warmup_end_enabled or dynamic_denoise_enabled
 
     data_transform, gt_transform = get_data_transforms(image_size, crop_size)
 
     train_data_list = []
     test_data_list = []
     contaminated_paths, manifest_path = (None, None)
-    if args.warmup_diag or postprocess_mode != 'none' or phase2_enabled:
+    if needs_warmup_diagnosis:
         contaminated_paths, manifest_path = load_injected_manifest(
             args.data_path,
             os.path.dirname(__file__),
@@ -186,7 +250,7 @@ def train(item_list):
         else:
             print_fn('warmup diagnosis: loaded contamination manifest {}.'.format(manifest_path))
 
-    if phase2_enabled and args.warmup_primary_metric == 'score_gap' and contaminated_paths is None:
+    if auto_warmup_end_enabled and args.warmup_primary_metric == 'score_gap' and contaminated_paths is None:
         raise ValueError('--warmup_primary_metric score_gap requires contamination-aware metrics. Please provide a valid inject_defects manifest via --diag_manifest_path.')
 
     for i, item in enumerate(item_list):
@@ -212,7 +276,7 @@ def train(item_list):
     )
 
     train_eval_dataloader = None
-    if args.warmup_diag or postprocess_mode != 'none' or phase2_enabled:
+    if needs_warmup_diagnosis:
         train_eval_dataloader = build_train_eval_dataloader(
             train_data_list,
             data_root=args.data_path,
@@ -298,7 +362,7 @@ def train(item_list):
     has_postprocessed = False
     sample_weight_map = {}
     reliability_map = {}
-    stage = 'warmup' if phase2_enabled else 'baseline'
+    stage = 'baseline'
     warmup_end_iter = None
     warmup_trigger_iter = None
     freeze_iter = None
@@ -343,7 +407,7 @@ def train(item_list):
             current_iter = it + 1
             if args.warmup_diag and current_iter in args.warmup_milestones and not (
                 (postprocess_mode != 'none' and current_iter == args.warmup_end_iter) or
-                (phase2_enabled and stage == 'warmup' and should_run_warmup_check(current_iter, total_iters, args))
+                (auto_warmup_end_enabled and should_run_warmup_check(current_iter, total_iters, args))
             ):
                 run_one_warmup_diagnosis(
                     model,
@@ -357,7 +421,7 @@ def train(item_list):
                     manifest_path=manifest_path,
                 )
 
-            if phase2_enabled and stage == 'warmup' and should_run_warmup_check(current_iter, total_iters, args):
+            if auto_warmup_end_enabled and warmup_trigger_iter is None and should_run_warmup_check(current_iter, total_iters, args):
                 diagnosis_result = run_phase2_diagnosis(model, train_eval_dataloader, current_iter, manifest_path)
                 t_max = max(1, int(total_iters * args.warmup_check_end_ratio))
                 trigger_result = evaluate_warmup_trigger(
@@ -387,63 +451,114 @@ def train(item_list):
                 if trigger_result['triggered']:
                     warmup_trigger_iter = current_iter
                     warmup_end_iter = trigger_result['best_primary_iter']
-                    if warmup_end_iter is None:
-                        raise ValueError('warm-up trigger fired without a best_primary_iter')
-
-                    if warmup_end_iter == current_iter:
-                        weight_scored_df = trigger_result['scored_df']
-                        weight_source_iter = current_iter
-                    else:
-                        weight_scored_df, _ = load_saved_train_scores(args.diag_save_dir, warmup_end_iter)
-                        weight_source_iter = warmup_end_iter
-
-                    weight_update = build_phase2_weight_update(
-                        weight_scored_df,
-                        reliability_map=reliability_map,
-                        old_weight_map=sample_weight_map,
-                        min_weight=args.denoise_min_weight,
-                        weight_beta=args.warmup_weight_beta,
-                        weight_scope=args.denoise_weight_scope,
-                        reliability_ema=args.denoise_reliability_ema,
-                        weight_ema=args.denoise_weight_ema,
-                        clip_delta=args.denoise_weight_clip_delta,
-                        top_p=args.warmup_gmm_top_p,
+                    warmup_trigger_reason = trigger_result['trigger_reason']
+                    selected_scored_df, selected_score_iter, selected_score_path = resolve_warmup_scored_df(
+                        trigger_result,
+                        current_iter,
+                        args.diag_save_dir,
                     )
-                    freeze_iter = max(warmup_end_iter, int(total_iters * args.denoise_freeze_ratio))
                     save_phase2_artifacts(
                         diagnosis_result['iter_dir'],
                         extra_summary={
-                            'stage': 'denoise',
+                            'stage': 'warmup_end',
                             'warmup_trigger_iter': int(warmup_trigger_iter),
                             'warmup_end_iter': int(warmup_end_iter),
-                            'weight_init_source_iter': int(weight_source_iter),
+                            'score_source_iter': int(selected_score_iter),
+                            'score_source_path': selected_score_path,
                             'best_iter_less_than_trigger_iter': bool(warmup_end_iter < warmup_trigger_iter),
-                            'warmup_trigger_reason': trigger_result['trigger_reason'],
-                            'freeze_iter': int(freeze_iter),
-                            **weight_update['summary'],
+                            'warmup_trigger_reason': warmup_trigger_reason,
+                            'dynamic_denoise_enabled': bool(dynamic_denoise_enabled),
+                            'postprocess_mode': postprocess_mode,
                         },
-                        suspicious_df=weight_update['suspicious_df'],
-                        weight_df=weight_update['weight_df'],
-                        reliability_df=weight_update['reliability_df'],
                     )
-                    sample_weight_map = weight_update['sample_weight_map']
-                    reliability_map = weight_update['reliability_map']
-                    stage = 'denoise'
-                    warmup_trigger_reason = trigger_result['trigger_reason']
-                    last_refresh_iter = current_iter
-                    print_fn('phase2 warmup end iter {} (trigger iter {}): metric={}, mode={}, reason={}, freeze_iter={}, weight_mean={}, weight_min={}, weight_max={}'.format(
-                        warmup_end_iter,
-                        warmup_trigger_iter,
-                        args.warmup_primary_metric,
-                        args.warmup_trigger_mode,
-                        warmup_trigger_reason,
-                        freeze_iter,
-                        weight_update['summary'].get('weight_mean'),
-                        weight_update['summary'].get('weight_min'),
-                        weight_update['summary'].get('weight_max'),
-                    ))
 
-            if phase2_enabled and stage == 'denoise' and current_iter > warmup_end_iter:
+                    if dynamic_denoise_enabled:
+                        weight_update = build_phase2_weight_update(
+                            selected_scored_df,
+                            reliability_map=reliability_map,
+                            old_weight_map=sample_weight_map,
+                            min_weight=args.denoise_min_weight,
+                            weight_beta=args.warmup_weight_beta,
+                            weight_scope=args.denoise_weight_scope,
+                            reliability_ema=args.denoise_reliability_ema,
+                            weight_ema=args.denoise_weight_ema,
+                            clip_delta=args.denoise_weight_clip_delta,
+                            top_p=args.warmup_gmm_top_p,
+                        )
+                        freeze_iter = max(warmup_end_iter, int(total_iters * args.denoise_freeze_ratio))
+                        save_phase2_artifacts(
+                            diagnosis_result['iter_dir'],
+                            extra_summary={
+                                'stage': 'denoise',
+                                'warmup_trigger_iter': int(warmup_trigger_iter),
+                                'warmup_end_iter': int(warmup_end_iter),
+                                'weight_init_source_iter': int(selected_score_iter),
+                                'best_iter_less_than_trigger_iter': bool(warmup_end_iter < warmup_trigger_iter),
+                                'warmup_trigger_reason': warmup_trigger_reason,
+                                'freeze_iter': int(freeze_iter),
+                                **weight_update['summary'],
+                            },
+                            suspicious_df=weight_update['suspicious_df'],
+                            weight_df=weight_update['weight_df'],
+                            reliability_df=weight_update['reliability_df'],
+                        )
+                        sample_weight_map = weight_update['sample_weight_map']
+                        reliability_map = weight_update['reliability_map']
+                        stage = 'denoise'
+                        last_refresh_iter = current_iter
+                        print_fn('phase2 warmup end iter {} (trigger iter {}): metric={}, mode={}, reason={}, freeze_iter={}, weight_mean={}, weight_min={}, weight_max={}'.format(
+                            warmup_end_iter,
+                            warmup_trigger_iter,
+                            args.warmup_primary_metric,
+                            args.warmup_trigger_mode,
+                            warmup_trigger_reason,
+                            freeze_iter,
+                            weight_update['summary'].get('weight_mean'),
+                            weight_update['summary'].get('weight_min'),
+                            weight_update['summary'].get('weight_max'),
+                        ))
+                    else:
+                        print_fn('auto warmup end iter {} (trigger iter {}): metric={}, mode={}, reason={}, postprocess_mode={}'.format(
+                            warmup_end_iter,
+                            warmup_trigger_iter,
+                            args.warmup_primary_metric,
+                            args.warmup_trigger_mode,
+                            warmup_trigger_reason,
+                            postprocess_mode,
+                        ))
+
+                        if postprocess_mode != 'none' and not has_postprocessed:
+                            postprocess_result = apply_warmup_postprocess(
+                                train_data_list,
+                                selected_scored_df,
+                                postprocess_mode,
+                                contaminated_paths,
+                            )
+                            save_prune_plan(diagnosis_result['iter_dir'], postprocess_result['postprocess_plan'], warmup_end_iter)
+                            train_data_list = postprocess_result['train_data_list']
+                            train_data = postprocess_result['train_data']
+                            train_dataloader = postprocess_result['train_dataloader']
+                            train_eval_dataloader = postprocess_result['train_eval_dataloader']
+                            sample_weight_map = postprocess_result['sample_weight_map']
+                            use_sample_weight = postprocess_result['use_sample_weight']
+                            has_postprocessed = True
+                            print_fn('warmup postprocess iter {} (trigger iter {}): mode={}, pruned {} / {} training samples.'.format(
+                                warmup_end_iter,
+                                warmup_trigger_iter,
+                                postprocess_mode,
+                                postprocess_result['postprocess_plan']['summary'].get('num_pruned', 0),
+                                postprocess_result['postprocess_plan']['summary'].get('num_samples_before_prune', len(selected_scored_df)),
+                            ))
+                            if 'weight_mean' in postprocess_result['postprocess_plan']['summary']:
+                                print_fn('warmup weights: mean={}, min={}, max={}'.format(
+                                    postprocess_result['postprocess_plan']['summary'].get('weight_mean'),
+                                    postprocess_result['postprocess_plan']['summary'].get('weight_min'),
+                                    postprocess_result['postprocess_plan']['summary'].get('weight_max'),
+                                ))
+                            print_fn('train image number after postprocess:{}'.format(len(train_data)))
+                            model.train()
+
+            if dynamic_denoise_enabled and stage == 'denoise' and current_iter > warmup_end_iter:
                 if current_iter >= freeze_iter:
                     diagnosis_result = run_phase2_diagnosis(model, train_eval_dataloader, current_iter, manifest_path)
                     save_phase2_artifacts(
@@ -500,7 +615,7 @@ def train(item_list):
                         weight_update['summary'].get('clipped_sample_count'),
                     ))
 
-            if (not phase2_enabled) and postprocess_mode != 'none' and (not has_postprocessed) and current_iter == args.warmup_end_iter:
+            if (not auto_warmup_end_enabled) and postprocess_mode != 'none' and (not has_postprocessed) and current_iter == args.warmup_end_iter:
                 diagnosis_result = run_one_warmup_diagnosis(
                     model,
                     train_eval_dataloader,
@@ -514,58 +629,31 @@ def train(item_list):
                     save_scores=args.warmup_save_scores_before_prune or postprocess_mode in ['soft', 'hybrid'],
                 )
                 scored_df = diagnosis_result['df'].copy()
-
-                postprocess_prune_ratio = args.warmup_hybrid_prune_ratio if postprocess_mode == 'hybrid' else args.warmup_prune_ratio
-                postprocess_plan = build_warmup_postprocess_plan(
+                postprocess_result = apply_warmup_postprocess(
+                    train_data_list,
                     scored_df,
-                    mode=postprocess_mode,
-                    prune_ratio=postprocess_prune_ratio,
-                    min_keep_per_class=args.warmup_min_keep_per_class,
-                    weight_beta=args.warmup_weight_beta,
-                    min_weight=args.warmup_min_weight,
-                    weight_scope=args.warmup_weight_scope,
+                    postprocess_mode,
+                    contaminated_paths,
                 )
-                save_prune_plan(diagnosis_result['iter_dir'], postprocess_plan, current_iter)
-
-                if postprocess_mode in ['remove', 'hybrid']:
-                    pruned_train_data_list = []
-                    for class_id, train_dataset in enumerate(train_data_list):
-                        retained_indices = postprocess_plan['retained_index_map'].get(class_id)
-                        if retained_indices is None:
-                            retained_indices = list(range(len(train_dataset)))
-                        pruned_train_data_list.append(Subset(train_dataset, retained_indices))
-                    train_data_list = pruned_train_data_list
-
-                sample_weight_map = postprocess_plan['sample_weight_map']
-                use_sample_weight = postprocess_mode in ['soft', 'hybrid']
-                train_data, train_dataloader = build_train_dataloader(
-                    train_data_list,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    data_root=args.data_path,
-                    item_list=item_list,
-                    with_meta=use_sample_weight,
-                )
-                train_eval_dataloader = build_train_eval_dataloader(
-                    train_data_list,
-                    data_root=args.data_path,
-                    contaminated_paths=contaminated_paths,
-                    batch_size=args.diag_batch_size,
-                    num_workers=args.diag_num_workers,
-                    item_list=item_list,
-                )
+                save_prune_plan(diagnosis_result['iter_dir'], postprocess_result['postprocess_plan'], current_iter)
+                train_data_list = postprocess_result['train_data_list']
+                train_data = postprocess_result['train_data']
+                train_dataloader = postprocess_result['train_dataloader']
+                train_eval_dataloader = postprocess_result['train_eval_dataloader']
+                sample_weight_map = postprocess_result['sample_weight_map']
+                use_sample_weight = postprocess_result['use_sample_weight']
                 has_postprocessed = True
                 print_fn('warmup postprocess iter {}: mode={}, pruned {} / {} training samples.'.format(
                     current_iter,
                     postprocess_mode,
-                    postprocess_plan['summary'].get('num_pruned', 0),
-                    postprocess_plan['summary'].get('num_samples_before_prune', len(scored_df)),
+                    postprocess_result['postprocess_plan']['summary'].get('num_pruned', 0),
+                    postprocess_result['postprocess_plan']['summary'].get('num_samples_before_prune', len(scored_df)),
                 ))
-                if 'weight_mean' in postprocess_plan['summary']:
+                if 'weight_mean' in postprocess_result['postprocess_plan']['summary']:
                     print_fn('warmup weights: mean={}, min={}, max={}'.format(
-                        postprocess_plan['summary'].get('weight_mean'),
-                        postprocess_plan['summary'].get('weight_min'),
-                        postprocess_plan['summary'].get('weight_max'),
+                        postprocess_result['postprocess_plan']['summary'].get('weight_mean'),
+                        postprocess_result['postprocess_plan']['summary'].get('weight_min'),
+                        postprocess_result['postprocess_plan']['summary'].get('weight_max'),
                     ))
                 print_fn('train image number after postprocess:{}'.format(len(train_data)))
                 model.train()
@@ -683,11 +771,12 @@ if __name__ == '__main__':
     )
     parser.add_argument('--warmup_diag', action='store_true')
     parser.add_argument('--warmup_denoise', action='store_true')
+    parser.add_argument('--warmup_dynamic_denoise', action='store_true')
     parser.add_argument('--warmup_postprocess_mode', type=str, default='none', choices=['none', 'remove', 'soft', 'hybrid'])
     parser.add_argument('--warmup_auto_end', action='store_true')
     parser.add_argument('--warmup_milestones', type=str, default='50, 100, 200, 400, 600,1000,2000,4000')
     parser.add_argument('--warmup_end_iter', type=int, default=1000)
-    parser.add_argument('--warmup_prune_ratio', type=float, default=0.05)
+    parser.add_argument('--warmup_prune_ratio', type=float, default=0.1)
     parser.add_argument('--warmup_hybrid_prune_ratio', type=float, default=0.05)
     parser.add_argument('--warmup_min_keep_per_class', type=int, default=20)
     parser.add_argument('--warmup_weight_beta', type=float, default=1.0)
