@@ -166,7 +166,8 @@ def resolve_warmup_scored_df(trigger_result, current_iter, save_dir):
     return scored_df.copy(), int(warmup_end_iter), score_path
 
 
-def apply_warmup_postprocess(train_data_list, scored_df, postprocess_mode, contaminated_paths):
+def apply_warmup_postprocess(train_data_list, scored_df, postprocess_mode, contaminated_paths,
+                             batch_size, num_workers, item_list):
     postprocess_prune_ratio = args.warmup_hybrid_prune_ratio if postprocess_mode == 'hybrid' else args.warmup_prune_ratio
     postprocess_plan = build_warmup_postprocess_plan(
         scored_df,
@@ -533,6 +534,9 @@ def train(item_list):
                                 selected_scored_df,
                                 postprocess_mode,
                                 contaminated_paths,
+                                batch_size,
+                                num_workers,
+                                item_list,
                             )
                             save_prune_plan(diagnosis_result['iter_dir'], postprocess_result['postprocess_plan'], warmup_end_iter)
                             train_data_list = postprocess_result['train_data_list']

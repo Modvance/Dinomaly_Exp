@@ -89,5 +89,7 @@ python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../s
 
 python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_peak_dt_best --gpus 5 --warmup_auto_end --warmup_primary_metric D_t --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --warmup_trigger_mode peak_patience --warmup_weight_beta 3.0 --warmup_min_weight 0.1 --denoise_weight_ema 0.0 --denoise_weight_clip_delta 0.2 --denoise_refresh_interval 300
 
-python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_peak_dt_hard --warmup_diag --gpus 2 --warmup_auto_end --warmup_primary_metric D_t --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --warmup_trigger_mode peak_patience --warmup_postprocess_mode remove
+python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_peak_dt_global --gpus 3 --warmup_auto_end --warmup_primary_metric D_t --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --warmup_trigger_mode peak_patience --warmup_weight_beta 3.0 --warmup_min_weight 0.1 --warmup_dynamic_denoise --denoise_weight_ema 0.0 --denoise_weight_clip_delta 0.2 --denoise_refresh_interval 300 --denoise_weight_scope global
+
+python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_peak_dt_hard --gpus 2 --warmup_auto_end --warmup_primary_metric D_t --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --warmup_trigger_mode peak_patience --warmup_postprocess_mode remove
 ```
