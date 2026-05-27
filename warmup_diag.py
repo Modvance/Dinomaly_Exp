@@ -14,16 +14,6 @@ from sklearn.mixture import GaussianMixture
 from utils import compute_image_level_scores, get_gaussian_kernel, infer_anomaly_map_batch
 
 
-def parse_warmup_milestones(milestones):
-    values = []
-    for part in milestones.split(','):
-        part = part.strip()
-        if not part:
-            continue
-        values.append(int(part))
-    return sorted(set(values))
-
-
 def _safe_float(value):
     if value is None:
         return None

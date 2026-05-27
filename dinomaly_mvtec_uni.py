@@ -24,7 +24,6 @@ from warmup_diag import (
     evaluate_warmup_trigger,
     load_injected_manifest,
     load_saved_train_scores,
-    parse_warmup_milestones,
     run_one_warmup_diagnosis,
     save_phase2_artifacts,
     save_prune_plan,
@@ -403,7 +402,7 @@ def train(item_list):
             lr_scheduler.step()
 
             current_iter = it + 1
-            if args.warmup_diag and current_iter in args.warmup_milestones and not (
+            if args.warmup_diag and current_iter % args.warmup_diag_interval == 0 and not (
                 (postprocess_mode != 'none' and current_iter == args.warmup_end_iter) or
                 (auto_warmup_end_enabled and should_run_warmup_check(current_iter, total_iters, args))
             ):
@@ -635,6 +634,9 @@ def train(item_list):
                     scored_df,
                     postprocess_mode,
                     contaminated_paths,
+                    batch_size,
+                    num_workers,
+                    item_list,
                 )
                 save_prune_plan(diagnosis_result['iter_dir'], postprocess_result['postprocess_plan'], current_iter)
                 train_data_list = postprocess_result['train_data_list']
@@ -769,7 +771,7 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_dynamic_denoise', action='store_true')
     parser.add_argument('--warmup_postprocess_mode', type=str, default='none', choices=['none', 'remove', 'soft', 'hybrid'])
     parser.add_argument('--warmup_auto_end', action='store_true')
-    parser.add_argument('--warmup_milestones', type=str, default='50, 100, 200, 400, 600,1000,2000,4000')
+    parser.add_argument('--warmup_diag_interval', type=int, default=200)
     parser.add_argument('--warmup_end_iter', type=int, default=1000)
     parser.add_argument('--warmup_prune_ratio', type=float, default=0.1)
     parser.add_argument('--warmup_hybrid_prune_ratio', type=float, default=0.05)
@@ -802,7 +804,8 @@ if __name__ == '__main__':
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
     parser.add_argument('--diag_resize_mask', type=int, default=256)
     args = parser.parse_args()
-    args.warmup_milestones = parse_warmup_milestones(args.warmup_milestones)
+    if args.warmup_diag_interval <= 0:
+        parser.error('--warmup_diag_interval must be positive')
 
     item_list = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',
                  'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper']
