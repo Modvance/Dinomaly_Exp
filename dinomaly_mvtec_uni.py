@@ -661,7 +661,7 @@ def train(item_list):
                 print_fn('train image number after postprocess:{}'.format(len(train_data)))
                 model.train()
 
-            if current_iter % 5000 == 0:
+            if current_iter % args.eval_interval == 0:
                 auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
                 auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
 
@@ -803,9 +803,12 @@ if __name__ == '__main__':
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
     parser.add_argument('--diag_resize_mask', type=int, default=256)
+    parser.add_argument('--eval_interval', type=int, default=500)
     args = parser.parse_args()
     if args.warmup_diag_interval <= 0:
         parser.error('--warmup_diag_interval must be positive')
+    if args.eval_interval <= 0:
+        parser.error('--eval_interval must be positive')
 
     item_list = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',
                  'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper']

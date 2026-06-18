@@ -661,7 +661,7 @@ def train(item_list):
                 print_fn('train image number after postprocess:{}'.format(len(train_data)))
                 model.train()
 
-            if current_iter % 5000 == 0:
+            if current_iter % args.eval_interval == 0:
                 auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
                 auroc_px_list, ap_px_list, f1_px_list, aupro_px_list = [], [], [], []
 
@@ -777,8 +777,8 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_dynamic_denoise', action='store_true')
     parser.add_argument('--warmup_postprocess_mode', type=str, default='none', choices=['none', 'remove', 'soft', 'hybrid'])
     parser.add_argument('--warmup_auto_end', action='store_true')
-    parser.add_argument('--warmup_diag_interval', type=int, default=200)
-    parser.add_argument('--warmup_end_iter', type=int, default=1000)
+    parser.add_argument('--warmup_diag_interval', type=int, default=20)
+    parser.add_argument('--warmup_end_iter', type=int, default=9000)
     parser.add_argument('--warmup_prune_ratio', type=float, default=0.1)
     parser.add_argument('--warmup_hybrid_prune_ratio', type=float, default=0.05)
     parser.add_argument('--warmup_min_keep_per_class', type=int, default=20)
@@ -786,9 +786,9 @@ if __name__ == '__main__':
     parser.add_argument('--warmup_min_weight', type=float, default=0.2)
     parser.add_argument('--warmup_weight_scope', type=str, default='class', choices=['class', 'global'])
     parser.add_argument('--warmup_save_scores_before_prune', action='store_true')
-    parser.add_argument('--warmup_check_start_ratio', type=float, default=0.1)
-    parser.add_argument('--warmup_check_end_ratio', type=float, default=0.4)
-    parser.add_argument('--warmup_check_interval', type=int, default=200)
+    parser.add_argument('--warmup_check_start_ratio', type=float, default=0.01)
+    parser.add_argument('--warmup_check_end_ratio', type=float, default=0.15)
+    parser.add_argument('--warmup_check_interval', type=int, default=20)
     parser.add_argument('--warmup_gmm_top_p', type=float, default=0.1)
     parser.add_argument('--warmup_primary_metric', type=str, default='D_t', choices=['D_t', 'score_gap'])
     parser.add_argument('--warmup_trigger_mode', type=str, default='plateau', choices=['plateau', 'peak_patience'])
@@ -809,9 +809,12 @@ if __name__ == '__main__':
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
     parser.add_argument('--diag_resize_mask', type=int, default=256)
+    parser.add_argument('--eval_interval', type=int, default=500)
     args = parser.parse_args()
     if args.warmup_diag_interval <= 0:
         parser.error('--warmup_diag_interval must be positive')
+    if args.eval_interval <= 0:
+        parser.error('--eval_interval must be positive')
 
     item_list = ['candle', 'capsules', 'cashew', 'chewinggum', 'fryum', 'macaroni1', 'macaroni2',
                  'pcb1', 'pcb2', 'pcb3', 'pcb4', 'pipe_fryum']
