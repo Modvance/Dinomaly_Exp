@@ -105,3 +105,16 @@ python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../s
 
 python dinomaly_mvtec_uni.py --data_path ../noisy_datasets/seed0 --save_dir ../saved_results/noisy/ --save_name mvtec_peak_dt_hard --gpus 5 --warmup_auto_end --warmup_primary_metric D_t --diag_manifest_path ../noisy_datasets/seed0/inject_defects.txt --warmup_trigger_mode peak_patience --warmup_postprocess_mode remove
 ```
+
+eval
+```bash
+python dinomaly_mvtec_uni.py --data_path ../mvtec_anomaly_detection --save_dir ../saved_results/eval/ --save_name mvtec --gpus 3 --eval_interval 500
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/eval/ --save_name mvtec_pareto --gpus 0 --eval_interval 500
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/eval/ --save_name mvtec_k4 --gpus 2 --eval_interval 500
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/eval/ --save_name mvtec_k1 --gpus 3 --eval_interval 500
+```
+
+gbps
+```bash
+python Dinomaly/dinomaly_mvtec_gbps.py --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
+```

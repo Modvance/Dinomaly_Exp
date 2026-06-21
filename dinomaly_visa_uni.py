@@ -637,6 +637,9 @@ def train(item_list):
                     scored_df,
                     postprocess_mode,
                     contaminated_paths,
+                    batch_size,
+                    num_workers,
+                    item_list,
                 )
                 save_prune_plan(diagnosis_result['iter_dir'], postprocess_result['postprocess_plan'], current_iter)
                 train_data_list = postprocess_result['train_data_list']
