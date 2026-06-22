@@ -325,7 +325,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_name', type=str, default='vitill_visa_patch')
     parser.add_argument('--diag_save_dir', type=str, default='./patch_diag')
     parser.add_argument('--gpus', type=int, default=0)
-    parser.add_argument('--eval_interval', type=int, default=500)
+    parser.add_argument('--eval_interval', type=int, default=5000)
     parser.add_argument('--diag_batch_size', type=int, default=16)
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)

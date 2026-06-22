@@ -803,7 +803,7 @@ if __name__ == '__main__':
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
     parser.add_argument('--diag_resize_mask', type=int, default=256)
-    parser.add_argument('--eval_interval', type=int, default=500)
+    parser.add_argument('--eval_interval', type=int, default=5000)
     args = parser.parse_args()
     if args.warmup_diag_interval <= 0:
         parser.error('--warmup_diag_interval must be positive')
