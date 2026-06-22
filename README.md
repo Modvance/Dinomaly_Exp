@@ -116,5 +116,14 @@ python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 
 
 gbps
 ```bash
-python Dinomaly/dinomaly_mvtec_gbps.py --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_pareto --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k4 --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k1 --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
+```
+
+patch
+```bash
+python dinomaly_mvtec_patch.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/patch/ --save_name mvtec_pareto --gpus 1
+python dinomaly_mvtec_patch.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/patch/ --save_name mvtec_k4 --gpus 2
+python dinomaly_mvtec_patch.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/patch/ --save_name mvtec_k1 --gpus 3
 ```
