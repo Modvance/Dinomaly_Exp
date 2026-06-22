@@ -11,13 +11,13 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, Subset
 from torchvision.datasets import ImageFolder
 
-from dataset import MVTecDataset, TrainDiagDataset, get_data_transforms
+from dataset import MVTecDataset, TrainDiagDataset, TrainPatchWeightDataset, get_data_transforms
 from dinov1.utils import trunc_normal_
 from models import vit_encoder
 from models.uad import ViTill
 from models.vision_transformer import Block as VitBlock, LinearAttention2, bMlp
 from optimizers import StableAdamW
-from utils import WarmCosineScheduler, compute_image_level_scores, evaluation_batch, get_gaussian_kernel, global_cosine_hm_percent, infer_anomaly_map_batch
+from utils import WarmCosineScheduler, compute_image_level_scores, evaluation_batch, get_gaussian_kernel, global_cosine_hm_percent, global_cosine_hm_percent_patch, infer_anomaly_map_batch
 
 
 DEFAULT_TOTAL_ITERS = 10000
@@ -117,6 +117,35 @@ def build_train_eval_dataloader(train_datasets, data_root, batch_size, num_worke
         drop_last=False,
     )
     return train_eval_dataloader
+
+
+def build_patch_train_dataloader(train_datasets, data_root, item_list, patch_weight_bank,
+                                 patch_grid_size, batch_size, num_workers, skip_patch_denoise=False):
+    wrapped_datasets = []
+    sample_offset = 0
+    for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
+        wrapped_dataset = TrainPatchWeightDataset(
+            train_data,
+            data_root=data_root,
+            class_name=item,
+            class_id=class_id,
+            sample_offset=sample_offset,
+            patch_weight_bank=patch_weight_bank,
+            default_patch_grid_size=patch_grid_size,
+            skip_patch_denoise=skip_patch_denoise,
+        )
+        wrapped_datasets.append(wrapped_dataset)
+        sample_offset += len(wrapped_dataset)
+
+    train_data = ConcatDataset(wrapped_datasets)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+    )
+    return train_data, train_dataloader
 
 
 def rebuild_pruned_train_loaders(train_data_list, retained_index_map, data_root, item_list,
@@ -263,6 +292,25 @@ def train_step(model, trainable, optimizer, scheduler, images, current_zero_base
     return float(loss.item())
 
 
+def train_patch_step(model, trainable, optimizer, scheduler, images, patch_weight,
+                     current_zero_based_iter, grad_clip_norm=0.1):
+    model.train()
+    images = images.to(next(model.parameters()).device)
+    patch_weight = patch_weight.to(next(model.parameters()).device)
+    en, de = model(images)
+
+    p_final = 0.9
+    p = min(p_final * current_zero_based_iter / 1000, p_final)
+    loss = global_cosine_hm_percent_patch(en, de, patch_weight=patch_weight, p=p, factor=0.1)
+
+    optimizer.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(trainable.parameters(), max_norm=grad_clip_norm)
+    optimizer.step()
+    scheduler.step()
+    return float(loss.item())
+
+
 def evaluate_model(model, test_data_list, item_list, device, batch_size=DEFAULT_BATCH_SIZE,
                    num_workers=DEFAULT_NUM_WORKERS, max_ratio=0.01, resize_mask=256, print_fn=None):
     auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
@@ -342,6 +390,46 @@ def score_trainset(model, loader, device, max_ratio=0.01, resize_mask=256):
 
     import pandas as pd
     return pd.DataFrame(rows)
+
+
+def collect_train_anomaly_maps(model, loader, device, max_ratio=0.01, resize_mask=256, apply_smoothing=True):
+    rows = []
+    map_list = []
+    was_training = model.training
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        for images, _, meta in loader:
+            images = images.to(device)
+            anomaly_map, _ = infer_anomaly_map_batch(
+                model,
+                images,
+                gaussian_kernel,
+                resize_mask=resize_mask,
+                apply_smoothing=apply_smoothing,
+            )
+            image_scores = compute_image_level_scores(anomaly_map, max_ratio=max_ratio).detach().cpu().numpy()
+            anomaly_map_cpu = anomaly_map[:, 0].detach().cpu()
+
+            batch_size = len(image_scores)
+            for index in range(batch_size):
+                row = {}
+                for key, value in meta.items():
+                    item = value[index]
+                    if torch.is_tensor(item):
+                        item = item.item()
+                    elif isinstance(item, np.generic):
+                        item = item.item()
+                    row[key] = item
+                row['image_score'] = float(image_scores[index])
+                rows.append(row)
+                map_list.append(anomaly_map_cpu[index])
+
+    if was_training:
+        model.train()
+
+    return pd.DataFrame(rows), torch.stack(map_list, dim=0)
 
 
 def should_run_check(current_iter, total_iters, start_ratio, end_ratio, interval):

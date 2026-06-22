@@ -94,6 +94,32 @@ def global_cosine_hm_percent(a, b, p=0.9, factor=0., sample_weight=None):
     return loss
 
 
+def global_cosine_hm_percent_patch(a, b, patch_weight, p=0.9, factor=0., eps=1e-12):
+    cos_loss = torch.nn.CosineSimilarity()
+    loss = 0
+    patch_weight = patch_weight.detach().float().to(a[0].device)
+    if patch_weight.ndim == 3:
+        patch_weight = patch_weight.unsqueeze(1)
+    for item in range(len(a)):
+        a_ = a[item].detach()
+        b_ = b[item]
+        with torch.no_grad():
+            point_dist = 1 - cos_loss(a_, b_).unsqueeze(1)
+        thresh = torch.topk(point_dist.reshape(-1), k=int(point_dist.numel() * (1 - p)))[0][-1]
+
+        resized_weight = F.interpolate(patch_weight, size=point_dist.shape[-2:], mode='bilinear', align_corners=False)
+        resized_weight = resized_weight.detach()
+        weighted_sum = (resized_weight * point_dist).flatten(1).sum(dim=1)
+        weight_sum = resized_weight.flatten(1).sum(dim=1).clamp_min(eps)
+        loss += torch.mean(weighted_sum / weight_sum)
+
+        partial_func = partial(modify_grad, inds=point_dist < thresh, factor=factor)
+        b_.register_hook(partial_func)
+
+    loss = loss / len(a)
+    return loss
+
+
 def regional_cosine_hm_percent(a, b, p=0.9, factor=0.):
     cos_loss = torch.nn.CosineSimilarity()
     loss = 0
@@ -359,7 +385,7 @@ def compute_image_level_scores(anomaly_map, max_ratio=0):
     return scores.mean(dim=1)
 
 
-def infer_anomaly_map_batch(model, img, gaussian_kernel, resize_mask=None, gt=None):
+def infer_anomaly_map_batch(model, img, gaussian_kernel, resize_mask=None, gt=None, apply_smoothing=True):
     output = model(img)
     en, de = output[0], output[1]
 
@@ -369,7 +395,8 @@ def infer_anomaly_map_batch(model, img, gaussian_kernel, resize_mask=None, gt=No
         if gt is not None:
             gt = F.interpolate(gt, size=resize_mask, mode='nearest')
 
-    anomaly_map = gaussian_kernel(anomaly_map)
+    if apply_smoothing:
+        anomaly_map = gaussian_kernel(anomaly_map)
     return anomaly_map, gt
 
 

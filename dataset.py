@@ -109,6 +109,35 @@ class TrainWeightDataset(_BaseImageFolderMetaDataset):
         return image, label, meta
 
 
+class TrainPatchWeightDataset(_BaseImageFolderMetaDataset):
+    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0, patch_weight_bank=None,
+                 default_patch_grid_size=(32, 32), skip_patch_denoise=False):
+        super().__init__(dataset, data_root, class_name, class_id)
+        self.sample_offset = int(sample_offset)
+        self.patch_weight_bank = {} if patch_weight_bank is None else patch_weight_bank
+        self.default_patch_grid_size = tuple(int(v) for v in default_patch_grid_size)
+        self.skip_patch_denoise = bool(skip_patch_denoise)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        meta = self._build_base_meta(idx)
+        sample_idx = self.sample_offset + idx
+        bank_entry = None if self.skip_patch_denoise else self.patch_weight_bank.get(int(sample_idx))
+        if bank_entry is None:
+            patch_weight = torch.ones(self.default_patch_grid_size, dtype=torch.float32)
+            patch_active = False
+        else:
+            patch_weight = bank_entry['weight'].detach().cpu().float()
+            patch_active = bool(bank_entry.get('active', False))
+        meta.update({
+            'sample_idx': int(sample_idx),
+            'patch_weight': patch_weight,
+            'patch_active': int(patch_active),
+        })
+        meta.pop('rel_path', None)
+        return image, label, meta
+
+
 class MVTecDataset(torch.utils.data.Dataset):
     def __init__(self, root, transform, gt_transform, phase):
         if phase == 'train':
