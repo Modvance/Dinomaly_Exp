@@ -103,9 +103,9 @@ def global_cosine_hm_percent_patch(a, b, patch_weight, p=0.9, factor=0., eps=1e-
     for item in range(len(a)):
         a_ = a[item].detach()
         b_ = b[item]
+        point_dist = 1 - cos_loss(a_, b_).unsqueeze(1)
         with torch.no_grad():
-            point_dist = 1 - cos_loss(a_, b_).unsqueeze(1)
-        thresh = torch.topk(point_dist.reshape(-1), k=int(point_dist.numel() * (1 - p)))[0][-1]
+            thresh = torch.topk(point_dist.reshape(-1), k=int(point_dist.numel() * (1 - p)))[0][-1]
 
         resized_weight = F.interpolate(patch_weight, size=point_dist.shape[-2:], mode='bilinear', align_corners=False)
         resized_weight = resized_weight.detach()
@@ -113,7 +113,7 @@ def global_cosine_hm_percent_patch(a, b, patch_weight, p=0.9, factor=0., eps=1e-
         weight_sum = resized_weight.flatten(1).sum(dim=1).clamp_min(eps)
         loss += torch.mean(weighted_sum / weight_sum)
 
-        partial_func = partial(modify_grad, inds=point_dist < thresh, factor=factor)
+        partial_func = partial(modify_grad, inds=point_dist.detach() < thresh, factor=factor)
         b_.register_hook(partial_func)
 
     loss = loss / len(a)
