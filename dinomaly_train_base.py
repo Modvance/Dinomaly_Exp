@@ -94,7 +94,7 @@ def build_train_dataloader(train_datasets, batch_size, num_workers):
     return train_data, train_dataloader
 
 
-def build_train_eval_dataloader(train_datasets, data_root, batch_size, num_workers, item_list):
+def build_train_eval_dataloader(train_datasets, data_root, batch_size, num_workers, item_list, contaminated_paths=None):
     train_eval_data_list = []
     sample_offset = 0
     for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
@@ -104,7 +104,7 @@ def build_train_eval_dataloader(train_datasets, data_root, batch_size, num_worke
             class_name=item,
             class_id=class_id,
             sample_offset=sample_offset,
-            contaminated_paths=None,
+            contaminated_paths=contaminated_paths,
         )
         train_eval_data_list.append(train_eval_data)
         sample_offset += len(train_eval_data)
@@ -150,7 +150,8 @@ def build_patch_train_dataloader(train_datasets, data_root, item_list, patch_wei
 
 
 def rebuild_pruned_train_loaders(train_data_list, retained_index_map, data_root, item_list,
-                                 batch_size, num_workers, diag_batch_size, diag_num_workers):
+                                 batch_size, num_workers, diag_batch_size, diag_num_workers,
+                                 contaminated_paths=None):
     pruned_train_data_list = []
     for class_id, train_dataset in enumerate(train_data_list):
         retained_indices = retained_index_map.get(class_id)
@@ -169,6 +170,7 @@ def rebuild_pruned_train_loaders(train_data_list, retained_index_map, data_root,
         batch_size=diag_batch_size,
         num_workers=diag_num_workers,
         item_list=item_list,
+        contaminated_paths=contaminated_paths,
     )
     return {
         'train_data_list': pruned_train_data_list,

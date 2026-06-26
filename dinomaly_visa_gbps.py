@@ -29,8 +29,11 @@ from gbps_runner_utils import (
     resolve_gbps_best_scored_df,
     save_gbps_artifacts,
     save_gbps_prune_artifacts,
+    summarize_class_label_counts,
+    summarize_contamination_labels,
 )
 from safe_gbps import compute_gbps_u_with_bootstrap
+from warmup_diag import load_injected_manifest
 
 warnings = __import__('warnings')
 warnings.filterwarnings('ignore')
@@ -46,6 +49,16 @@ def train(item_list):
     final_eval_summary = None
 
     train_data_list, test_data_list = build_datasets(args.data_path, item_list)
+    contaminated_paths, manifest_path = load_injected_manifest(
+        args.data_path,
+        os.path.dirname(__file__),
+        manifest_path=args.diag_manifest_path,
+    )
+    if contaminated_paths is None:
+        print_fn('gbps diagnosis: contamination manifest not found, contamination-aware logging will be unavailable.')
+    else:
+        print_fn('gbps diagnosis: loaded contamination manifest {}.'.format(manifest_path))
+
     train_data, train_dataloader = build_train_dataloader(train_data_list, batch_size=batch_size, num_workers=num_workers)
     train_eval_dataloader = build_train_eval_dataloader(
         train_data_list,
@@ -53,6 +66,7 @@ def train(item_list):
         batch_size=args.diag_batch_size,
         num_workers=args.diag_num_workers,
         item_list=item_list,
+        contaminated_paths=contaminated_paths,
     )
 
     model, trainable = build_model(device)
@@ -146,6 +160,12 @@ def train(item_list):
                 summary = dict(gbps_result['summary'])
                 summary.update(trigger_result['summary'])
                 summary['gbps_group_info'] = gbps_group_info
+                summary['diag_manifest_path'] = manifest_path
+                summary['diag_manifest_requested_path'] = args.diag_manifest_path
+                summary['diag_has_contamination_labels'] = bool(contaminated_paths is not None)
+                summary['diag_contamination_label_mode'] = 'manifest' if contaminated_paths is not None else 'unavailable'
+                summary.update(summarize_contamination_labels(scored_df))
+                summary['class_label_counts'] = summarize_class_label_counts(scored_df)
                 save_gbps_artifacts(
                     iter_dir,
                     group_metrics_df=gbps_result['group_metrics_df'],
@@ -172,6 +192,10 @@ def train(item_list):
                         'score_source_path': selected_score_path,
                         'selected_iter_less_than_trigger_iter': bool(gbps_selected_iter is not None and gbps_selected_iter < gbps_trigger_iter),
                         'gbps_postprocess_mode': args.gbps_postprocess_mode,
+                        'diag_manifest_path': manifest_path,
+                        'diag_manifest_requested_path': args.diag_manifest_path,
+                        'diag_has_contamination_labels': bool(contaminated_paths is not None),
+                        'diag_contamination_label_mode': 'manifest' if contaminated_paths is not None else 'unavailable',
                     }
                     if args.gbps_postprocess_mode == 'remove' and not gbps_has_postprocessed and selected_scored_df is not None:
                         train_image_count_before_prune = len(train_data)
@@ -190,6 +214,7 @@ def train(item_list):
                             num_workers=num_workers,
                             diag_batch_size=args.diag_batch_size,
                             diag_num_workers=args.diag_num_workers,
+                            contaminated_paths=contaminated_paths,
                         )
                         train_data_list = rebuild_result['train_data_list']
                         train_data = rebuild_result['train_data']
@@ -281,6 +306,7 @@ if __name__ == '__main__':
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--diag_max_ratio', type=float, default=0.01)
     parser.add_argument('--diag_resize_mask', type=int, default=256)
+    parser.add_argument('--diag_manifest_path', type=str, default=None)
     parser.add_argument('--gbps_check_start_ratio', type=float, default=0.01)
     parser.add_argument('--gbps_check_end_ratio', type=float, default=0.15)
     parser.add_argument('--gbps_check_interval', type=int, default=20)

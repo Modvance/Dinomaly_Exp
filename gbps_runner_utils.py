@@ -6,6 +6,34 @@ import numpy as np
 import pandas as pd
 
 
+def summarize_contamination_labels(df, prefix=None):
+    if df is None or len(df) == 0 or 'is_contaminated' not in df.columns:
+        counts = {
+            'num_samples': 0,
+            'num_labeled_clean': 0,
+            'num_labeled_contaminated': 0,
+            'num_unlabeled_samples': 0,
+        }
+    else:
+        labels = pd.to_numeric(df['is_contaminated'], errors='coerce')
+        counts = {
+            'num_samples': int(len(df)),
+            'num_labeled_clean': int((labels == 0).sum()),
+            'num_labeled_contaminated': int((labels == 1).sum()),
+            'num_unlabeled_samples': int((~labels.isin([0, 1])).sum()),
+        }
+    if prefix is None:
+        return counts
+    return {f'{prefix}_{key}': value for key, value in counts.items()}
+
+
+def summarize_class_label_counts(df):
+    if df is None or len(df) == 0 or 'class_name' not in df.columns:
+        return {}
+    counts = df['class_name'].astype(str).value_counts().sort_index()
+    return {str(class_name): int(count) for class_name, count in counts.items()}
+
+
 def _safe_float(value):
     if value is None:
         return None
@@ -126,6 +154,8 @@ def build_gbps_hard_delete_plan(scored_df, group_assignments_df, prune_ratio, mi
         'group_counts': group_counts,
         'class_retained_counts': class_retained_counts,
     }
+    summary.update(summarize_contamination_labels(pruned_samples, prefix='pruned'))
+    summary.update(summarize_contamination_labels(kept_samples, prefix='kept'))
     return {
         'mode': 'remove',
         'merged_scores_df': merged_df,
