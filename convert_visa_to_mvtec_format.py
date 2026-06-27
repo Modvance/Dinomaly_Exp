@@ -1,6 +1,8 @@
 import os
 import csv
 import shutil
+import stat
+from pathlib import Path
 from tqdm import tqdm
 import argparse
 
@@ -72,21 +74,34 @@ def restructure_visa(source_dir: str, target_dir: str, use_symlink: bool = True)
             _link_or_copy(mask_src_abs, mask_dst_abs, use_symlink)
 
 
+def _ensure_writable(path: Path) -> None:
+    mode = path.stat().st_mode
+    if path.is_dir():
+        path.chmod(mode | stat.S_IWUSR | stat.S_IXUSR)
+    else:
+        path.chmod(mode | stat.S_IWUSR)
+
+
 def _link_or_copy(src: str, dst: str, use_symlink: bool) -> None:
     """Create *dst* pointing to *src* via symlink or copy.
 
-    If *dst* already exists, it is silently overwritten when copying, and left
-    untouched when linking to avoid ``FileExistsError``.
+    Existing targets are replaced so re-running the script can repair stale or
+    broken outputs.
     """
+    src_path = Path(src).resolve()
+    dst_path = Path(dst)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_writable(dst_path.parent)
+
+    if dst_path.exists() or dst_path.is_symlink():
+        _ensure_writable(dst_path)
+        dst_path.unlink()
+
     if use_symlink:
-        try:
-            os.symlink(src, dst)
-        except FileExistsError:
-            # Keep the existing link to allow re‑running the script
-            # without cleanup.
-            pass
+        os.symlink(src_path, dst_path)
     else:
-        shutil.copy2(src, dst)
+        shutil.copy2(src_path, dst_path)
+        _ensure_writable(dst_path)
 
 
 if __name__ == "__main__":
@@ -107,12 +122,11 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--copy",
-        default=True,
+        action="store_true",
         help="Copy files instead of linking (default: use symlinks)",
     )
 
     args = parser.parse_args()
-    # Decide based on user input
     args.use_symlink = not args.copy
 
     restructure_visa(args.source_dir, args.target_dir, use_symlink=args.use_symlink)

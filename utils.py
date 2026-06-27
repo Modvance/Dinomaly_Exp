@@ -120,6 +120,34 @@ def global_cosine_hm_percent_patch(a, b, patch_weight, p=0.9, factor=0., eps=1e-
     return loss
 
 
+def global_cosine_hm_percent_phase5(a, b, w_img, w_patch, p=0.9, factor=0., eps=1e-12):
+    cos_loss = torch.nn.CosineSimilarity()
+    loss = 0
+    w_img = w_img.detach().float().reshape(-1).to(a[0].device)
+    w_patch = w_patch.detach().float().to(a[0].device)
+    if w_patch.ndim == 3:
+        w_patch = w_patch.unsqueeze(1)
+    for item in range(len(a)):
+        a_ = a[item].detach()
+        b_ = b[item]
+        point_dist = 1 - cos_loss(a_, b_).unsqueeze(1)
+        with torch.no_grad():
+            thresh = torch.topk(point_dist.reshape(-1), k=int(point_dist.numel() * (1 - p)))[0][-1]
+
+        resized_weight = F.interpolate(w_patch, size=point_dist.shape[-2:], mode='bilinear', align_corners=False)
+        resized_weight = resized_weight.detach()
+        weighted_sum = (resized_weight * point_dist).flatten(1).sum(dim=1)
+        weight_sum = resized_weight.flatten(1).sum(dim=1).clamp_min(eps)
+        patch_mean = weighted_sum / weight_sum
+        loss += torch.mean(w_img * patch_mean)
+
+        partial_func = partial(modify_grad, inds=point_dist.detach() < thresh, factor=factor)
+        b_.register_hook(partial_func)
+
+    loss = loss / len(a)
+    return loss
+
+
 def regional_cosine_hm_percent(a, b, p=0.9, factor=0.):
     cos_loss = torch.nn.CosineSimilarity()
     loss = 0

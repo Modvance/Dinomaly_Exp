@@ -138,6 +138,45 @@ class TrainPatchWeightDataset(_BaseImageFolderMetaDataset):
         return image, label, meta
 
 
+class TrainPhase5WeightDataset(_BaseImageFolderMetaDataset):
+    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0, reliability_bank=None,
+                 default_patch_grid_size=(32, 32), skip_phase5_weighting=False):
+        super().__init__(dataset, data_root, class_name, class_id)
+        self.sample_offset = int(sample_offset)
+        self.reliability_bank = {} if reliability_bank is None else reliability_bank
+        if isinstance(default_patch_grid_size, str):
+            parts = [part.strip() for part in default_patch_grid_size.split(',') if part.strip()]
+            if len(parts) == 1:
+                self.default_patch_grid_size = (int(parts[0]), int(parts[0]))
+            else:
+                self.default_patch_grid_size = (int(parts[0]), int(parts[1]))
+        else:
+            self.default_patch_grid_size = tuple(int(v) for v in default_patch_grid_size)
+        self.skip_phase5_weighting = bool(skip_phase5_weighting)
+
+    def __getitem__(self, idx):
+        image, label = self.dataset[idx]
+        meta = self._build_base_meta(idx)
+        sample_idx = self.sample_offset + idx
+        bank_entry = None if self.skip_phase5_weighting else self.reliability_bank.get(int(sample_idx))
+        if bank_entry is None:
+            w_img = torch.tensor(1.0, dtype=torch.float32)
+            w_patch = torch.ones(self.default_patch_grid_size, dtype=torch.float32)
+            group_id = -1
+        else:
+            w_img = torch.tensor(float(bank_entry.get('w_img', 1.0)), dtype=torch.float32)
+            w_patch = bank_entry['w_patch'].detach().cpu().float()
+            group_id = int(bank_entry.get('group_id', -1))
+        meta.update({
+            'sample_idx': int(sample_idx),
+            'group_id': int(group_id),
+            'w_img': w_img,
+            'w_patch': w_patch,
+        })
+        meta.pop('rel_path', None)
+        return image, label, meta
+
+
 class MVTecDataset(torch.utils.data.Dataset):
     def __init__(self, root, transform, gt_transform, phase):
         if phase == 'train':

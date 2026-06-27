@@ -38,6 +38,7 @@ what `make_noisy_mvtecad.py` produced (e.g.
 import argparse
 import os
 import shutil
+import stat
 from pathlib import Path
 from typing import Dict, List
 
@@ -45,14 +46,39 @@ from typing import Dict, List
 # Helpers
 ###############################################################################
 
+def ensure_writable(path: Path):
+    mode = path.stat().st_mode
+    if path.is_dir():
+        path.chmod(mode | stat.S_IWUSR | stat.S_IXUSR)
+    else:
+        path.chmod(mode | stat.S_IWUSR)
+
+
+def ensure_tree_writable(path: Path):
+    if not path.exists():
+        return
+    if path.is_file() or path.is_symlink():
+        ensure_writable(path)
+        return
+    for root, dirs, files in os.walk(path):
+        root_path = Path(root)
+        ensure_writable(root_path)
+        for name in dirs:
+            ensure_writable(root_path / name)
+        for name in files:
+            ensure_writable(root_path / name)
+
+
 def copy_or_link(src: Path, dst: Path, symlink: bool):
     dst.parent.mkdir(parents=True, exist_ok=True)
+    ensure_writable(dst.parent)
     if dst.exists():
         return
     if symlink:
         os.symlink(src.resolve(), dst)
     else:
         shutil.copy2(src, dst)
+        ensure_writable(dst)
 
 
 def replicate_split(src_root: Path, dst_root: Path, split: str):
@@ -62,7 +88,9 @@ def replicate_split(src_root: Path, dst_root: Path, split: str):
         if not src_split.is_dir():
             continue
         dst_split = dst_root / obj / split
+        ensure_tree_writable(dst_split)
         shutil.copytree(src_split, dst_split, dirs_exist_ok=True)
+        ensure_tree_writable(dst_split)
 
 
 def gather_defect_dirs(src_root: Path) -> Dict[str, List[str]]:
@@ -91,6 +119,8 @@ def prune_good_samples(dest: Path, prune_manifest: Path):
                 continue
             target = dest / rel
             if target.is_file():
+                ensure_writable(target.parent)
+                ensure_writable(target)
                 target.unlink()
                 removed += 1
             else:
@@ -151,10 +181,12 @@ def main():
     # 1. Ensure pristine structure in dest
     for obj_path in sorted(
         [d for d in args.source_dir.iterdir() if (d / "train").is_dir()]):
-        obj_name = obj_path.name                    # keep the name once, as str
-        src_good = obj_path / "train" / "good"      # pure Path arithmetic
+        obj_name = obj_path.name
+        src_good = obj_path / "train" / "good"
         dst_good = args.dest_dir / obj_name / "train" / "good"
+        ensure_tree_writable(dst_good)
         shutil.copytree(src_good, dst_good, dirs_exist_ok=True)
+        ensure_tree_writable(dst_good)
     replicate_split(args.source_dir, args.dest_dir, "test")
     replicate_split(args.source_dir, args.dest_dir, "ground_truth")
 

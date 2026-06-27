@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 for seed in {01..05}; do
-  python make_mvtecad_ltn.py \
+  python make_mvtecad_nlt.py \
     --source-dir ../mvtec_anomaly_detection \
     --dest-dir   ../LTN_datasets/mvtecad-step_k1-seed${seed} \
     --prune-manifest manifest/mvtecad-nlt/step_k1/seed${seed}/prune_good.txt \
@@ -9,7 +9,7 @@ for seed in {01..05}; do
 done
 
 for seed in {01..05}; do
-  python make_mvtecad_ltn.py \
+  python make_mvtecad_nlt.py \
     --source-dir ../mvtec_anomaly_detection \
     --dest-dir   ../LTN_datasets/mvtecad-step_k4-seed${seed} \
     --prune-manifest manifest/mvtecad-nlt/step_k4/seed${seed}/prune_good.txt \
@@ -17,7 +17,7 @@ for seed in {01..05}; do
 done
 
 for seed in {01..05}; do
-  python make_mvtecad_ltn.py \
+  python make_mvtecad_nlt.py \
     --source-dir ../mvtec_anomaly_detection \
     --dest-dir   ../LTN_datasets/mvtecad-pareto-seed${seed} \
     --prune-manifest manifest/mvtecad-nlt/pareto/seed${seed}/prune_good.txt \

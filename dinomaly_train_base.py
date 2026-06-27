@@ -12,13 +12,13 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, Subset
 from torchvision.datasets import ImageFolder
 
-from dataset import MVTecDataset, TrainDiagDataset, TrainPatchWeightDataset, get_data_transforms
+from dataset import MVTecDataset, TrainDiagDataset, TrainPatchWeightDataset, TrainPhase5WeightDataset, get_data_transforms
 from dinov1.utils import trunc_normal_
 from models import vit_encoder
 from models.uad import ViTill
 from models.vision_transformer import Block as VitBlock, LinearAttention2, bMlp
 from optimizers import StableAdamW
-from utils import WarmCosineScheduler, compute_image_level_scores, evaluation_batch, get_gaussian_kernel, global_cosine_hm_percent, global_cosine_hm_percent_patch, infer_anomaly_map_batch
+from utils import WarmCosineScheduler, compute_image_level_scores, evaluation_batch, get_gaussian_kernel, global_cosine_hm_percent, global_cosine_hm_percent_patch, global_cosine_hm_percent_phase5, infer_anomaly_map_batch
 
 
 DEFAULT_TOTAL_ITERS = 10000
@@ -134,6 +134,35 @@ def build_patch_train_dataloader(train_datasets, data_root, item_list, patch_wei
             patch_weight_bank=patch_weight_bank,
             default_patch_grid_size=patch_grid_size,
             skip_patch_denoise=skip_patch_denoise,
+        )
+        wrapped_datasets.append(wrapped_dataset)
+        sample_offset += len(wrapped_dataset)
+
+    train_data = ConcatDataset(wrapped_datasets)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_data,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        drop_last=True,
+    )
+    return train_data, train_dataloader
+
+
+def build_phase5_train_dataloader(train_datasets, data_root, item_list, reliability_bank,
+                                  patch_grid_size, batch_size, num_workers, skip_phase5_weighting=False):
+    wrapped_datasets = []
+    sample_offset = 0
+    for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
+        wrapped_dataset = TrainPhase5WeightDataset(
+            train_data,
+            data_root=data_root,
+            class_name=item,
+            class_id=class_id,
+            sample_offset=sample_offset,
+            reliability_bank=reliability_bank,
+            default_patch_grid_size=patch_grid_size,
+            skip_phase5_weighting=skip_phase5_weighting,
         )
         wrapped_datasets.append(wrapped_dataset)
         sample_offset += len(wrapped_dataset)
@@ -305,6 +334,27 @@ def train_patch_step(model, trainable, optimizer, scheduler, images, patch_weigh
     p_final = 0.9
     p = min(p_final * current_zero_based_iter / 1000, p_final)
     loss = global_cosine_hm_percent_patch(en, de, patch_weight=patch_weight, p=p, factor=0.1)
+
+    optimizer.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(trainable.parameters(), max_norm=grad_clip_norm)
+    optimizer.step()
+    scheduler.step()
+    return float(loss.item())
+
+
+def train_phase5_step(model, trainable, optimizer, scheduler, images, w_img, w_patch,
+                      current_zero_based_iter, grad_clip_norm=0.1):
+    model.train()
+    device = next(model.parameters()).device
+    images = images.to(device)
+    w_img = w_img.to(device)
+    w_patch = w_patch.to(device)
+    en, de = model(images)
+
+    p_final = 0.9
+    p = min(p_final * current_zero_based_iter / 1000, p_final)
+    loss = global_cosine_hm_percent_phase5(en, de, w_img=w_img, w_patch=w_patch, p=p, factor=0.1)
 
     optimizer.zero_grad()
     loss.backward()

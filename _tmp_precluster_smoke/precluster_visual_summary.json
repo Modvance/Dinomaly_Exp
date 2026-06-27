@@ -1,0 +1,112 @@
+{
+  "config": {
+    "data": {
+      "image_root": "/home/linux/projects/LTN_datasets/mvtecad-pareto-seed01/bottle/train/good",
+      "image_extensions": [
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp"
+      ],
+      "recursive": 1
+    },
+    "output": {
+      "output_dir": "/home/linux/projects/Dinomaly/_tmp_precluster_smoke",
+      "result_csv": "precluster_visual_result.csv",
+      "summary_json": "precluster_visual_summary.json",
+      "features_npz": "precluster_visual_features.npz",
+      "graph_npz": "precluster_visual_graph.npz"
+    },
+    "encoder": {
+      "model_name": "dinov2_vitb14",
+      "pretrained": 1,
+      "input_size": 518,
+      "batch_size": 2,
+      "num_workers": 0,
+      "device": "cpu",
+      "precision": "fp16",
+      "use_registers": 0,
+      "high_layer": -1,
+      "mid_layers": [
+        -6,
+        -5,
+        -4
+      ]
+    },
+    "features": {
+      "structure_grid": [
+        2,
+        2
+      ],
+      "object_weight": 1.0,
+      "structure_weight": 0.7,
+      "texture_weight": 0.5,
+      "normalize_each_feature": 1,
+      "normalize_final_feature": 1,
+      "foreground_eps": 1e-06
+    },
+    "multiview": {
+      "enabled": 1,
+      "num_views": 3,
+      "scale_min": 0.9,
+      "scale_max": 1.0,
+      "brightness": 0.1,
+      "contrast": 0.1
+    },
+    "knn": {
+      "metric": "cosine",
+      "k_min": 20,
+      "k_max": 100,
+      "mutual": 1,
+      "use_snn": 1
+    },
+    "graph": {
+      "max_edges_per_node": 5
+    },
+    "clustering": {
+      "small_cluster_size": 3,
+      "keep_singleton": 1
+    },
+    "debug": {
+      "save_feature_parts": 1,
+      "save_graph": 1,
+      "random_seed": 42
+    }
+  },
+  "num_samples": 5,
+  "model_name": "dinov2_vitb14",
+  "layer_config": {
+    "high": [
+      11
+    ],
+    "mid": [
+      6,
+      7,
+      8
+    ],
+    "all": [
+      6,
+      7,
+      8,
+      11
+    ]
+  },
+  "feature_dims": {
+    "object": 768,
+    "structure": 3072,
+    "texture": 1536,
+    "embedding": 5376
+  },
+  "selected_k": 4,
+  "requested_k": 20,
+  "candidate_edge_count": 20,
+  "retained_edge_count": 10,
+  "num_components": 1,
+  "num_singletons": 0,
+  "num_small_clusters": 0,
+  "num_multi_clusters": 1,
+  "cluster_size_histogram": {
+    "5": 1
+  }
+}
