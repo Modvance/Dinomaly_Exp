@@ -116,9 +116,14 @@ python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 
 
 gbps
 ```bash
-python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_pareto --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
-python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k4 --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
-python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k1 --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_pareto --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k4 --gpus 5 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k1 --gpus 6 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt
+
+eval:
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_pareto_eval --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt --eval_interval 500
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k4_eval --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt --eval_interval 500
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k1_eval --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt --eval_interval 500
 ```
 
 patch
@@ -126,4 +131,11 @@ patch
 python dinomaly_mvtec_patch.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/patch/ --save_name mvtec_pareto --gpus 1
 python dinomaly_mvtec_patch.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/patch/ --save_name mvtec_k4 --gpus 2
 python dinomaly_mvtec_patch.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/patch/ --save_name mvtec_k1 --gpus 3
+```
+
+phase5
+```bash
+python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_pareto --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt --gpus 1
+python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_k4 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt --gpus 2
+python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_k1 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt --gpus 3
 ```
