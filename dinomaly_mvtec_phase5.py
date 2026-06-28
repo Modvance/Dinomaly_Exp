@@ -62,6 +62,7 @@ def train(item_list):
         device,
         args.diag_save_dir,
         args,
+        print_fn=print_fn,
     )
     reliability_bank = reliability_result['reliability_bank']
     reliability_summary_df = reliability_result['summary_df']
@@ -203,20 +204,31 @@ if __name__ == '__main__':
     parser.add_argument('--diag_num_workers', type=int, default=4)
     parser.add_argument('--gbps_grouping_method', type=str, default='kmeans')
     parser.add_argument('--gbps_num_groups', type=int, default=None)
-    parser.add_argument('--gbps_auto_k', action='store_true')
+    parser.add_argument('--gbps_auto_k', action='store_true', default=True)
     parser.add_argument('--gbps_k_candidates', type=str, default='8,10,12,15,20')
     parser.add_argument('--gbps_pca_dim', type=int, default=64)
     parser.add_argument('--gbps_embedding_source', type=str, default='encoder')
     parser.add_argument('--gbps_group_cache_path', type=str, default=None)
     parser.add_argument('--phase5_knn_k', type=int, default=5)
     parser.add_argument('--phase5_memory_size', type=int, default=1024)
-    parser.add_argument('--phase5_memory_build_mode', type=str, default='kmeans')
+    parser.add_argument('--phase5_memory_build_mode', type=str, default='kmeans', choices=['kmeans', 'random'])
     parser.add_argument('--phase5_top_wimg_ratio', type=float, default=0.5)
     parser.add_argument('--phase5_reliability_cache_path', type=str, default=None)
     parser.add_argument('--phase5_force_recompute', action='store_true')
     parser.add_argument('--phase5_min_group_size', type=int, default=3)
     parser.add_argument('--phase5_eps', type=float, default=1e-6)
     parser.add_argument('--phase5_patch_grid_size', type=str, default='28,28')
+    parser.add_argument('--phase5_use_faiss', type=int, default=1)
+    parser.add_argument('--phase5_faiss_gpu', type=int, default=1)
+    parser.add_argument('--phase5_faiss_gpu_id', type=int, default=0)
+    parser.add_argument('--phase5_knn_backend', type=str, default='faiss', choices=['faiss', 'sklearn'])
+    parser.add_argument('--phase5_kmeans_backend', type=str, default='faiss', choices=['faiss', 'sklearn'])
+    parser.add_argument('--phase5_faiss_batch_size', type=int, default=200000)
+    parser.add_argument('--phase5_kmeans_niter', type=int, default=300)
+    parser.add_argument('--phase5_kmeans_nredo', type=int, default=10)
+    parser.add_argument('--phase5_kmeans_spherical', type=int, default=1)
+    parser.add_argument('--phase5_l2_normalize', type=int, default=1)
+    parser.add_argument('--phase5_fallback_to_sklearn', type=int, default=1)
     parser.add_argument('--phase5_loss_norm', type=str, default='per_image', choices=['per_image'])
     parser.add_argument('--phase5_train_mode', type=str, default='restart', choices=['restart'])
     args = parser.parse_args()

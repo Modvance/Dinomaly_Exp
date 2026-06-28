@@ -1,6 +1,10 @@
 ## conda create -n dinomaly python=3.8.12
 ## conda activate dinomaly
 ## pip install -r requirements.txt
+##
+## Optional for phase5 FAISS backend (recommended for GPU acceleration):
+## conda install -n dinomaly -c pytorch -c nvidia -c conda-forge faiss-gpu -y
+## conda run -n dinomaly python -c "import faiss; print('faiss version:', getattr(faiss, '__version__', 'unknown')); print('num gpus:', faiss.get_num_gpus())"
 
 --find-links https://download.pytorch.org/whl/torch_stable.html
 
