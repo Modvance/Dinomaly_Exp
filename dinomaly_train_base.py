@@ -9,10 +9,10 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, Subset
+from torch.utils.data import ConcatDataset, Subset, WeightedRandomSampler
 from torchvision.datasets import ImageFolder
 
-from dataset import MVTecDataset, TrainDiagDataset, TrainPatchWeightDataset, TrainPhase5WeightDataset, get_data_transforms
+from dataset import MVTecDataset, TrainDiagDataset, TrainPatchWeightDataset, TrainPhase5WeightDataset, TrainPhase6Dataset, get_data_transforms
 from dinov1.utils import trunc_normal_
 from models import vit_encoder
 from models.uad import ViTill
@@ -82,15 +82,37 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False
 
 
-def build_train_dataloader(train_datasets, batch_size, num_workers):
+def build_train_dataloader(train_datasets, batch_size, num_workers, sampler=None, shuffle=None, epoch_num_samples=None):
     train_data = ConcatDataset(train_datasets)
-    train_dataloader = torch.utils.data.DataLoader(
-        train_data,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        drop_last=True,
-    )
+    if sampler is None:
+        effective_shuffle = True if shuffle is None else bool(shuffle)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=batch_size,
+            shuffle=effective_shuffle,
+            num_workers=num_workers,
+            drop_last=True,
+        )
+    else:
+        if shuffle is None:
+            shuffle = False
+        if bool(shuffle):
+            raise ValueError('shuffle must be False when sampler is provided')
+        if epoch_num_samples is None:
+            epoch_num_samples = len(train_data)
+        weighted_sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sampler, dtype=torch.double),
+            num_samples=int(epoch_num_samples),
+            replacement=True,
+        )
+        train_dataloader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=batch_size,
+            sampler=weighted_sampler,
+            shuffle=False,
+            num_workers=num_workers,
+            drop_last=True,
+        )
     return train_data, train_dataloader
 
 
@@ -178,9 +200,38 @@ def build_phase5_train_dataloader(train_datasets, data_root, item_list, reliabil
     return train_data, train_dataloader
 
 
+def build_phase6_train_dataloader(train_datasets, data_root, item_list, phase6_plan,
+                                  batch_size, num_workers, sampler=None, epoch_num_samples=None):
+    wrapped_datasets = []
+    sample_weights_df = phase6_plan['sample_weights_df'].copy()
+    if 'class_id' not in sample_weights_df.columns:
+        raise ValueError('phase6 sample_weights_df must contain class_id')
+
+    for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
+        class_rows = sample_weights_df.loc[sample_weights_df['class_id'].astype(int) == int(class_id)]
+        wrapped_dataset = TrainPhase6Dataset(
+            train_data,
+            data_root=data_root,
+            class_name=item,
+            class_id=class_id,
+            sample_rows=class_rows.to_dict(orient='records'),
+        )
+        wrapped_datasets.append(wrapped_dataset)
+
+    train_data, train_dataloader = build_train_dataloader(
+        wrapped_datasets,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        sampler=sampler,
+        epoch_num_samples=epoch_num_samples,
+    )
+    return train_data, train_dataloader
+
+
 def rebuild_pruned_train_loaders(train_data_list, retained_index_map, data_root, item_list,
                                  batch_size, num_workers, diag_batch_size, diag_num_workers,
-                                 contaminated_paths=None):
+                                 contaminated_paths=None, sampler=None, epoch_num_samples=None,
+                                 phase6_plan=None, use_phase6_meta=False):
     pruned_train_data_list = []
     for class_id, train_dataset in enumerate(train_data_list):
         retained_indices = retained_index_map.get(class_id)
@@ -188,11 +239,27 @@ def rebuild_pruned_train_loaders(train_data_list, retained_index_map, data_root,
             retained_indices = list(range(len(train_dataset)))
         pruned_train_data_list.append(Subset(train_dataset, retained_indices))
 
-    train_data, train_dataloader = build_train_dataloader(
-        pruned_train_data_list,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
+    if use_phase6_meta:
+        if phase6_plan is None:
+            raise ValueError('phase6_plan is required when use_phase6_meta=True')
+        train_data, train_dataloader = build_phase6_train_dataloader(
+            pruned_train_data_list,
+            data_root=data_root,
+            item_list=item_list,
+            phase6_plan=phase6_plan,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sampler=sampler,
+            epoch_num_samples=epoch_num_samples,
+        )
+    else:
+        train_data, train_dataloader = build_train_dataloader(
+            pruned_train_data_list,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            sampler=sampler,
+            epoch_num_samples=epoch_num_samples,
+        )
     train_eval_dataloader = build_train_eval_dataloader(
         pruned_train_data_list,
         data_root=data_root,

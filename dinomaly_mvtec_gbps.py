@@ -32,6 +32,7 @@ from gbps_runner_utils import (
     summarize_class_label_counts,
     summarize_contamination_labels,
 )
+from phase6_runner_utils import build_longtail_sampling_plan, save_longtail_artifacts
 from safe_gbps import compute_gbps_u_with_bootstrap
 from warmup_diag import load_injected_manifest
 
@@ -98,7 +99,15 @@ def train(item_list):
     it = 0
     for _ in range(int(np.ceil(total_iters / len(train_dataloader)))):
         loss_list = []
-        for images, _ in train_dataloader:
+        for batch in train_dataloader:
+            if len(batch) == 3:
+                images, _, meta = batch
+                sample_weight = None
+                if args.lt_enable and args.lt_group_balanced_loss and isinstance(meta, dict) and 'loss_weight' in meta:
+                    sample_weight = meta['loss_weight']
+            else:
+                images, _ = batch
+                sample_weight = None
             loss_value = train_step(
                 model,
                 trainable,
@@ -106,6 +115,7 @@ def train(item_list):
                 lr_scheduler,
                 images,
                 current_zero_based_iter=it,
+                sample_weight=sample_weight,
             )
             loss_list.append(loss_value)
 
@@ -205,6 +215,14 @@ def train(item_list):
                             prune_ratio=args.gbps_prune_ratio,
                             min_keep_per_group=args.gbps_min_keep_per_group,
                         )
+                        lt_sampling_plan = None
+                        if args.lt_enable:
+                            lt_sampling_plan = build_longtail_sampling_plan(
+                                delete_plan['kept_samples'],
+                                args,
+                                original_num_samples=train_image_count_before_prune,
+                                prune_group_counts=delete_plan['summary'].get('group_counts'),
+                            )
                         rebuild_result = rebuild_pruned_train_loaders(
                             train_data_list,
                             delete_plan['retained_index_map'],
@@ -215,6 +233,10 @@ def train(item_list):
                             diag_batch_size=args.diag_batch_size,
                             diag_num_workers=args.diag_num_workers,
                             contaminated_paths=contaminated_paths,
+                            sampler=None if lt_sampling_plan is None or not args.lt_sampler_enable else lt_sampling_plan['sampler_weights'],
+                            epoch_num_samples=None if lt_sampling_plan is None or not args.lt_sampler_enable else lt_sampling_plan['epoch_num_samples'],
+                            phase6_plan=lt_sampling_plan,
+                            use_phase6_meta=bool(lt_sampling_plan is not None),
                         )
                         train_data_list = rebuild_result['train_data_list']
                         train_data = rebuild_result['train_data']
@@ -229,8 +251,19 @@ def train(item_list):
                             'gbps_prune_group_counts': delete_plan['summary']['group_counts'],
                             'train_image_count_before_prune': int(train_image_count_before_prune),
                             'train_image_count_after_prune': int(len(train_data)),
+                            'lt_enable': bool(args.lt_enable),
+                            'lt_sampler_enable': bool(args.lt_enable and args.lt_sampler_enable),
                         })
+                        if lt_sampling_plan is not None:
+                            postprocess_summary.update(lt_sampling_plan['summary'])
                         save_gbps_prune_artifacts(iter_dir, delete_plan, extra_summary=postprocess_summary)
+                        if lt_sampling_plan is not None:
+                            save_longtail_artifacts(iter_dir, lt_sampling_plan, extra_summary=postprocess_summary)
+                            print_fn('phase6 long-tail sampler prepared: groups={}, epoch_num_samples={}, alpha={:.3f}'.format(
+                                lt_sampling_plan['summary']['lt_total_groups'],
+                                lt_sampling_plan['summary']['lt_epoch_num_samples_effective'],
+                                lt_sampling_plan['summary']['lt_sampler_alpha'],
+                            ))
                         print_fn('gbps remove iter {}: pruned {} / {} training samples, train image number {} -> {}'.format(
                             gbps_selected_iter,
                             delete_plan['summary']['num_pruned'],
@@ -333,6 +366,23 @@ if __name__ == '__main__':
     parser.add_argument('--gbps_improve_eps', type=float, default=1e-6)
     parser.add_argument('--gbps_min_checks_before_trigger', type=int, default=2)
     parser.add_argument('--gbps_min_checks_after_best', type=int, default=1)
+    parser.add_argument('--lt_enable', action='store_true')
+    parser.add_argument('--lt_group_col', type=str, default='group_id')
+    parser.add_argument('--lt_sampler_enable', action='store_true')
+    parser.add_argument('--lt_sampler_alpha', type=float, default=0.5)
+    parser.add_argument('--lt_sampler_clip_min', type=float, default=0.25)
+    parser.add_argument('--lt_sampler_clip_max', type=float, default=4.0)
+    parser.add_argument('--lt_epoch_num_samples', type=str, default='kept', choices=['kept', 'original'])
+    parser.add_argument('--lt_group_balanced_loss', action='store_true')
+    parser.add_argument('--lt_tail_aug_enable', action='store_true')
+    parser.add_argument('--lt_tail_rho_thr', type=float, default=0.3)
+    parser.add_argument('--lt_tail_aug_p_noisy_thr', type=float, default=0.2)
+    parser.add_argument('--lt_tail_aug_k', type=int, default=4)
+    parser.add_argument('--lt_tail_aug_max_group_ratio', type=float, default=0.5)
+    parser.add_argument('--lt_tail_aug_score_eta', type=float, default=0.5)
+    parser.add_argument('--lt_aug_weight_scale', type=float, default=0.5)
+    parser.add_argument('--lt_tail_aug_use_warmup_score', action='store_true')
+    parser.add_argument('--lt_tail_aug_manifest_path', type=str, default=None)
     args = parser.parse_args()
 
     item_list = ['carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',

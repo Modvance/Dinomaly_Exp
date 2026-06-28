@@ -139,3 +139,11 @@ python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-pareto-seed0
 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_k4 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt --gpus 2
 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_k1 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt --gpus 3
 ```
+
+class
+```bash
+python run_precluster_visual.py --image_root ../mvtec_anomaly_detection --output_dir ../results/class/vlm_1 --stage all --split train --device cuda
+python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-pareto-seed02 --output_dir ../results/class/vlm_pareto_1 --stage all --split train --device cuda
+python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k4-seed02 --output_dir ../results/class/vlm_k4 --stage all --split train --device cuda
+python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k1-seed02 --output_dir ../results/class/vlm_k1 --stage all --split train --device cuda
+```

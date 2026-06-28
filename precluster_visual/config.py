@@ -1,7 +1,12 @@
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 import json
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 _DEFAULT_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.bmp', '.webp']
@@ -26,51 +31,49 @@ class OutputConfig:
 
 @dataclass
 class EncoderConfig:
-    model_name: str = 'dinov2_vitb14'
-    pretrained: bool = True
-    input_size: int = 518
+    model_name: str = 'google/siglip-large-patch16-384'
+    input_size: int = 384
     batch_size: int = 16
     num_workers: int = 4
     device: str = 'cuda'
     precision: str = 'fp16'
-    use_registers: bool = False
-    high_layer: int = -1
-    mid_layers: List[int] = field(default_factory=lambda: [-6, -5, -4])
-
-
-@dataclass
-class FeatureConfig:
-    structure_grid: List[int] = field(default_factory=lambda: [2, 2])
-    object_weight: float = 1.0
-    structure_weight: float = 0.7
-    texture_weight: float = 0.5
-    normalize_each_feature: bool = True
-    normalize_final_feature: bool = True
-    foreground_eps: float = 1e-6
+    normalize: bool = True
 
 
 @dataclass
 class MultiViewConfig:
     enabled: bool = True
     num_views: int = 3
-    scale_min: float = 0.9
+    scale_min: float = 0.92
     scale_max: float = 1.0
     brightness: float = 0.1
     contrast: float = 0.1
+    saturation: float = 0.05
+    hue: float = 0.02
 
 
 @dataclass
 class KnnConfig:
     metric: str = 'cosine'
-    k_min: int = 40
+    k_rule: str = 'sqrt'
+    k_min: int = 20
     k_max: int = 140
     mutual: bool = True
-    use_snn: bool = True
+    use_snn: bool = False
+
+
+@dataclass
+class CalibrationConfig:
+    enabled: bool = True
+    num_bins: int = 100
+    num_negative_pairs: int = 50000
+    connect_if_p_same_gt: float = 0.45
 
 
 @dataclass
 class GraphConfig:
-    max_edges_per_node: int = 10
+    max_edges_per_node: int = 12
+    use_local_top_edges: bool = True
 
 
 @dataclass
@@ -81,7 +84,7 @@ class ClusterConfig:
 
 @dataclass
 class DebugConfig:
-    save_feature_parts: bool = True
+    save_pair_statistics: bool = True
     save_graph: bool = True
     random_seed: int = 42
 
@@ -91,9 +94,9 @@ class PreclusterConfig:
     data: DataConfig
     output: OutputConfig
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
-    features: FeatureConfig = field(default_factory=FeatureConfig)
     multiview: MultiViewConfig = field(default_factory=MultiViewConfig)
     knn: KnnConfig = field(default_factory=KnnConfig)
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     graph: GraphConfig = field(default_factory=GraphConfig)
     clustering: ClusterConfig = field(default_factory=ClusterConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
@@ -102,9 +105,16 @@ class PreclusterConfig:
         return asdict(self)
 
 
-def _read_json(path: Path) -> Dict[str, Any]:
+def _read_config(path: Path) -> Dict[str, Any]:
+    suffix = path.suffix.lower()
     with open(path) as file:
-        return json.load(file)
+        if suffix == '.json':
+            return json.load(file)
+        if suffix in ['.yaml', '.yml']:
+            if yaml is None:
+                raise ImportError('PyYAML is required to load YAML config files')
+            return yaml.safe_load(file)
+    raise ValueError('unsupported config extension: {}'.format(path.suffix))
 
 
 def _merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -122,9 +132,9 @@ def _coerce_dataclass(data: Dict[str, Any]) -> PreclusterConfig:
         data=DataConfig(**data['data']),
         output=OutputConfig(**data['output']),
         encoder=EncoderConfig(**data.get('encoder', {})),
-        features=FeatureConfig(**data.get('features', {})),
         multiview=MultiViewConfig(**data.get('multiview', {})),
         knn=KnnConfig(**data.get('knn', {})),
+        calibration=CalibrationConfig(**data.get('calibration', {})),
         graph=GraphConfig(**data.get('graph', {})),
         clustering=ClusterConfig(**data.get('clustering', {})),
         debug=DebugConfig(**data.get('debug', {})),
@@ -138,7 +148,7 @@ def load_config(config_path: Optional[str] = None, overrides: Optional[Dict[str,
         output=OutputConfig(output_dir=output_dir or ''),
     ).to_dict()
     if config_path is not None:
-        loaded = _read_json(Path(config_path))
+        loaded = _read_config(Path(config_path))
         base = _merge_dict(base, loaded)
     if overrides is not None:
         base = _merge_dict(base, overrides)
@@ -162,14 +172,20 @@ def validate_config(config: PreclusterConfig) -> None:
         raise ValueError('encoder.batch_size must be positive')
     if config.encoder.num_workers < 0:
         raise ValueError('encoder.num_workers must be non-negative')
+    if str(config.encoder.precision).lower() not in ['fp32', 'fp16', 'bf16']:
+        raise ValueError('encoder.precision must be one of: fp32, fp16, bf16')
+    if config.knn.k_rule not in ['sqrt']:
+        raise ValueError('knn.k_rule must currently be sqrt')
     if config.knn.k_min <= 0 or config.knn.k_max <= 0:
         raise ValueError('k_min and k_max must be positive')
     if config.knn.k_min > config.knn.k_max:
         raise ValueError('k_min cannot exceed k_max')
-    if len(config.features.structure_grid) != 2:
-        raise ValueError('structure_grid must have two integers')
-    if any(int(v) <= 0 for v in config.features.structure_grid):
-        raise ValueError('structure_grid values must be positive')
+    if config.calibration.num_bins <= 1:
+        raise ValueError('calibration.num_bins must be greater than 1')
+    if config.calibration.num_negative_pairs <= 0:
+        raise ValueError('calibration.num_negative_pairs must be positive')
+    if not 0.0 <= float(config.calibration.connect_if_p_same_gt) <= 1.0:
+        raise ValueError('calibration.connect_if_p_same_gt must be within [0, 1]')
     if config.graph.max_edges_per_node <= 0:
         raise ValueError('graph.max_edges_per_node must be positive')
     if config.multiview.enabled and config.multiview.num_views <= 0:

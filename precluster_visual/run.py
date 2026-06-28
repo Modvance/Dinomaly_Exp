@@ -1,15 +1,16 @@
 import random
-from typing import Dict, List
+from typing import Dict
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
 from .augment import build_view_transforms
+from .calibrator import fit_similarity_calibrator
 from .cluster import build_cluster_summary, build_result_table, cluster_connected_components
 from .data import MultiViewImagePathDataset, collate_multiview, discover_image_paths
-from .encoder import extract_view_tokens, load_dinov2_model, resolve_layer_indices
-from .features import aggregate_multiview, build_feature_bundle, compute_view_stability
+from .encoder import SiglipImageEncoder
+from .features import aggregate_multiview, compute_view_stability, stack_view_embeddings
 from .graph import build_graph
 from .io_utils import ensure_dir, save_features_npz, save_graph_npz, save_result_csv, save_summary_json
 
@@ -21,20 +22,16 @@ def _set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-def _resolve_device(device_name: str) -> torch.device:
-    if device_name.startswith('cuda') and not torch.cuda.is_available():
-        return torch.device('cpu')
-    return torch.device(device_name)
+def _feature_paths(config) -> Dict[str, str]:
+    return {
+        'result_csv': '{}/{}'.format(config.output.output_dir, config.output.result_csv),
+        'summary_json': '{}/{}'.format(config.output.output_dir, config.output.summary_json),
+        'features_npz': '{}/{}'.format(config.output.output_dir, config.output.features_npz),
+        'graph_npz': '{}/{}'.format(config.output.output_dir, config.output.graph_npz),
+    }
 
 
-def _stack_feature_parts(feature_parts: List[Dict[str, torch.Tensor]], key: str) -> torch.Tensor:
-    return torch.cat([part[key].detach().cpu() for part in feature_parts], dim=0)
-
-
-def run_precluster_visual(config):
-    _set_seed(int(config.debug.random_seed))
-    ensure_dir(config.output.output_dir)
-    device = _resolve_device(str(config.encoder.device))
+def _extract_feature_bundle(config):
     image_paths = discover_image_paths(
         config.data.image_root,
         config.data.image_extensions,
@@ -51,93 +48,135 @@ def run_precluster_visual(config):
         drop_last=False,
         collate_fn=collate_multiview,
     )
+    encoder = SiglipImageEncoder(
+        model_name=str(config.encoder.model_name),
+        device=str(config.encoder.device),
+        precision=str(config.encoder.precision),
+    )
 
-    model = load_dinov2_model(config).to(device)
-    layer_config = resolve_layer_indices(len(model.blocks), config.encoder.high_layer, config.encoder.mid_layers)
-    autocast_enabled = bool(device.type == 'cuda' and str(config.encoder.precision).lower() in ['fp16', 'bf16'])
-
-    all_object_parts = []
-    all_structure_parts = []
-    all_texture_parts = []
     all_embeddings = []
+    all_view_embeddings = []
     all_view_stability = []
+    all_sample_idx = []
+    all_img_path = []
 
-    for stacked_views, meta in dataloader:
-        view_feature_parts = []
-        for images in stacked_views:
-            images = images.to(device)
-            token_bundle = extract_view_tokens(model, images, layer_config, autocast_enabled=autocast_enabled)
-            feature_bundle = build_feature_bundle(
-                token_bundle['cls_tokens'],
-                token_bundle['patch_tokens_high'],
-                token_bundle['patch_tokens_mid'],
-                config,
-            )
-            view_feature_parts.append(feature_bundle)
+    for view_batches, meta in dataloader:
+        encoded_views = [encoder.encode_pil_batch(images) for images in view_batches]
+        batch_embedding = aggregate_multiview(encoded_views, normalize=bool(config.encoder.normalize)).cpu()
+        batch_view_embeddings = stack_view_embeddings(encoded_views, normalize=bool(config.encoder.normalize)).cpu()
+        batch_view_stability = compute_view_stability(encoded_views).cpu()
 
-        object_views = [part['object_feature'] for part in view_feature_parts]
-        structure_views = [part['structure_feature'] for part in view_feature_parts]
-        texture_views = [part['texture_feature'] for part in view_feature_parts]
-        embedding_views = [part['embedding'] for part in view_feature_parts]
+        all_embeddings.append(batch_embedding)
+        all_view_embeddings.append(batch_view_embeddings)
+        all_view_stability.append(batch_view_stability)
+        all_sample_idx.extend([int(item) for item in meta['sample_idx']])
+        all_img_path.extend([str(item) for item in meta['img_path']])
 
-        all_object_parts.append(aggregate_multiview(object_views, normalize=bool(config.features.normalize_each_feature)).detach().cpu())
-        all_structure_parts.append(aggregate_multiview(structure_views, normalize=bool(config.features.normalize_each_feature)).detach().cpu())
-        all_texture_parts.append(aggregate_multiview(texture_views, normalize=bool(config.features.normalize_each_feature)).detach().cpu())
-        all_embeddings.append(aggregate_multiview(embedding_views, normalize=bool(config.features.normalize_final_feature)).detach().cpu())
-        all_view_stability.append(compute_view_stability(embedding_views).detach().cpu())
-
-    object_feature = torch.cat(all_object_parts, dim=0).numpy().astype(np.float32)
-    structure_feature = torch.cat(all_structure_parts, dim=0).numpy().astype(np.float32)
-    texture_feature = torch.cat(all_texture_parts, dim=0).numpy().astype(np.float32)
-    embedding = torch.cat(all_embeddings, dim=0).numpy().astype(np.float32)
+    embeddings = torch.cat(all_embeddings, dim=0).numpy().astype(np.float32)
+    view_embeddings = torch.cat(all_view_embeddings, dim=0).numpy().astype(np.float32)
     view_stability = torch.cat(all_view_stability, dim=0).numpy().astype(np.float32)
 
-    feature_bundle = {
-        'object_feature': object_feature,
-        'structure_feature': structure_feature,
-        'texture_feature': texture_feature,
-        'embedding': embedding,
+    return {
+        'image_paths': np.asarray(all_img_path),
+        'sample_idx': np.asarray(all_sample_idx, dtype=np.int64),
+        'embeddings': embeddings,
+        'view_embeddings': view_embeddings,
+        'view_stability': view_stability,
     }
-    graph_result = build_graph(feature_bundle, config)
+
+
+def _load_feature_bundle(path: str):
+    loaded = np.load(path, allow_pickle=False)
+    return {
+        'image_paths': loaded['image_paths'].astype(str),
+        'sample_idx': loaded['sample_idx'].astype(np.int64) if 'sample_idx' in loaded.files else np.arange(len(loaded['image_paths']), dtype=np.int64),
+        'embeddings': loaded['embeddings'].astype(np.float32),
+        'view_embeddings': loaded['view_embeddings'].astype(np.float32),
+        'view_stability': loaded['view_stability'].astype(np.float32),
+    }
+
+
+def _run_extract_stage(config):
+    feature_bundle = _extract_feature_bundle(config)
+    paths = _feature_paths(config)
+    save_features_npz(paths['features_npz'], feature_bundle)
+    return {
+        'num_samples': int(len(feature_bundle['image_paths'])),
+        'output_dir': str(config.output.output_dir),
+        'features_path': paths['features_npz'],
+    }
+
+
+def _run_cluster_stage(config):
+    paths = _feature_paths(config)
+    feature_bundle = _load_feature_bundle(paths['features_npz'])
+    calibrator = fit_similarity_calibrator(
+        view_embeddings=feature_bundle['view_embeddings'],
+        embeddings=feature_bundle['embeddings'],
+        num_bins=int(config.calibration.num_bins),
+        num_negative_pairs=int(config.calibration.num_negative_pairs),
+        random_seed=int(config.debug.random_seed),
+    ) if bool(config.calibration.enabled) else None
+
+    graph_result = build_graph(feature_bundle, config, calibrator=calibrator)
+    image_paths = feature_bundle['image_paths'].tolist()
     num_components, labels = cluster_connected_components(len(image_paths), graph_result['rows'], graph_result['cols'], graph_result['edge_scores'])
-    result_df = build_result_table(image_paths, labels, view_stability, graph_result['rows'], graph_result['cols'], graph_result['edge_scores'], int(config.clustering.small_cluster_size))
+    result_df = build_result_table(
+        image_paths,
+        labels,
+        feature_bundle['view_stability'],
+        graph_result['rows'],
+        graph_result['cols'],
+        graph_result['edge_scores'],
+        int(config.clustering.small_cluster_size),
+    )
     cluster_summary = build_cluster_summary(result_df, num_components)
 
-    result_csv_path = '{}/{}'.format(config.output.output_dir, config.output.result_csv)
-    summary_json_path = '{}/{}'.format(config.output.output_dir, config.output.summary_json)
-    features_npz_path = '{}/{}'.format(config.output.output_dir, config.output.features_npz)
-    graph_npz_path = '{}/{}'.format(config.output.output_dir, config.output.graph_npz)
-
-    save_result_csv(result_csv_path, result_df)
-    save_summary_json(summary_json_path, {
+    save_result_csv(paths['result_csv'], result_df)
+    save_summary_json(paths['summary_json'], {
         'config': config.to_dict(),
         'num_samples': int(len(image_paths)),
         'model_name': str(config.encoder.model_name),
-        'layer_config': layer_config,
-        'feature_dims': {
-            'object': int(object_feature.shape[1]),
-            'structure': int(structure_feature.shape[1]),
-            'texture': int(texture_feature.shape[1]),
-            'embedding': int(embedding.shape[1]),
-        },
+        'embedding_dim': int(feature_bundle['embeddings'].shape[1]),
+        'num_views': int(feature_bundle['view_embeddings'].shape[1]),
         'selected_k': int(graph_result['k']),
         'requested_k': int(graph_result['requested_k']),
         'candidate_edge_count': int(graph_result['candidate_edge_count']),
         'retained_edge_count': int(graph_result['retained_edge_count']),
+        'calibration_enabled': bool(config.calibration.enabled),
+        'calibration_fitted': bool(calibrator is not None),
         **cluster_summary,
     })
-    save_features_npz(features_npz_path, {
-        'embeddings': embedding,
-        'object_features': object_feature,
-        'structure_features': structure_feature,
-        'texture_features': texture_feature,
-        'view_stability': view_stability,
+    save_features_npz(paths['features_npz'], {
+        'image_paths': feature_bundle['image_paths'],
+        'sample_idx': feature_bundle['sample_idx'],
+        'embeddings': feature_bundle['embeddings'],
+        'view_embeddings': feature_bundle['view_embeddings'],
+        'view_stability': feature_bundle['view_stability'],
         'labels': np.asarray(labels, dtype=np.int64),
     })
-    save_graph_npz(graph_npz_path, graph_result['rows'], graph_result['cols'], graph_result['edge_scores'], extras=graph_result['extras'])
+    save_graph_npz(paths['graph_npz'], graph_result['rows'], graph_result['cols'], graph_result['edge_scores'], extras=graph_result['extras'])
 
     return {
         'num_samples': int(len(image_paths)),
         'num_clusters': int(num_components),
         'output_dir': str(config.output.output_dir),
+        'features_path': paths['features_npz'],
+        'result_csv_path': paths['result_csv'],
+        'summary_json_path': paths['summary_json'],
+        'graph_npz_path': paths['graph_npz'],
     }
+
+
+def run_precluster_visual(config, stage: str = 'all'):
+    _set_seed(int(config.debug.random_seed))
+    ensure_dir(config.output.output_dir)
+    selected_stage = str(stage).lower()
+    if selected_stage == 'extract':
+        return _run_extract_stage(config)
+    if selected_stage == 'cluster':
+        return _run_cluster_stage(config)
+    if selected_stage == 'all':
+        _run_extract_stage(config)
+        return _run_cluster_stage(config)
+    raise ValueError('unsupported stage: {}'.format(stage))

@@ -1,6 +1,7 @@
 import random
 
 from torchvision import transforms
+from torchvision.transforms import functional as TF
 from PIL import Image
 import os
 import torch
@@ -172,6 +173,131 @@ class TrainPhase5WeightDataset(_BaseImageFolderMetaDataset):
             'group_id': int(group_id),
             'w_img': w_img,
             'w_patch': w_patch,
+        })
+        meta.pop('rel_path', None)
+        return image, label, meta
+
+
+PHASE6_AUG_TYPES = (
+    'hflip',
+    'rotate_small',
+    'brightness_contrast',
+    'translate_small',
+    'resized_crop_weak',
+)
+
+
+def _phase6_clean_value(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, float) and np.isnan(value):
+        return default
+    return value
+
+
+def _phase6_apply_weak_transform(image, aug_type, aug_seed):
+    aug_type = str(aug_type)
+    rng = random.Random(int(aug_seed))
+    if aug_type == 'hflip':
+        return TF.hflip(image)
+    if aug_type == 'rotate_small':
+        angle = rng.uniform(-8.0, 8.0)
+        return TF.rotate(image, angle=angle, interpolation=transforms.InterpolationMode.BILINEAR)
+    if aug_type == 'brightness_contrast':
+        brightness = rng.uniform(0.92, 1.08)
+        contrast = rng.uniform(0.92, 1.08)
+        image = TF.adjust_brightness(image, brightness)
+        return TF.adjust_contrast(image, contrast)
+    if aug_type == 'translate_small':
+        max_dx = max(1, int(round(image.size[0] * 0.04)))
+        max_dy = max(1, int(round(image.size[1] * 0.04)))
+        translate = (rng.randint(-max_dx, max_dx), rng.randint(-max_dy, max_dy))
+        return TF.affine(
+            image,
+            angle=0.0,
+            translate=translate,
+            scale=1.0,
+            shear=[0.0, 0.0],
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        )
+    if aug_type == 'resized_crop_weak':
+        width, height = image.size
+        crop_scale = rng.uniform(0.92, 1.0)
+        crop_h = max(1, int(round(height * crop_scale)))
+        crop_w = max(1, int(round(width * crop_scale)))
+        max_top = max(0, height - crop_h)
+        max_left = max(0, width - crop_w)
+        top = 0 if max_top == 0 else rng.randint(0, max_top)
+        left = 0 if max_left == 0 else rng.randint(0, max_left)
+        return TF.resized_crop(
+            image,
+            top=top,
+            left=left,
+            height=crop_h,
+            width=crop_w,
+            size=(height, width),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        )
+    return image
+
+
+class TrainPhase6Dataset(_BaseImageFolderMetaDataset):
+    def __init__(self, dataset, data_root, class_name, class_id, sample_rows=None):
+        super().__init__(dataset, data_root, class_name, class_id)
+        self.sample_rows = [] if sample_rows is None else [dict(row) for row in sample_rows]
+        self.base_idx_to_local_idx = {}
+        for local_idx in range(len(self.dataset)):
+            base_meta = self._build_base_meta(local_idx)
+            self.base_idx_to_local_idx[int(base_meta['base_idx'])] = int(local_idx)
+
+    def __len__(self):
+        return len(self.sample_rows)
+
+    def _load_parent_image(self, base_idx, aug_type=None, aug_seed=None):
+        local_idx = self.base_idx_to_local_idx[int(base_idx)]
+        base_dataset, resolved_base_idx = self._resolve_base_sample(local_idx)
+        img_path = base_dataset.samples[resolved_base_idx][0]
+        image = Image.open(img_path).convert('RGB')
+        if aug_type:
+            image = _phase6_apply_weak_transform(image, aug_type=aug_type, aug_seed=aug_seed)
+        transform = getattr(base_dataset, 'transform', None)
+        if transform is not None:
+            image = transform(image)
+        else:
+            image = TF.to_tensor(image)
+        return image, int(self.class_id), local_idx
+
+    def __getitem__(self, idx):
+        row = self.sample_rows[idx]
+        is_augmented = int(_phase6_clean_value(row.get('is_augmented'), 0))
+        base_idx = int(_phase6_clean_value(row.get('base_idx'), -1))
+        if base_idx < 0:
+            raise ValueError('phase6 sample row is missing base_idx')
+
+        if is_augmented:
+            aug_type = str(_phase6_clean_value(row.get('aug_type'), 'identity'))
+            aug_seed = int(_phase6_clean_value(row.get('aug_seed'), 0))
+            image, label, local_idx = self._load_parent_image(base_idx, aug_type=aug_type, aug_seed=aug_seed)
+        else:
+            local_idx = self.base_idx_to_local_idx[int(base_idx)]
+            image, label = self.dataset[local_idx]
+            aug_type = str(_phase6_clean_value(row.get('aug_type'), ''))
+            aug_seed = int(_phase6_clean_value(row.get('aug_seed'), -1))
+
+        meta = self._build_base_meta(local_idx)
+        meta.update({
+            'sample_idx': int(_phase6_clean_value(row.get('sample_idx'), idx)),
+            'sample_key': str(_phase6_clean_value(row.get('sample_key'), 'sample::{}'.format(idx))),
+            'group_id': int(_phase6_clean_value(row.get('group_id'), -1)),
+            'pseudo_group_id': int(_phase6_clean_value(row.get('pseudo_group_id'), _phase6_clean_value(row.get('group_id'), -1))),
+            'sampler_weight': float(_phase6_clean_value(row.get('sampler_weight'), 1.0)),
+            'loss_weight': float(_phase6_clean_value(row.get('loss_weight'), 1.0)),
+            'is_augmented': int(is_augmented),
+            'aug_parent_key': str(_phase6_clean_value(row.get('aug_parent_key'), '')),
+            'aug_type': aug_type,
+            'aug_seed': int(aug_seed),
+            'aug_rank': int(_phase6_clean_value(row.get('aug_rank'), -1)),
+            'selected_group_col': str(_phase6_clean_value(row.get('selected_group_col'), 'group_id')),
         })
         meta.pop('rel_path', None)
         return image, label, meta

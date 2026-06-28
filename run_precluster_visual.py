@@ -6,10 +6,11 @@ from precluster_visual.run import run_precluster_visual
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run standalone visual preclustering without labels or fixed class count')
+    parser = argparse.ArgumentParser(description='Run standalone SigLIP preclustering without labels or fixed class count')
     parser.add_argument('--image_root', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--config', type=str, default=None)
+    parser.add_argument('--stage', type=str, default='all', choices=['extract', 'cluster', 'all'])
     parser.add_argument('--split', type=str, default=None, choices=['train', 'test', 'all'])
     parser.add_argument('--model_name', type=str, default=None)
     parser.add_argument('--device', type=str, default=None)
@@ -44,10 +45,20 @@ def main():
         image_root=os.path.abspath(args.image_root),
         output_dir=os.path.abspath(args.output_dir),
     )
-    result = run_precluster_visual(config)
+    result = run_precluster_visual(config, stage=args.stage)
+    print('stage={}'.format(args.stage))
     print('num_samples={}'.format(result['num_samples']))
-    print('num_clusters={}'.format(result['num_clusters']))
+    if 'num_clusters' in result:
+        print('num_clusters={}'.format(result['num_clusters']))
     print('output_dir={}'.format(result['output_dir']))
+    if 'features_path' in result:
+        print('features_path={}'.format(result['features_path']))
+    if 'result_csv_path' in result:
+        print('result_csv_path={}'.format(result['result_csv_path']))
+    if 'summary_json_path' in result:
+        print('summary_json_path={}'.format(result['summary_json_path']))
+    if 'graph_npz_path' in result:
+        print('graph_npz_path={}'.format(result['graph_npz_path']))
 
 
 if __name__ == '__main__':

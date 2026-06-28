@@ -1,27 +1,8 @@
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import List, Sequence
 
 from PIL import Image
 from torch.utils.data import Dataset
-
-
-class ImagePathDataset(Dataset):
-    def __init__(self, image_paths: Sequence[str], transform):
-        self.image_paths = [str(path) for path in image_paths]
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        image_path = self.image_paths[idx]
-        image = Image.open(image_path).convert('RGB')
-        tensor = self.transform(image)
-        meta = {
-            'sample_idx': int(idx),
-            'img_path': image_path,
-        }
-        return tensor, meta
 
 
 class MultiViewImagePathDataset(Dataset):
@@ -74,9 +55,7 @@ def collate_multiview(batch):
             view_batches[view_index].append(view)
         sample_idx.append(int(meta['sample_idx']))
         img_path.append(meta['img_path'])
-    import torch
-    stacked_views = [torch.stack(view_batch, dim=0) for view_batch in view_batches]
-    return stacked_views, {
+    return view_batches, {
         'sample_idx': sample_idx,
         'img_path': img_path,
     }
