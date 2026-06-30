@@ -6,13 +6,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from .augment import build_view_transforms
-from .calibrator import fit_similarity_calibrator
-from .cluster import build_cluster_summary, build_result_table, cluster_connected_components
+from .calibrator import build_assignment_calibration, build_default_calibration
+from .cluster import build_cluster_summary, build_prototype_summary, build_result_table
 from .data import MultiViewImagePathDataset, collate_multiview, discover_image_paths
+from .discovery import discover_semantic_prototypes
 from .encoder import SiglipImageEncoder
 from .features import aggregate_multiview, compute_view_stability, stack_view_embeddings
-from .graph import build_graph
-from .io_utils import ensure_dir, save_features_npz, save_graph_npz, save_result_csv, save_summary_json
+from .io_utils import ensure_dir, save_features_npz, save_prototype_npz, save_result_csv, save_summary_json
 
 
 def _set_seed(seed: int):
@@ -27,7 +27,7 @@ def _feature_paths(config) -> Dict[str, str]:
         'result_csv': '{}/{}'.format(config.output.output_dir, config.output.result_csv),
         'summary_json': '{}/{}'.format(config.output.output_dir, config.output.summary_json),
         'features_npz': '{}/{}'.format(config.output.output_dir, config.output.features_npz),
-        'graph_npz': '{}/{}'.format(config.output.output_dir, config.output.graph_npz),
+        'prototype_npz': '{}/{}'.format(config.output.output_dir, config.output.prototype_npz),
     }
 
 
@@ -93,6 +93,11 @@ def _load_feature_bundle(path: str):
         'embeddings': loaded['embeddings'].astype(np.float32),
         'view_embeddings': loaded['view_embeddings'].astype(np.float32),
         'view_stability': loaded['view_stability'].astype(np.float32),
+        'labels': loaded['labels'].astype(np.int64) if 'labels' in loaded.files else None,
+        'prototype_ids': loaded['prototype_ids'].astype(np.int64) if 'prototype_ids' in loaded.files else None,
+        'assignment_scores': loaded['assignment_scores'].astype(np.float32) if 'assignment_scores' in loaded.files else None,
+        'assignment_margins': loaded['assignment_margins'].astype(np.float32) if 'assignment_margins' in loaded.files else None,
+        'assignment_thresholds': loaded['assignment_thresholds'].astype(np.float32) if 'assignment_thresholds' in loaded.files else None,
     }
 
 
@@ -110,27 +115,47 @@ def _run_extract_stage(config):
 def _run_cluster_stage(config):
     paths = _feature_paths(config)
     feature_bundle = _load_feature_bundle(paths['features_npz'])
-    calibrator = fit_similarity_calibrator(
-        view_embeddings=feature_bundle['view_embeddings'],
-        embeddings=feature_bundle['embeddings'],
-        num_bins=int(config.calibration.num_bins),
-        num_negative_pairs=int(config.calibration.num_negative_pairs),
-        random_seed=int(config.debug.random_seed),
-    ) if bool(config.calibration.enabled) else None
+    if bool(config.calibration.enabled):
+        calibration = build_assignment_calibration(
+            view_embeddings=feature_bundle['view_embeddings'],
+            embeddings=feature_bundle['embeddings'],
+            num_bins=int(config.calibration.num_bins),
+            num_negative_pairs=int(config.calibration.num_negative_pairs),
+            base_threshold_delta=float(config.calibration.base_threshold_delta),
+            assign_threshold_floor_offset=float(config.calibration.assign_threshold_floor_offset),
+            random_seed=int(config.debug.random_seed),
+        )
+    else:
+        calibration = build_default_calibration(
+            base_threshold_delta=float(config.calibration.base_threshold_delta),
+            assign_threshold_floor_offset=float(config.calibration.assign_threshold_floor_offset),
+        )
 
-    graph_result = build_graph(feature_bundle, config, calibrator=calibrator)
-    image_paths = feature_bundle['image_paths'].tolist()
-    num_components, labels = cluster_connected_components(len(image_paths), graph_result['rows'], graph_result['cols'], graph_result['edge_scores'])
-    result_df = build_result_table(
-        image_paths,
-        labels,
-        feature_bundle['view_stability'],
-        graph_result['rows'],
-        graph_result['cols'],
-        graph_result['edge_scores'],
-        int(config.clustering.small_cluster_size),
+    discovery = discover_semantic_prototypes(
+        embeddings=feature_bundle['embeddings'],
+        view_stability=feature_bundle['view_stability'],
+        calibration=calibration,
+        config=config,
     )
-    cluster_summary = build_cluster_summary(result_df, num_components)
+
+    image_paths = feature_bundle['image_paths'].tolist()
+    result_df = build_result_table(
+        image_paths=image_paths,
+        labels=discovery['labels'],
+        prototype_ids=discovery['prototype_ids'],
+        view_stability=feature_bundle['view_stability'],
+        assignment_scores=discovery['assignment_scores'],
+        assignment_margins=discovery['assignment_margins'],
+        assignment_thresholds=discovery['assignment_thresholds'],
+        prototype_confidences=discovery['prototype_confidences'],
+        small_cluster_size=int(config.clustering.small_cluster_size),
+    )
+    cluster_summary = build_cluster_summary(result_df, int(discovery['num_prototypes_after_merge']))
+    prototype_summary = build_prototype_summary(
+        prototype_ids=discovery['prototype_ids'],
+        prototype_thresholds=discovery['assignment_thresholds'],
+        prototype_confidences=discovery['prototype_confidences'],
+    )
 
     save_result_csv(paths['result_csv'], result_df)
     save_summary_json(paths['summary_json'], {
@@ -139,13 +164,13 @@ def _run_cluster_stage(config):
         'model_name': str(config.encoder.model_name),
         'embedding_dim': int(feature_bundle['embeddings'].shape[1]),
         'num_views': int(feature_bundle['view_embeddings'].shape[1]),
-        'selected_k': int(graph_result['k']),
-        'requested_k': int(graph_result['requested_k']),
-        'candidate_edge_count': int(graph_result['candidate_edge_count']),
-        'retained_edge_count': int(graph_result['retained_edge_count']),
         'calibration_enabled': bool(config.calibration.enabled),
-        'calibration_fitted': bool(calibrator is not None),
+        'calibration': calibration.to_dict(),
+        'num_prototypes_before_merge': int(discovery['num_prototypes_before_merge']),
+        'num_prototypes_after_merge': int(discovery['num_prototypes_after_merge']),
+        'num_merge_events': int(discovery['num_merge_events']),
         **cluster_summary,
+        **prototype_summary,
     })
     save_features_npz(paths['features_npz'], {
         'image_paths': feature_bundle['image_paths'],
@@ -153,18 +178,38 @@ def _run_cluster_stage(config):
         'embeddings': feature_bundle['embeddings'],
         'view_embeddings': feature_bundle['view_embeddings'],
         'view_stability': feature_bundle['view_stability'],
-        'labels': np.asarray(labels, dtype=np.int64),
+        'labels': discovery['labels'],
+        'prototype_ids': discovery['prototype_ids'],
+        'assignment_scores': discovery['assignment_scores'],
+        'assignment_margins': discovery['assignment_margins'],
+        'assignment_thresholds': discovery['assignment_thresholds'],
+        'prototype_confidences': discovery['prototype_confidences'],
+        'center_scores': discovery['center_scores'],
+        'support_scores': discovery['support_scores'],
+        'ordered_indices': discovery['ordered_indices'],
+        'created_new_mask': discovery['created_new_mask'],
+        'labels_before_merge': discovery['labels_before_merge'],
+        'prototype_ids_before_merge': discovery['prototype_ids_before_merge'],
+        'assignment_thresholds_before_merge': discovery['assignment_thresholds_before_merge'],
     })
-    save_graph_npz(paths['graph_npz'], graph_result['rows'], graph_result['cols'], graph_result['edge_scores'], extras=graph_result['extras'])
+    save_prototype_npz(paths['prototype_npz'], {
+        'prototype_ids': discovery['prototype_export_ids'],
+        'prototype_centers': discovery['prototype_export_centers'],
+        'prototype_thresholds': discovery['prototype_export_thresholds'],
+        'prototype_confidences': discovery['prototype_export_confidences'],
+        'prototype_sizes': discovery['prototype_export_sizes'],
+        'prototype_support_indices': discovery['prototype_export_support_indices'],
+        'prototype_member_counts': discovery['prototype_export_member_counts'],
+    })
 
     return {
         'num_samples': int(len(image_paths)),
-        'num_clusters': int(num_components),
+        'num_clusters': int(discovery['num_prototypes_after_merge']),
         'output_dir': str(config.output.output_dir),
         'features_path': paths['features_npz'],
         'result_csv_path': paths['result_csv'],
         'summary_json_path': paths['summary_json'],
-        'graph_npz_path': paths['graph_npz'],
+        'prototype_npz_path': paths['prototype_npz'],
     }
 
 

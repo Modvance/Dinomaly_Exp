@@ -119,11 +119,22 @@ gbps
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_pareto --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k4 --gpus 5 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k1 --gpus 6 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k1_gp15 --gpus 1 --gbps_num_groups 15 --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt
 
 eval:
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_pareto_eval --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt --eval_interval 500
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k4_eval --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt --eval_interval 500
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/gbps/ --save_name mvtec_k1_eval --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt --eval_interval 500
+
+lt:
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/lt --save_name pareto --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable --lt_group_balanced_loss --lt_tail_aug_enable
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/lt --save_name k4 --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable --lt_group_balanced_loss --lt_tail_aug_enable
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/lt --save_name k1 --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable --lt_group_balanced_loss --lt_tail_aug_enable
+
+sampler:
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/lt --save_name pareto_spl --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/lt --save_name k4_spl --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/lt --save_name k1_spl --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable
 ```
 
 patch
@@ -138,6 +149,10 @@ phase5
 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_pareto --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt --gpus 1
 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_k4 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt --gpus 2
 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/phase5 --save_name mvtec_k1 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt --gpus 3
+
+CUDA_VISIBLE_DEVICES=1 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/phase5/ --save_name mvtec_pareto --gpus 0 --phase5_use_faiss 1 --phase5_faiss_gpu 1 --phase5_faiss_gpu_id 0 --phase5_knn_backend faiss --phase5_kmeans_backend faiss --phase5_force_recompute
+CUDA_VISIBLE_DEVICES=2 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/phase5/ --save_name mvtec_k4 --gpus 0 --phase5_use_faiss 1 --phase5_faiss_gpu 1 --phase5_faiss_gpu_id 0 --phase5_knn_backend faiss --phase5_kmeans_backend faiss --phase5_force_recompute
+CUDA_VISIBLE_DEVICES=3 python dinomaly_mvtec_phase5.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/phase5/ --save_name mvtec_k1 --gpus 0 --phase5_use_faiss 1 --phase5_faiss_gpu 1 --phase5_faiss_gpu_id 0 --phase5_knn_backend faiss --phase5_kmeans_backend faiss --phase5_force_recompute
 ```
 
 class
@@ -146,4 +161,9 @@ python run_precluster_visual.py --image_root ../mvtec_anomaly_detection --output
 python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-pareto-seed02 --output_dir ../results/class/vlm_pareto_1 --stage all --split train --device cuda
 python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k4-seed02 --output_dir ../results/class/vlm_k4 --stage all --split train --device cuda
 python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k1-seed02 --output_dir ../results/class/vlm_k1 --stage all --split train --device cuda
+
+python run_precluster_visual.py --image_root ../mvtec_anomaly_detection --output_dir ../results/class/vlm_proto --stage all --split train --device cuda
+python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-pareto-seed02 --output_dir ../results/class/vlm_proto_pareto --stage all --split train --device cuda
+python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k4-seed02 --output_dir ../results/class/vlm_proto_k4 --stage all --split train --device cuda
+python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k1-seed02 --output_dir ../results/class/vlm_proto_k1 --stage all --split train --device cuda
 ```

@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
@@ -47,13 +47,5 @@ def save_features_npz(path: str, arrays: Dict[str, Any]) -> None:
     np.savez_compressed(path, **{key: value for key, value in arrays.items() if value is not None})
 
 
-def save_graph_npz(path: str, rows, cols, edge_scores, extras: Optional[Dict[str, Any]] = None) -> None:
-    payload = {
-        'rows': np.asarray(rows, dtype=np.int64),
-        'cols': np.asarray(cols, dtype=np.int64),
-        'edge_scores': np.asarray(edge_scores, dtype=np.float32),
-    }
-    if extras is not None:
-        for key, value in extras.items():
-            payload[key] = np.asarray(value)
-    save_features_npz(path, payload)
+def save_prototype_npz(path: str, arrays: Dict[str, Any]) -> None:
+    save_features_npz(path, arrays)

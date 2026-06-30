@@ -1,7 +1,25 @@
+from dataclasses import asdict, dataclass
 import random
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
+
+
+@dataclass
+class AssignmentCalibration:
+    tau_global: float
+    tau_base: float
+    tau_floor: float
+    positive_mean: Optional[float]
+    negative_mean: Optional[float]
+    positive_std: Optional[float]
+    negative_std: Optional[float]
+    num_positive: int
+    num_negative: int
+    calibrated: bool
+
+    def to_dict(self):
+        return asdict(self)
 
 
 class HistogramLikelihoodCalibrator:
@@ -76,3 +94,75 @@ def fit_similarity_calibrator(view_embeddings: np.ndarray, embeddings: np.ndarra
     if positive.size == 0 or negative.size == 0:
         return None
     return HistogramLikelihoodCalibrator(num_bins=num_bins).fit(positive, negative)
+
+
+def _safe_mean(values: np.ndarray) -> Optional[float]:
+    return None if values.size == 0 else float(np.mean(values))
+
+
+def _safe_std(values: np.ndarray) -> Optional[float]:
+    return None if values.size == 0 else float(np.std(values))
+
+
+def _fallback_tau_global(positive: np.ndarray, negative: np.ndarray) -> float:
+    if positive.size > 0 and negative.size > 0:
+        positive_anchor = float(np.quantile(positive, 0.10))
+        negative_anchor = float(np.quantile(negative, 0.99))
+        return float(np.clip(0.5 * (positive_anchor + negative_anchor), -1.0, 1.0))
+    if positive.size > 0:
+        return float(np.clip(np.quantile(positive, 0.10), -1.0, 1.0))
+    if negative.size > 0:
+        return float(np.clip(np.quantile(negative, 0.99) + 0.05, -1.0, 1.0))
+    return 0.60
+
+
+def _derive_tau_global(positive: np.ndarray, negative: np.ndarray, num_bins: int) -> Tuple[float, bool]:
+    if positive.size == 0 or negative.size == 0:
+        return _fallback_tau_global(positive, negative), False
+    calibrator = HistogramLikelihoodCalibrator(num_bins=num_bins).fit(positive, negative)
+    centers = 0.5 * (calibrator.bin_edges[:-1] + calibrator.bin_edges[1:])
+    probabilities = calibrator.predict_array(centers)
+    eligible = centers[probabilities >= 0.5]
+    if eligible.size > 0:
+        return float(np.clip(eligible.min(), -1.0, 1.0)), True
+    return _fallback_tau_global(positive, negative), True
+
+
+def build_assignment_calibration(view_embeddings: np.ndarray, embeddings: np.ndarray, num_bins: int,
+                                 num_negative_pairs: int, base_threshold_delta: float,
+                                 assign_threshold_floor_offset: float, random_seed: int = 42) -> AssignmentCalibration:
+    positive = build_positive_similarities(view_embeddings)
+    negative = build_negative_similarities(embeddings, num_pairs=num_negative_pairs, random_seed=random_seed)
+    tau_global, calibrated = _derive_tau_global(positive, negative, num_bins=int(num_bins))
+    tau_base = float(np.clip(tau_global - float(base_threshold_delta), -1.0, 1.0))
+    tau_floor = float(np.clip(tau_base - float(assign_threshold_floor_offset), -1.0, 1.0))
+    return AssignmentCalibration(
+        tau_global=float(tau_global),
+        tau_base=float(tau_base),
+        tau_floor=float(tau_floor),
+        positive_mean=_safe_mean(positive),
+        negative_mean=_safe_mean(negative),
+        positive_std=_safe_std(positive),
+        negative_std=_safe_std(negative),
+        num_positive=int(positive.size),
+        num_negative=int(negative.size),
+        calibrated=bool(calibrated),
+    )
+
+
+def build_default_calibration(base_threshold_delta: float, assign_threshold_floor_offset: float) -> AssignmentCalibration:
+    tau_global = 0.60
+    tau_base = float(np.clip(tau_global - float(base_threshold_delta), -1.0, 1.0))
+    tau_floor = float(np.clip(tau_base - float(assign_threshold_floor_offset), -1.0, 1.0))
+    return AssignmentCalibration(
+        tau_global=float(tau_global),
+        tau_base=float(tau_base),
+        tau_floor=float(tau_floor),
+        positive_mean=None,
+        negative_mean=None,
+        positive_std=None,
+        negative_std=None,
+        num_positive=0,
+        num_negative=0,
+        calibrated=False,
+    )

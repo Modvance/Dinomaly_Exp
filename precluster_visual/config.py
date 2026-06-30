@@ -26,7 +26,7 @@ class OutputConfig:
     result_csv: str = 'precluster_visual_result.csv'
     summary_json: str = 'precluster_visual_summary.json'
     features_npz: str = 'precluster_visual_features.npz'
-    graph_npz: str = 'precluster_visual_graph.npz'
+    prototype_npz: str = 'precluster_visual_prototypes.npz'
 
 
 @dataclass
@@ -38,6 +38,12 @@ class EncoderConfig:
     device: str = 'cuda'
     precision: str = 'fp16'
     normalize: bool = True
+
+
+@dataclass
+class PreprocessConfig:
+    mode: str = 'default'
+    letterbox_fill: int = 0
 
 
 @dataclass
@@ -53,27 +59,36 @@ class MultiViewConfig:
 
 
 @dataclass
-class KnnConfig:
-    metric: str = 'cosine'
-    k_rule: str = 'sqrt'
-    k_min: int = 20
-    k_max: int = 140
-    mutual: bool = True
-    use_snn: bool = False
-
-
-@dataclass
 class CalibrationConfig:
     enabled: bool = True
     num_bins: int = 100
     num_negative_pairs: int = 50000
-    connect_if_p_same_gt: float = 0.45
+    base_threshold_delta: float = 0.05
+    assign_threshold_floor_offset: float = 0.05
 
 
 @dataclass
-class GraphConfig:
-    max_edges_per_node: int = 12
-    use_local_top_edges: bool = True
+class PrototypeConfig:
+    max_supports: int = 5
+    support_top_r: int = 2
+    min_members_for_adaptive_threshold: int = 3
+    member_score_quantile: float = 0.10
+    update_center_only_high_confidence: bool = False
+    high_confidence_margin_bonus: float = 0.02
+
+
+@dataclass
+class AssignmentConfig:
+    margin_threshold: float = 0.02
+    use_class_adaptive_threshold: bool = True
+
+
+@dataclass
+class MergeConfig:
+    enabled: bool = True
+    merge_threshold_offset: float = 0.02
+    support_top_r: int = 2
+    max_merge_passes: int = 1
 
 
 @dataclass
@@ -85,7 +100,7 @@ class ClusterConfig:
 @dataclass
 class DebugConfig:
     save_pair_statistics: bool = True
-    save_graph: bool = True
+    save_prototypes: bool = True
     random_seed: int = 42
 
 
@@ -94,10 +109,12 @@ class PreclusterConfig:
     data: DataConfig
     output: OutputConfig
     encoder: EncoderConfig = field(default_factory=EncoderConfig)
+    preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)
     multiview: MultiViewConfig = field(default_factory=MultiViewConfig)
-    knn: KnnConfig = field(default_factory=KnnConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
-    graph: GraphConfig = field(default_factory=GraphConfig)
+    prototype: PrototypeConfig = field(default_factory=PrototypeConfig)
+    assignment: AssignmentConfig = field(default_factory=AssignmentConfig)
+    merge: MergeConfig = field(default_factory=MergeConfig)
     clustering: ClusterConfig = field(default_factory=ClusterConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
 
@@ -132,10 +149,12 @@ def _coerce_dataclass(data: Dict[str, Any]) -> PreclusterConfig:
         data=DataConfig(**data['data']),
         output=OutputConfig(**data['output']),
         encoder=EncoderConfig(**data.get('encoder', {})),
+        preprocess=PreprocessConfig(**data.get('preprocess', {})),
         multiview=MultiViewConfig(**data.get('multiview', {})),
-        knn=KnnConfig(**data.get('knn', {})),
         calibration=CalibrationConfig(**data.get('calibration', {})),
-        graph=GraphConfig(**data.get('graph', {})),
+        prototype=PrototypeConfig(**data.get('prototype', {})),
+        assignment=AssignmentConfig(**data.get('assignment', {})),
+        merge=MergeConfig(**data.get('merge', {})),
         clustering=ClusterConfig(**data.get('clustering', {})),
         debug=DebugConfig(**data.get('debug', {})),
     )
@@ -174,19 +193,37 @@ def validate_config(config: PreclusterConfig) -> None:
         raise ValueError('encoder.num_workers must be non-negative')
     if str(config.encoder.precision).lower() not in ['fp32', 'fp16', 'bf16']:
         raise ValueError('encoder.precision must be one of: fp32, fp16, bf16')
-    if config.knn.k_rule not in ['sqrt']:
-        raise ValueError('knn.k_rule must currently be sqrt')
-    if config.knn.k_min <= 0 or config.knn.k_max <= 0:
-        raise ValueError('k_min and k_max must be positive')
-    if config.knn.k_min > config.knn.k_max:
-        raise ValueError('k_min cannot exceed k_max')
+    if int(config.encoder.input_size) <= 0:
+        raise ValueError('encoder.input_size must be positive')
+    if str(config.preprocess.mode).lower() not in ['default', 'letterbox']:
+        raise ValueError('preprocess.mode must be one of: default, letterbox')
+    if config.multiview.enabled and config.multiview.num_views <= 0:
+        raise ValueError('multiview.num_views must be positive when multiview is enabled')
     if config.calibration.num_bins <= 1:
         raise ValueError('calibration.num_bins must be greater than 1')
     if config.calibration.num_negative_pairs <= 0:
         raise ValueError('calibration.num_negative_pairs must be positive')
-    if not 0.0 <= float(config.calibration.connect_if_p_same_gt) <= 1.0:
-        raise ValueError('calibration.connect_if_p_same_gt must be within [0, 1]')
-    if config.graph.max_edges_per_node <= 0:
-        raise ValueError('graph.max_edges_per_node must be positive')
-    if config.multiview.enabled and config.multiview.num_views <= 0:
-        raise ValueError('multiview.num_views must be positive when multiview is enabled')
+    if not 0.0 <= float(config.calibration.base_threshold_delta) <= 1.0:
+        raise ValueError('calibration.base_threshold_delta must be within [0, 1]')
+    if float(config.calibration.assign_threshold_floor_offset) < 0.0:
+        raise ValueError('calibration.assign_threshold_floor_offset must be non-negative')
+    if int(config.prototype.max_supports) <= 0:
+        raise ValueError('prototype.max_supports must be positive')
+    if int(config.prototype.support_top_r) <= 0:
+        raise ValueError('prototype.support_top_r must be positive')
+    if int(config.prototype.min_members_for_adaptive_threshold) <= 0:
+        raise ValueError('prototype.min_members_for_adaptive_threshold must be positive')
+    if not 0.0 <= float(config.prototype.member_score_quantile) <= 1.0:
+        raise ValueError('prototype.member_score_quantile must be within [0, 1]')
+    if float(config.prototype.high_confidence_margin_bonus) < 0.0:
+        raise ValueError('prototype.high_confidence_margin_bonus must be non-negative')
+    if float(config.assignment.margin_threshold) < 0.0:
+        raise ValueError('assignment.margin_threshold must be non-negative')
+    if float(config.merge.merge_threshold_offset) < 0.0:
+        raise ValueError('merge.merge_threshold_offset must be non-negative')
+    if int(config.merge.support_top_r) <= 0:
+        raise ValueError('merge.support_top_r must be positive')
+    if int(config.merge.max_merge_passes) <= 0:
+        raise ValueError('merge.max_merge_passes must be positive')
+    if int(config.clustering.small_cluster_size) <= 0:
+        raise ValueError('clustering.small_cluster_size must be positive')

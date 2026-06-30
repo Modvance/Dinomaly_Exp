@@ -6,7 +6,7 @@ from precluster_visual.run import run_precluster_visual
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Run standalone SigLIP preclustering without labels or fixed class count')
+    parser = argparse.ArgumentParser(description='Run standalone semantic prototype discovery without labels or fixed class count')
     parser.add_argument('--image_root', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
     parser.add_argument('--config', type=str, default=None)
@@ -17,7 +17,9 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--input_size', type=int, default=None)
-    parser.add_argument('--max_edges_per_node', type=int, default=None)
+    parser.add_argument('--preprocess_mode', type=str, default=None, choices=['default', 'letterbox'])
+    parser.add_argument('--margin_threshold', type=float, default=None)
+    parser.add_argument('--max_supports', type=int, default=None)
     return parser.parse_args()
 
 
@@ -36,8 +38,12 @@ def main():
         overrides.setdefault('encoder', {})['num_workers'] = args.num_workers
     if args.input_size is not None:
         overrides.setdefault('encoder', {})['input_size'] = args.input_size
-    if args.max_edges_per_node is not None:
-        overrides.setdefault('graph', {})['max_edges_per_node'] = args.max_edges_per_node
+    if args.preprocess_mode is not None:
+        overrides.setdefault('preprocess', {})['mode'] = args.preprocess_mode
+    if args.margin_threshold is not None:
+        overrides.setdefault('assignment', {})['margin_threshold'] = args.margin_threshold
+    if args.max_supports is not None:
+        overrides.setdefault('prototype', {})['max_supports'] = args.max_supports
 
     config = load_config(
         config_path=args.config,
@@ -57,8 +63,8 @@ def main():
         print('result_csv_path={}'.format(result['result_csv_path']))
     if 'summary_json_path' in result:
         print('summary_json_path={}'.format(result['summary_json_path']))
-    if 'graph_npz_path' in result:
-        print('graph_npz_path={}'.format(result['graph_npz_path']))
+    if 'prototype_npz_path' in result:
+        print('prototype_npz_path={}'.format(result['prototype_npz_path']))
 
 
 if __name__ == '__main__':

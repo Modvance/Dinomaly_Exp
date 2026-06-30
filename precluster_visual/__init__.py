@@ -1,4 +1,5 @@
 from .config import PreclusterConfig, load_config
+from .discovery import discover_semantic_prototypes
 
 
 def run_precluster_visual(*args, **kwargs):
@@ -6,4 +7,4 @@ def run_precluster_visual(*args, **kwargs):
     return _run_precluster_visual(*args, **kwargs)
 
 
-__all__ = ['PreclusterConfig', 'load_config', 'run_precluster_visual']
+__all__ = ['PreclusterConfig', 'load_config', 'discover_semantic_prototypes', 'run_precluster_visual']

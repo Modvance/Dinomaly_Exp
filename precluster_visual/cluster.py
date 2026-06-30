@@ -1,17 +1,7 @@
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
-
-
-def cluster_connected_components(num_nodes: int, rows, cols, edge_scores):
-    if len(rows) == 0:
-        labels = np.arange(num_nodes, dtype=np.int64)
-        return int(num_nodes), labels
-    graph = coo_matrix((np.asarray(edge_scores, dtype=np.float32), (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64))), shape=(num_nodes, num_nodes)).tocsr()
-    return connected_components(graph, directed=False, return_labels=True)
 
 
 def relabel_contiguous(labels: np.ndarray) -> np.ndarray:
@@ -20,52 +10,76 @@ def relabel_contiguous(labels: np.ndarray) -> np.ndarray:
     return np.asarray([mapping[int(label)] for label in labels], dtype=np.int64)
 
 
-def build_cluster_edge_scores(labels: np.ndarray, rows, cols, edge_scores) -> Dict[int, List[float]]:
-    cluster_scores = {int(label): [] for label in np.unique(labels).tolist()}
-    for row, col, score in zip(rows, cols, edge_scores):
-        if int(labels[int(row)]) == int(labels[int(col)]):
-            cluster_scores[int(labels[int(row)])].append(float(score))
-    return cluster_scores
-
-
-def build_result_table(image_paths: List[str], labels: np.ndarray, view_stability: np.ndarray,
-                       rows, cols, edge_scores, small_cluster_size: int) -> pd.DataFrame:
-    labels = relabel_contiguous(labels)
+def build_result_table(image_paths: List[str], labels: np.ndarray, prototype_ids: np.ndarray,
+                       view_stability: np.ndarray, assignment_scores: np.ndarray,
+                       assignment_margins: np.ndarray, assignment_thresholds: np.ndarray,
+                       prototype_confidences: np.ndarray, small_cluster_size: int) -> pd.DataFrame:
+    labels = relabel_contiguous(np.asarray(labels, dtype=np.int64))
     counts = pd.Series(labels).value_counts().to_dict()
-    cluster_edge_scores = build_cluster_edge_scores(labels, rows, cols, edge_scores)
     records = []
-    for sample_idx, (image_path, label, stability) in enumerate(zip(image_paths, labels.tolist(), view_stability.tolist())):
+    for sample_idx, image_path in enumerate(image_paths):
+        label = int(labels[int(sample_idx)])
         cluster_size = int(counts[int(label)])
         if cluster_size == 1:
             cluster_type = 'singleton'
-            cluster_conf = float(stability)
         elif cluster_size <= int(small_cluster_size):
             cluster_type = 'small'
-            values = cluster_edge_scores.get(int(label), [])
-            cluster_conf = float(np.mean(values)) if len(values) > 0 else None
         else:
             cluster_type = 'multi'
-            values = cluster_edge_scores.get(int(label), [])
-            cluster_conf = float(np.mean(values)) if len(values) > 0 else None
         records.append({
             'sample_idx': int(sample_idx),
             'img_path': image_path,
             'pseudo_label': int(label),
             'cluster_size': cluster_size,
             'cluster_type': cluster_type,
-            'cluster_conf': cluster_conf,
+            'cluster_conf': float(prototype_confidences[int(sample_idx)]),
             'is_singleton': bool(cluster_size == 1),
+            'assignment_score': float(assignment_scores[int(sample_idx)]),
+            'assignment_margin': float(assignment_margins[int(sample_idx)]),
+            'assignment_threshold': float(assignment_thresholds[int(sample_idx)]),
+            'view_stability': float(view_stability[int(sample_idx)]),
+            'prototype_id': int(prototype_ids[int(sample_idx)]),
         })
     return pd.DataFrame(records)
 
 
-def build_cluster_summary(result_df: pd.DataFrame, num_components: int) -> Dict[str, object]:
+def build_cluster_summary(result_df: pd.DataFrame, num_clusters: int) -> Dict[str, object]:
     cluster_sizes = result_df[['pseudo_label', 'cluster_size']].drop_duplicates()['cluster_size'].tolist()
     size_histogram = pd.Series(cluster_sizes).value_counts().sort_index().to_dict() if len(cluster_sizes) > 0 else {}
     return {
-        'num_components': int(num_components),
+        'num_clusters': int(num_clusters),
         'num_singletons': int((result_df['cluster_type'] == 'singleton').sum()),
         'num_small_clusters': int(result_df.loc[result_df['cluster_type'] == 'small', 'pseudo_label'].nunique()),
         'num_multi_clusters': int(result_df.loc[result_df['cluster_type'] == 'multi', 'pseudo_label'].nunique()),
         'cluster_size_histogram': {str(int(key)): int(value) for key, value in size_histogram.items()},
+        'mean_assignment_score': float(result_df['assignment_score'].mean()) if len(result_df) > 0 else 0.0,
+        'mean_assignment_margin': float(result_df['assignment_margin'].mean()) if len(result_df) > 0 else 0.0,
+        'mean_view_stability': float(result_df['view_stability'].mean()) if len(result_df) > 0 else 0.0,
+    }
+
+
+def build_prototype_summary(prototype_ids: np.ndarray, prototype_thresholds: np.ndarray,
+                            prototype_confidences: np.ndarray) -> Dict[str, object]:
+    if len(prototype_ids) == 0:
+        return {
+            'num_prototypes': 0,
+            'prototype_size_histogram': {},
+            'mean_prototype_threshold': 0.0,
+            'mean_prototype_confidence': 0.0,
+        }
+    frame = pd.DataFrame({
+        'prototype_id': np.asarray(prototype_ids, dtype=np.int64),
+        'prototype_threshold': np.asarray(prototype_thresholds, dtype=np.float32),
+        'prototype_confidence': np.asarray(prototype_confidences, dtype=np.float32),
+    })
+    grouped = frame.groupby('prototype_id', sort=True)
+    sizes = grouped.size().tolist()
+    threshold_values = grouped['prototype_threshold'].first().tolist()
+    confidence_values = grouped['prototype_confidence'].first().tolist()
+    histogram = pd.Series(sizes).value_counts().sort_index().to_dict() if len(sizes) > 0 else {}
+    return {
+        'num_prototypes': int(len(sizes)),
+        'prototype_size_histogram': {str(int(key)): int(value) for key, value in histogram.items()},
+        'mean_prototype_threshold': float(np.mean(threshold_values)) if len(threshold_values) > 0 else 0.0,
+        'mean_prototype_confidence': float(np.mean(confidence_values)) if len(confidence_values) > 0 else 0.0,
     }

@@ -763,6 +763,17 @@ def train(item_list):
     print_fn('  iters_per_sec     {:.4f}'.format(iters_per_sec))
     print_fn('  samples_per_sec   {:.2f}'.format(samples_per_sec))
 
+    checkpoint_path = os.path.join(args.save_dir, args.save_name, 'final_model.pt')
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'iteration': int(it),
+        'args': vars(args).copy(),
+    }
+    if final_eval_summary is not None:
+        checkpoint['final_eval_summary'] = final_eval_summary
+    torch.save(checkpoint, checkpoint_path)
+    print_fn('saved final model checkpoint to {}'.format(checkpoint_path))
+
 
 if __name__ == '__main__':
     os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
