@@ -302,6 +302,20 @@ def train(item_list):
                 break
         print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
 
+    if final_eval_summary is None:
+        final_eval_summary = evaluate_model(
+            model,
+            test_data_list,
+            item_list,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            max_ratio=0.01,
+            resize_mask=256,
+            print_fn=print_fn,
+        )
+        model.train()
+
     total_time = time.time() - train_start_time
     time_per_iter = total_time / total_iters
     iters_per_sec = total_iters / total_time

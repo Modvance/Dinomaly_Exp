@@ -300,6 +300,20 @@ def train(item_list):
         if it == total_iters:
             break
 
+    if final_eval_summary is None:
+        final_eval_summary = evaluate_model(
+            model,
+            test_data_list,
+            item_list,
+            device,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            max_ratio=0.01,
+            resize_mask=256,
+            print_fn=print_fn,
+        )
+        model.train()
+
     total_time = time.time() - train_start_time
     time_per_iter = total_time / max(1, total_iters * 2)
     print_fn('Patch training finished. Total time: {:.2f}s ({:.2f} min)'.format(total_time, total_time / 60.0))

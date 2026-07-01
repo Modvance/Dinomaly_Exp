@@ -18,6 +18,7 @@ from models.uad import ViTill
 from models.vision_transformer import Block as VitBlock, LinearAttention2, bMlp
 from optimizers import StableAdamW
 from utils import WarmCosineScheduler, evaluation_batch, global_cosine_hm_percent
+from dinomaly_train_base import evaluate_model
 from warmup_diag import (
     build_phase2_weight_update,
     build_warmup_postprocess_plan,
@@ -730,6 +731,20 @@ def train(item_list):
             if it == total_iters:
                 break
         print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
+
+    if final_eval_summary is None:
+        final_eval_summary = evaluate_model(
+            model,
+            test_data_list,
+            item_list,
+            device,
+            batch_size=batch_size,
+            num_workers=4,
+            max_ratio=0.01,
+            resize_mask=256,
+            print_fn=print_fn,
+        )
+        model.train()
 
     total_time = time.time() - train_start_time
     time_per_iter = total_time / total_iters
