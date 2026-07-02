@@ -135,6 +135,11 @@ sampler:
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/lt --save_name pareto_spl --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/lt --save_name k4_spl --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable
 python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/lt --save_name k1_spl --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_sampler_enable
+
+loss:
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-pareto-seed02 --save_dir ../saved_results/lt --save_name pareto_loss --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_group_balanced_loss
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed02 --save_dir ../saved_results/lt --save_name k4_loss --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_group_balanced_loss
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed02 --save_dir ../saved_results/lt --save_name k1_loss --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --lt_enable --lt_group_balanced_loss
 ```
 
 patch
@@ -167,3 +172,5 @@ python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-pareto-seed
 python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k4-seed02 --output_dir ../results/class/vlm_proto_k4 --stage all --split train --device cuda
 python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k1-seed02 --output_dir ../results/class/vlm_proto_k1 --stage all --split train --device cuda
 ```
+
+python dinomaly_mvtec_uni.py --data_path ../mvtec_anomaly_detection --save_name vitill_mvtec_uni_plain --gpus 0

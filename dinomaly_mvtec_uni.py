@@ -366,6 +366,7 @@ def train(item_list):
     freeze_iter = None
     warmup_trigger_reason = None
     best_primary_value = None
+    last_eval_iter = None
     best_primary_iter = None
     no_improve_count = 0
     last_suspicious_keys = None
@@ -725,6 +726,7 @@ def train(item_list):
                     'P-F1': mean_f1_px,
                     'P-AUPRO': mean_aupro_px,
                 }
+                last_eval_iter = int(current_iter)
                 model.train()
 
             it += 1
@@ -732,7 +734,7 @@ def train(item_list):
                 break
         print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
 
-    if final_eval_summary is None:
+    if last_eval_iter != int(it):
         final_eval_summary = evaluate_model(
             model,
             test_data_list,
@@ -744,6 +746,7 @@ def train(item_list):
             resize_mask=256,
             print_fn=print_fn,
         )
+        last_eval_iter = int(it)
         model.train()
 
     total_time = time.time() - train_start_time

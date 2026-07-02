@@ -102,6 +102,7 @@ def train(item_list):
     )
     print_fn('phase5 restart retrain image number:{}'.format(len(train_data)))
 
+    last_eval_iter = None
     it = 0
     for _ in range(int(np.ceil(total_iters / len(train_dataloader)))):
         loss_list = []
@@ -131,6 +132,7 @@ def train(item_list):
                     resize_mask=256,
                     print_fn=print_fn,
                 )
+                last_eval_iter = int(current_iter)
                 eval_row = {'iteration': int(current_iter)}
                 eval_row.update(final_eval_summary)
                 eval_history_rows.append(eval_row)
@@ -143,7 +145,7 @@ def train(item_list):
         if it == total_iters:
             break
 
-    if final_eval_summary is None:
+    if last_eval_iter != int(it):
         final_eval_summary = evaluate_model(
             model,
             test_data_list,
@@ -155,7 +157,8 @@ def train(item_list):
             resize_mask=256,
             print_fn=print_fn,
         )
-        eval_row = {'iteration': int(total_iters)}
+        last_eval_iter = int(it)
+        eval_row = {'iteration': int(it)}
         eval_row.update(final_eval_summary)
         eval_history_rows.append(eval_row)
         model.train()

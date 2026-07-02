@@ -95,6 +95,7 @@ def train(item_list):
     gbps_trigger_iter = None
     gbps_selected_iter = None
     gbps_has_postprocessed = False
+    last_eval_iter = None
 
     it = 0
     for _ in range(int(np.ceil(total_iters / len(train_dataloader)))):
@@ -295,6 +296,7 @@ def train(item_list):
                     resize_mask=256,
                     print_fn=print_fn,
                 )
+                last_eval_iter = int(current_iter)
                 model.train()
 
             it += 1
@@ -302,7 +304,7 @@ def train(item_list):
                 break
         print_fn('iter [{}/{}], loss:{:.4f}'.format(it, total_iters, np.mean(loss_list)))
 
-    if final_eval_summary is None:
+    if last_eval_iter != int(it):
         final_eval_summary = evaluate_model(
             model,
             test_data_list,
@@ -314,6 +316,7 @@ def train(item_list):
             resize_mask=256,
             print_fn=print_fn,
         )
+        last_eval_iter = int(it)
         model.train()
 
     total_time = time.time() - train_start_time

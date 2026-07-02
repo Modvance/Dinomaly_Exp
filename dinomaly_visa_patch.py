@@ -263,6 +263,7 @@ def train(item_list):
     print_fn('restart retrain image number:{}'.format(len(train_data)))
 
     final_eval_summary = None
+    last_eval_iter = None
     it = 0
     for _ in range(int(np.ceil(total_iters / len(train_dataloader)))):
         loss_list = []
@@ -291,6 +292,7 @@ def train(item_list):
                     resize_mask=256,
                     print_fn=print_fn,
                 )
+                last_eval_iter = int(current_iter)
                 model.train()
 
             it += 1
@@ -300,7 +302,7 @@ def train(item_list):
         if it == total_iters:
             break
 
-    if final_eval_summary is None:
+    if last_eval_iter != int(it):
         final_eval_summary = evaluate_model(
             model,
             test_data_list,
@@ -312,6 +314,7 @@ def train(item_list):
             resize_mask=256,
             print_fn=print_fn,
         )
+        last_eval_iter = int(it)
         model.train()
 
     total_time = time.time() - train_start_time
