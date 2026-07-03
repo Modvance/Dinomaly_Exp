@@ -431,6 +431,21 @@ def train_phase5_step(model, trainable, optimizer, scheduler, images, w_img, w_p
     return float(loss.item())
 
 
+def save_train_checkpoint(save_dir, save_name, model, iteration, args, final_eval_summary=None):
+    checkpoint_dir = os.path.join(save_dir, save_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, 'final_model.pt')
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'iteration': int(iteration),
+        'args': vars(args).copy(),
+    }
+    if final_eval_summary is not None:
+        checkpoint['final_eval_summary'] = final_eval_summary
+    torch.save(checkpoint, checkpoint_path)
+    return checkpoint_path
+
+
 def evaluate_model(model, test_data_list, item_list, device, batch_size=DEFAULT_BATCH_SIZE,
                    num_workers=DEFAULT_NUM_WORKERS, max_ratio=0.01, resize_mask=256, print_fn=None):
     auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []
