@@ -85,7 +85,7 @@ if __name__ == '__main__':
         )
         print_fn('built memory bank for {} classes'.format(len(memory_bank)))
 
-    score_df, per_class_metrics, summary = run_memory_augmented_evaluation(
+    score_df, per_class_metrics, summary, metrics_by_mode = run_memory_augmented_evaluation(
         model,
         test_data_list,
         MVTec_ITEM_LIST,
@@ -118,6 +118,7 @@ if __name__ == '__main__':
         per_class_metrics,
         summary,
         metadata,
+        metrics_by_mode=metrics_by_mode,
     )
 
     print_fn('saved memory artifacts to {}'.format(output_dir))

@@ -145,13 +145,14 @@ def resize_memory_map(memory_map, out_size):
 def run_memory_augmented_evaluation(model, test_data_list, item_list, memory_bank, args, device):
     gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
     rows: List[dict] = []
-    per_class_metrics: List[dict] = []
     score_mode = getattr(args, 'mem_score_mode', 'fused')
     lambda_value = float(getattr(args, 'mem_fusion_lambda', 1.0))
     batch_size = int(getattr(args, 'batch_size'))
     num_workers = int(getattr(args, 'num_workers'))
     max_ratio = float(getattr(args, 'max_ratio'))
     resize_mask = int(getattr(args, 'resize_mask'))
+    metric_modes = ('recon', 'memory', 'fused')
+    per_class_metrics_by_mode = {mode: [] for mode in metric_modes}
 
     for class_id, (class_name, test_data) in enumerate(zip(item_list, test_data_list)):
         loader = torch.utils.data.DataLoader(
@@ -161,10 +162,10 @@ def run_memory_augmented_evaluation(model, test_data_list, item_list, memory_ban
             num_workers=num_workers,
         )
         class_rows = []
-        gt_sp = []
-        pred_sp = []
-        gt_px = []
-        pred_px = []
+        class_predictions = {
+            mode: {'gt_sp': [], 'pred_sp': [], 'gt_px': [], 'pred_px': []}
+            for mode in metric_modes
+        }
 
         for images, gt, label, img_path in loader:
             images = images.to(device)
@@ -189,27 +190,28 @@ def run_memory_augmented_evaluation(model, test_data_list, item_list, memory_ban
             memory_map = resize_memory_map(memory_patch_maps.to(device), recon_map.shape[-2:]).unsqueeze(1)
 
             mem_applied_mask = mem_applied.to(device=device, dtype=torch.bool)
-            if score_mode == 'recon':
-                final_scores = recon_scores
-                final_map = recon_map
-            elif score_mode == 'memory':
-                final_scores = torch.where(mem_applied_mask, memory_scores, recon_scores)
-                final_map = torch.where(mem_applied_mask[:, None, None, None], memory_map, recon_map)
-            elif score_mode == 'fused':
-                final_scores = recon_scores + lambda_value * memory_scores
-                final_map = recon_map + lambda_value * memory_map
-            else:
-                raise ValueError('unsupported mem_score_mode: {}'.format(score_mode))
+            scores_by_mode = {
+                'recon': recon_scores,
+                'memory': torch.where(mem_applied_mask, memory_scores, recon_scores),
+                'fused': recon_scores + lambda_value * memory_scores,
+            }
+            maps_by_mode = {
+                'recon': recon_map,
+                'memory': torch.where(mem_applied_mask[:, None, None, None], memory_map, recon_map),
+                'fused': recon_map + lambda_value * memory_map,
+            }
 
             gt_bool = gt.bool()
             if gt_bool.shape[1] > 1:
                 gt_bool = torch.max(gt_bool, dim=1, keepdim=True)[0]
 
-            gt_sp.append(label.cpu())
-            pred_sp.append(final_scores.detach().cpu())
-            gt_px.append(gt_bool[:, 0].detach().cpu())
-            pred_px.append(final_map[:, 0].detach().cpu())
+            for mode in metric_modes:
+                class_predictions[mode]['gt_sp'].append(label.cpu())
+                class_predictions[mode]['pred_sp'].append(scores_by_mode[mode].detach().cpu())
+                class_predictions[mode]['gt_px'].append(gt_bool[:, 0].detach().cpu())
+                class_predictions[mode]['pred_px'].append(maps_by_mode[mode][:, 0].detach().cpu())
 
+            final_scores = scores_by_mode[score_mode]
             for index in range(images.shape[0]):
                 row = {
                     'class_id': class_id,
@@ -224,41 +226,53 @@ def run_memory_augmented_evaluation(model, test_data_list, item_list, memory_ban
                 class_rows.append(row)
                 rows.append(row)
 
-        gt_sp_np = torch.cat(gt_sp).flatten().numpy()
-        pred_sp_np = torch.cat(pred_sp).flatten().numpy()
-        gt_px_np = torch.cat(gt_px).numpy()
-        pred_px_np = torch.cat(pred_px).numpy()
-
         from sklearn.metrics import average_precision_score, roc_auc_score
         from utils import compute_pro, f1_score_max
 
-        per_class_metrics.append({
-            'class_id': class_id,
-            'class_name': class_name,
-            'I-AUROC': float(roc_auc_score(gt_sp_np, pred_sp_np)),
-            'I-AP': float(average_precision_score(gt_sp_np, pred_sp_np)),
-            'I-F1': float(f1_score_max(gt_sp_np, pred_sp_np)),
-            'P-AUROC': float(roc_auc_score(gt_px_np.ravel(), pred_px_np.ravel())),
-            'P-AP': float(average_precision_score(gt_px_np.ravel(), pred_px_np.ravel())),
-            'P-F1': float(f1_score_max(gt_px_np.ravel(), pred_px_np.ravel())),
-            'P-AUPRO': float(compute_pro(gt_px_np, pred_px_np)),
-            'num_samples': int(len(class_rows)),
-        })
+        for mode in metric_modes:
+            gt_sp_np = torch.cat(class_predictions[mode]['gt_sp']).flatten().numpy()
+            pred_sp_np = torch.cat(class_predictions[mode]['pred_sp']).flatten().numpy()
+            gt_px_np = torch.cat(class_predictions[mode]['gt_px']).numpy()
+            pred_px_np = torch.cat(class_predictions[mode]['pred_px']).numpy()
 
-    metrics_df = pd.DataFrame(per_class_metrics)
-    summary = {
-        'I-AUROC': float(metrics_df['I-AUROC'].mean()),
-        'I-AP': float(metrics_df['I-AP'].mean()),
-        'I-F1': float(metrics_df['I-F1'].mean()),
-        'P-AUROC': float(metrics_df['P-AUROC'].mean()),
-        'P-AP': float(metrics_df['P-AP'].mean()),
-        'P-F1': float(metrics_df['P-F1'].mean()),
-        'P-AUPRO': float(metrics_df['P-AUPRO'].mean()),
-    }
-    return pd.DataFrame(rows), per_class_metrics, summary
+            per_class_metrics_by_mode[mode].append({
+                'class_id': class_id,
+                'class_name': class_name,
+                'I-AUROC': float(roc_auc_score(gt_sp_np, pred_sp_np)),
+                'I-AP': float(average_precision_score(gt_sp_np, pred_sp_np)),
+                'I-F1': float(f1_score_max(gt_sp_np, pred_sp_np)),
+                'P-AUROC': float(roc_auc_score(gt_px_np.ravel(), pred_px_np.ravel())),
+                'P-AP': float(average_precision_score(gt_px_np.ravel(), pred_px_np.ravel())),
+                'P-F1': float(f1_score_max(gt_px_np.ravel(), pred_px_np.ravel())),
+                'P-AUPRO': float(compute_pro(gt_px_np, pred_px_np)),
+                'num_samples': int(len(class_rows)),
+            })
+
+    metrics_by_mode = {}
+    for mode in metric_modes:
+        metrics_df = pd.DataFrame(per_class_metrics_by_mode[mode])
+        metrics_by_mode[mode] = {
+            'summary': {
+                'I-AUROC': float(metrics_df['I-AUROC'].mean()),
+                'I-AP': float(metrics_df['I-AP'].mean()),
+                'I-F1': float(metrics_df['I-F1'].mean()),
+                'P-AUROC': float(metrics_df['P-AUROC'].mean()),
+                'P-AP': float(metrics_df['P-AP'].mean()),
+                'P-F1': float(metrics_df['P-F1'].mean()),
+                'P-AUPRO': float(metrics_df['P-AUPRO'].mean()),
+            },
+            'per_class_metrics': per_class_metrics_by_mode[mode],
+        }
+
+    return (
+        pd.DataFrame(rows),
+        metrics_by_mode[score_mode]['per_class_metrics'],
+        metrics_by_mode[score_mode]['summary'],
+        metrics_by_mode,
+    )
 
 
-def save_memory_artifacts(output_dir, memory_bank, score_df, per_class_metrics, summary, metadata):
+def save_memory_artifacts(output_dir, memory_bank, score_df, per_class_metrics, summary, metadata, metrics_by_mode=None):
     os.makedirs(output_dir, exist_ok=True)
 
     memory_bank_path = os.path.join(output_dir, 'memory_bank.pt')
@@ -283,6 +297,8 @@ def save_memory_artifacts(output_dir, memory_bank, score_df, per_class_metrics, 
         'per_class_metrics': per_class_metrics,
         'metadata': metadata,
     }
+    if metrics_by_mode is not None:
+        summary_payload['metrics_by_mode'] = metrics_by_mode
     with open(os.path.join(output_dir, 'memory_eval_summary.json'), 'w', encoding='utf-8') as file:
         json.dump(summary_payload, file, indent=2, ensure_ascii=False)
 
