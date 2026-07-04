@@ -446,6 +446,64 @@ def save_train_checkpoint(save_dir, save_name, model, iteration, args, final_eva
     return checkpoint_path
 
 
+def _checkpoint_args_get(checkpoint_args, key, default=None):
+    if checkpoint_args is None:
+        return default
+    if isinstance(checkpoint_args, dict):
+        return checkpoint_args.get(key, default)
+    return getattr(checkpoint_args, key, default)
+
+
+def load_train_checkpoint_metadata(checkpoint_path):
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint_args = checkpoint.get('args') or {}
+    encoder_name = _checkpoint_args_get(checkpoint_args, 'encoder_name', DEFAULT_ENCODER_NAME)
+    image_size = int(_checkpoint_args_get(checkpoint_args, 'image_size', DEFAULT_IMAGE_SIZE))
+    crop_size = int(_checkpoint_args_get(checkpoint_args, 'crop_size', DEFAULT_CROP_SIZE))
+    target_layers = list(_checkpoint_args_get(checkpoint_args, 'target_layers', DEFAULT_TARGET_LAYERS))
+    fuse_layer_encoder = _checkpoint_args_get(checkpoint_args, 'fuse_layer_encoder', DEFAULT_FUSE_LAYER_ENCODER)
+    fuse_layer_decoder = _checkpoint_args_get(checkpoint_args, 'fuse_layer_decoder', DEFAULT_FUSE_LAYER_DECODER)
+    diag_max_ratio = float(_checkpoint_args_get(checkpoint_args, 'diag_max_ratio', 0.01))
+    diag_resize_mask = int(_checkpoint_args_get(checkpoint_args, 'diag_resize_mask', 256))
+    return {
+        'checkpoint_path': checkpoint_path,
+        'checkpoint': checkpoint,
+        'model_state_dict': checkpoint['model_state_dict'],
+        'iteration': checkpoint.get('iteration'),
+        'args': checkpoint_args,
+        'encoder_name': encoder_name,
+        'image_size': image_size,
+        'crop_size': crop_size,
+        'target_layers': target_layers,
+        'fuse_layer_encoder': fuse_layer_encoder,
+        'fuse_layer_decoder': fuse_layer_decoder,
+        'diag_max_ratio': diag_max_ratio,
+        'diag_resize_mask': diag_resize_mask,
+        'final_eval_summary': checkpoint.get('final_eval_summary'),
+    }
+
+
+def load_model_from_train_checkpoint(checkpoint_path, device):
+    metadata = load_train_checkpoint_metadata(checkpoint_path)
+    model, trainable = build_model(
+        device,
+        encoder_name=metadata['encoder_name'],
+        target_layers=metadata['target_layers'],
+        fuse_layer_encoder=metadata['fuse_layer_encoder'],
+        fuse_layer_decoder=metadata['fuse_layer_decoder'],
+    )
+    model.load_state_dict(metadata['model_state_dict'])
+    model.eval()
+    return model, trainable, metadata
+
+
+def get_class_train_counts(train_data_list, item_list):
+    return {
+        int(class_id): int(len(train_data))
+        for class_id, (item, train_data) in enumerate(zip(item_list, train_data_list))
+    }
+
+
 def evaluate_model(model, test_data_list, item_list, device, batch_size=DEFAULT_BATCH_SIZE,
                    num_workers=DEFAULT_NUM_WORKERS, max_ratio=0.01, resize_mask=256, print_fn=None):
     auroc_sp_list, ap_sp_list, f1_sp_list = [], [], []

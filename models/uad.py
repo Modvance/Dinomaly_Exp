@@ -34,7 +34,7 @@ class ViTill(nn.Module):
             self.encoder.num_register_tokens = 0
         self.mask_neighbor_size = mask_neighbor_size
 
-    def forward(self, x):
+    def forward(self, x, return_patch_tokens=False):
         x = self.encoder.prepare_tokens(x)
         en_list = []
         for i, blk in enumerate(self.encoder.blocks):
@@ -53,7 +53,8 @@ class ViTill(nn.Module):
         if self.remove_class_token:
             en_list = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en_list]
 
-        x = self.fuse_feature(en_list)
+        patch_tokens = self.fuse_feature(en_list)
+        x = patch_tokens
         for i, blk in enumerate(self.bottleneck):
             x = blk(x)
 
@@ -74,9 +75,12 @@ class ViTill(nn.Module):
         if not self.remove_class_token:  # class tokens have not been removed above
             en = [e[:, 1 + self.encoder.num_register_tokens:, :] for e in en]
             de = [d[:, 1 + self.encoder.num_register_tokens:, :] for d in de]
+            patch_tokens = patch_tokens[:, 1 + self.encoder.num_register_tokens:, :]
 
         en = [e.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for e in en]
         de = [d.permute(0, 2, 1).reshape([x.shape[0], -1, side, side]).contiguous() for d in de]
+        if return_patch_tokens:
+            return en, de, patch_tokens.contiguous(), (side, side)
         return en, de
 
     def fuse_feature(self, feat_list):

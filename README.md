@@ -173,4 +173,27 @@ python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k4-see
 python run_precluster_visual.py --image_root ../LTN_datasets/mvtecad-step_k1-seed02 --output_dir ../results/class/vlm_proto_k1 --stage all --split train --device cuda
 ```
 
-python dinomaly_mvtec_uni.py --data_path ../mvtec_anomaly_detection --save_name vitill_mvtec_uni_plain --gpus 0
+test
+```bash
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k4-seed00 --save_dir ../results/test --save_name dino_mvtec_k4_clean --gpus 1
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/test --save_name dino_mvtec_k4 --gpus 2
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/test --save_name gbps_mvtec_k4 --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/test --save_name lt_mvtec_k4_spl --gpus 2 --gbps_auto_k --gbps_postprocess_mode remove  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt --lt_enable --lt_sampler_enabl
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/test --save_name lt_mvtec_k4_loss --gpus 1 --gbps_auto_k --gbps_postprocess_mode remove  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt --lt_enable --lt_group_balanced_loss
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/test --save_name lt_mvtec_k4_spl_loss --gpus 5 --gbps_auto_k --gbps_postprocess_mode remove  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt --lt_enable --lt_sampler_enable --lt_group_balanced_loss
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/test --save_name lt_mvtec_k4_spl_loss_aug --gpus 6 --gbps_auto_k --gbps_postprocess_mode remove  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt --lt_enable --lt_sampler_enable --lt_group_balanced_loss --lt_tail_aug_enable
+
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name dino_mvtec_k1_clean --gpus 1
+python dinomaly_mvtec_uni.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/test --save_name dino_mvtec_k1 --gpus 2
+python dinomaly_mvtec_gbps.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/test --save_name gbps_mvtec_k1 --gpus 3 --gbps_auto_k --gbps_postprocess_mode remove --gbps_prune_ratio 0.1 --gbps_min_keep_per_group 8 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed01/inject_defects.txt
+python dinomaly_mvtec_phase6.py --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name lt_mvtec_k1_clean_spl --gpus 1 --lt_sampler_enable
+python dinomaly_mvtec_phase6.py --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name lt_mvtec_k1_clean_loss --gpus 2 --lt_group_balanced_loss
+python dinomaly_mvtec_phase6.py --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name lt_mvtec_k1_clean_spl_loss_aug --gpus 3 --lt_sampler_enable --lt_group_balanced_loss --lt_tail_aug_enable
+python dinomaly_mvtec_phase6.py --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name lt_mvtec_k1_clean_spl_aug --gpus 2 --lt_sampler_enable --lt_tail_aug_enable
+python dinomaly_mvtec_phase6.py --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name lt_mvtec_k1_clean_spl_0.3_6 --gpus 1 --lt_sampler_enable --lt_sampler_enable --lt_sampler_alpha 0.3 --lt_sampler_clip_max 6
+python dinomaly_mvtec_phase6.py --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name lt_mvtec_k1_clean_spl_0.1_8 --gpus 3 --lt_sampler_enable --lt_sampler_enable --lt_sampler_alpha 0.1 --lt_sampler_clip_max 8
+
+python dinomaly_mvtec_one_shot_memory_eval.py --checkpoint_path ../results/test/dino_mvtec_k1_clean/final_model.pt --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name dino_mvtec_k1_mem --mem_enable --mem_score_mode fused --mem_fusion_lambda 1.0
+python dinomaly_mvtec_one_shot_memory_eval.py --checkpoint_path ../results/test/dino_mvtec_k1_clean/final_model.pt --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name dino_mvtec_k1_mem_s8 --mem_enable --mem_apply_mode class_size_le --mem_class_size_thr 8 --mem_score_mode fused --mem_fusion_lambda 1.0
+python dinomaly_mvtec_one_shot_memory_eval.py --checkpoint_path ../results/test/dino_mvtec_k1_clean/final_model.pt --data_path ../LTN_datasets/mvtecad-step_k1-seed00 --save_dir ../results/test --save_name dino_mvtec_k1_mem_s8_top5 --mem_enable --mem_apply_mode class_size_le --mem_class_size_thr 8 --mem_score_mode fused --mem_topk_ratio 0.05 --mem_fusion_lambda 1.0
+```
