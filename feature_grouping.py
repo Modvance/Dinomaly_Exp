@@ -37,6 +37,103 @@ def _normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
     return embeddings / norms
 
 
+def _connected_components_from_adjacency(adjacency: np.ndarray) -> List[List[int]]:
+    num_nodes = int(adjacency.shape[0])
+    visited = np.zeros(num_nodes, dtype=bool)
+    components: List[List[int]] = []
+    for start in range(num_nodes):
+        if visited[start]:
+            continue
+        stack = [start]
+        visited[start] = True
+        component = []
+        while stack:
+            node = stack.pop()
+            component.append(int(node))
+            neighbors = np.flatnonzero(adjacency[node])
+            for neighbor in neighbors.tolist():
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    stack.append(int(neighbor))
+        components.append(component)
+    return components
+
+
+def fit_mutual_knn_groups(
+    embeddings,
+    sample_keys,
+    k=5,
+    min_similarity=None,
+    min_group_size=1,
+):
+    sample_keys = [int(key) for key in sample_keys]
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    if embeddings.ndim != 2:
+        raise ValueError('embeddings must be a 2D array')
+    if embeddings.shape[0] != len(sample_keys):
+        raise ValueError('embeddings and sample_keys length mismatch')
+    if embeddings.shape[0] == 0:
+        raise ValueError('cannot fit mutual-kNN groups on empty embeddings')
+
+    normalized = _normalize_embeddings(embeddings)
+    num_samples = int(normalized.shape[0])
+    if num_samples == 1:
+        return {int(sample_keys[0]): 0}, {
+            'method': 'mutual_knn_cc',
+            'k': 0,
+            'min_similarity': None if min_similarity is None else float(min_similarity),
+            'min_group_size': int(min_group_size),
+            'num_samples': 1,
+            'num_edges': 0,
+            'group_sizes': {'0': 1},
+        }
+
+    effective_k = max(1, min(int(k), num_samples - 1))
+    similarity = normalized @ normalized.T
+    np.fill_diagonal(similarity, -np.inf)
+    neighbor_order = np.argsort(-similarity, axis=1)[:, :effective_k]
+
+    adjacency = np.zeros((num_samples, num_samples), dtype=bool)
+    neighbor_sets = [set(row.tolist()) for row in neighbor_order]
+    for index in range(num_samples):
+        for neighbor in neighbor_order[index].tolist():
+            if index not in neighbor_sets[neighbor]:
+                continue
+            if min_similarity is not None and float(similarity[index, neighbor]) < float(min_similarity):
+                continue
+            adjacency[index, neighbor] = True
+            adjacency[neighbor, index] = True
+
+    components = _connected_components_from_adjacency(adjacency)
+    min_group_size = max(1, int(min_group_size))
+    expanded_components: List[List[int]] = []
+    for component in components:
+        if len(component) >= min_group_size:
+            expanded_components.append(component)
+        else:
+            for index in component:
+                expanded_components.append([int(index)])
+
+    group_assignments = {}
+    group_sizes = {}
+    for group_id, component in enumerate(expanded_components):
+        group_sizes[str(int(group_id))] = int(len(component))
+        for index in component:
+            group_assignments[int(sample_keys[index])] = int(group_id)
+
+    num_edges = int(np.triu(adjacency, k=1).sum())
+    group_info = {
+        'method': 'mutual_knn_cc',
+        'k': int(effective_k),
+        'min_similarity': None if min_similarity is None else float(min_similarity),
+        'min_group_size': int(min_group_size),
+        'num_samples': int(num_samples),
+        'num_edges': num_edges,
+        'group_sizes': group_sizes,
+    }
+    return group_assignments, group_info
+
+
 def _extract_encoder_gap_embeddings(model, images: torch.Tensor) -> np.ndarray:
     en, _ = model(images)
     feature_map = en[-1]

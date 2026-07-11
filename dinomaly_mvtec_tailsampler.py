@@ -20,6 +20,8 @@ from dinomaly_train_base import (
     load_model_from_train_checkpoint,
 )
 from feature_grouping import extract_image_embeddings
+from hrt_artifacts import save_hrt_artifacts
+from hrt_postprocess import run_hrt_postprocess
 from tail_sampler_analysis import run_tail_sampler_analysis, save_tail_sampler_artifacts
 
 warnings = __import__('warnings')
@@ -54,6 +56,18 @@ if __name__ == '__main__':
     parser.add_argument('--tailsampler_dataset_name', type=str, default=None)
     parser.add_argument('--tailsampler_embedding_source', type=str, default='encoder', choices=['encoder', 'encoder_cls'])
     parser.add_argument('--save_sampler_details', action='store_true')
+    parser.add_argument('--enable_hrt', action='store_true')
+    parser.add_argument('--hrt_embedding_source', type=str, default='encoder_cls', choices=['encoder', 'encoder_cls'])
+    parser.add_argument('--hrt_group_k', type=int, default=5)
+    parser.add_argument('--hrt_group_min_size', type=int, default=1)
+    parser.add_argument('--hrt_group_min_similarity', type=float, default=None)
+    parser.add_argument('--hrt_head_topm', type=int, default=20)
+    parser.add_argument('--hrt_head_topk_mean', type=int, default=5)
+    parser.add_argument('--hrt_trim_lambda', type=float, default=2.5)
+    parser.add_argument('--hrt_min_keep_ratio', type=float, default=0.70)
+    parser.add_argument('--hrt_max_drop_ratio', type=float, default=0.30)
+    parser.add_argument('--hrt_chunk_size', type=int, default=4096)
+    parser.add_argument('--hrt_save_patch_maps', action='store_true')
     args = parser.parse_args()
 
     logger = get_logger(args.save_name, os.path.join(args.save_dir, args.save_name))
@@ -135,6 +149,53 @@ if __name__ == '__main__':
         save_details=bool(args.save_sampler_details),
     )
 
+    hrt_saved = None
+    hrt_summary = None
+    if args.enable_hrt:
+        hrt_result = run_hrt_postprocess(
+            model,
+            train_eval_dataloader,
+            device,
+            metadata_df,
+            details_df,
+            args,
+        )
+        hrt_output_dir = os.path.join(output_dir, 'hrt')
+        hrt_metadata = {
+            'data_path': args.data_path,
+            'dataset_name': args.tailsampler_dataset_name,
+            'checkpoint_path': args.checkpoint_path,
+            'encoder_name': checkpoint_metadata['encoder_name'] if checkpoint_metadata is not None else args.encoder_name,
+            'hrt_embedding_source': args.hrt_embedding_source,
+            'hrt_group_k': int(args.hrt_group_k),
+            'hrt_group_min_size': int(args.hrt_group_min_size),
+            'hrt_group_min_similarity': args.hrt_group_min_similarity,
+            'hrt_head_topm': int(args.hrt_head_topm),
+            'hrt_head_topk_mean': int(args.hrt_head_topk_mean),
+            'hrt_trim_lambda': float(args.hrt_trim_lambda),
+            'hrt_min_keep_ratio': float(args.hrt_min_keep_ratio),
+            'hrt_max_drop_ratio': float(args.hrt_max_drop_ratio),
+            'hrt_chunk_size': int(args.hrt_chunk_size),
+        }
+        hrt_saved = save_hrt_artifacts(
+            hrt_output_dir,
+            hrt_result['summary'],
+            hrt_result['candidate_groups_df'],
+            hrt_result['head_references_df'],
+            hrt_result['sample_scores_df'],
+            hrt_result['group_decisions_df'],
+            metadata=hrt_metadata,
+            deviation_maps=hrt_result['deviation_maps'],
+            patch_bank=hrt_result['patch_bank'],
+            save_patch_maps=bool(args.hrt_save_patch_maps),
+        )
+        hrt_summary = hrt_result['summary']
+        print_fn('saved HRT artifacts to {}'.format(hrt_output_dir))
+
     print_fn('saved TailSampler artifacts to {}'.format(output_dir))
     print_fn(json.dumps(summary_row, indent=2, ensure_ascii=False))
+    if hrt_summary is not None:
+        print_fn(json.dumps(hrt_summary, indent=2, ensure_ascii=False))
     print_fn(json.dumps(saved, indent=2, ensure_ascii=False))
+    if hrt_saved is not None:
+        print_fn(json.dumps(hrt_saved, indent=2, ensure_ascii=False))

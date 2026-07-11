@@ -119,6 +119,18 @@ def _count_pred_class_size_le(class_sizes_pred: np.ndarray, threshold: float) ->
     return int(np.sum(class_sizes_pred <= float(threshold)))
 
 
+def build_tail_candidate_partition(details_df: pd.DataFrame):
+    if 'sample_idx' not in details_df.columns or 'is_selected' not in details_df.columns:
+        raise ValueError('details_df must contain sample_idx and is_selected')
+    candidate_df = details_df[details_df['is_selected'].astype(int) == 1].copy().reset_index(drop=True)
+    head_df = details_df[details_df['is_selected'].astype(int) == 0].copy().reset_index(drop=True)
+    if 'sample_idx' in candidate_df.columns:
+        candidate_df['sample_idx'] = candidate_df['sample_idx'].astype(int)
+    if 'sample_idx' in head_df.columns:
+        head_df['sample_idx'] = head_df['sample_idx'].astype(int)
+    return candidate_df, head_df
+
+
 def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2:
