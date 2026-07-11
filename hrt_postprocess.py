@@ -6,7 +6,7 @@ import torch
 
 from feature_grouping import extract_image_embeddings, fit_mutual_knn_groups
 from one_shot_memory import extract_encoder_patch_tokens, compute_memory_patch_scores
-from tail_sampler_analysis import build_tail_candidate_partition
+from tail_sampler_analysis import build_tail_candidate_partition, compute_selection_metrics
 
 
 EPS = 1e-12
@@ -233,6 +233,64 @@ def _compute_group_decisions(sample_scores_df: pd.DataFrame, calibration: Dict[s
     return pd.DataFrame(rows, columns=columns)
 
 
+def build_final_hrt_selection(details_df: pd.DataFrame, sample_scores_df: pd.DataFrame):
+    required_columns = {'sample_idx', 'is_selected', 'is_gt_tail'}
+    missing_columns = required_columns.difference(details_df.columns)
+    if missing_columns:
+        raise ValueError('details_df missing required columns: {}'.format(sorted(missing_columns)))
+    if details_df['sample_idx'].duplicated().any():
+        raise ValueError('details_df sample_idx values must be unique')
+    if len(sample_scores_df) > 0 and sample_scores_df['sample_idx'].duplicated().any():
+        raise ValueError('sample_scores_df sample_idx values must be unique')
+
+    decision_columns = ['sample_idx', 'group_id', 'decision']
+    if len(sample_scores_df) == 0:
+        decision_df = pd.DataFrame(columns=decision_columns)
+    else:
+        decision_df = sample_scores_df[decision_columns].copy()
+    decision_df = decision_df.rename(columns={'decision': 'hrt_decision'})
+
+    final_selection_df = details_df.copy()
+    final_selection_df['sample_idx'] = final_selection_df['sample_idx'].astype(int)
+    final_selection_df = final_selection_df.merge(
+        decision_df,
+        on='sample_idx',
+        how='left',
+        validate='one_to_one',
+    )
+    if len(final_selection_df) != len(details_df):
+        raise RuntimeError('HRT final selection merge changed sample count')
+
+    final_selection_df['is_selected_before_hrt'] = final_selection_df['is_selected'].astype(int)
+    candidate_mask = final_selection_df['is_selected_before_hrt'] == 1
+    missing_candidate_decision = candidate_mask & final_selection_df['hrt_decision'].isna()
+    final_selection_df.loc[missing_candidate_decision, 'hrt_decision'] = 'uncertain_tail'
+    final_selection_df.loc[~candidate_mask, 'hrt_decision'] = 'not_candidate'
+
+    noise_mask = candidate_mask & (final_selection_df['hrt_decision'] == 'noise_subcluster')
+    final_selection_df['is_selected_after_hrt'] = candidate_mask.astype(int)
+    final_selection_df.loc[noise_mask, 'is_selected_after_hrt'] = 0
+    final_selection_df['hrt_removed'] = noise_mask.astype(int)
+
+    before_metrics = compute_selection_metrics(
+        final_selection_df['is_selected_before_hrt'].to_numpy(),
+        final_selection_df['is_gt_tail'].astype(int).to_numpy(),
+    )
+    after_metrics = compute_selection_metrics(
+        final_selection_df['is_selected_after_hrt'].to_numpy(),
+        final_selection_df['is_gt_tail'].astype(int).to_numpy(),
+    )
+    processing_summary = {
+        'before_selection_metrics': before_metrics,
+        'after_selection_metrics': after_metrics,
+        'num_selected_before_hrt': int(final_selection_df['is_selected_before_hrt'].sum()),
+        'num_selected_after_hrt': int(final_selection_df['is_selected_after_hrt'].sum()),
+        'num_removed_by_hrt': int(final_selection_df['hrt_removed'].sum()),
+        'num_candidates_defaulted_to_uncertain': int(missing_candidate_decision.sum()),
+    }
+    return final_selection_df, processing_summary
+
+
 def _build_calibration_rows(
     head_df: pd.DataFrame,
     head_embeddings_map: Dict[int, np.ndarray],
@@ -433,6 +491,7 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
 
     group_decisions_df = _compute_group_decisions(sample_scores_df, calibration)
     sample_scores_df = sample_scores_df.merge(group_decisions_df[['group_id', 'decision']], on='group_id', how='left')
+    final_selection_df, processing_summary = build_final_hrt_selection(details_df, sample_scores_df)
 
     summary = {
         'num_tail_candidates': int(len(candidate_df)),
@@ -446,6 +505,7 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
         'num_uncertain_tail_samples': int((sample_scores_df['decision'] == 'uncertain_tail').sum()) if len(sample_scores_df) > 0 else 0,
         'grouping_info': grouping_info,
         'calibration': calibration,
+        **processing_summary,
     }
 
     return {
@@ -454,6 +514,7 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
         'head_references_df': head_references_df,
         'sample_scores_df': sample_scores_df,
         'group_decisions_df': group_decisions_df,
+        'final_selection_df': final_selection_df,
         'deviation_maps': deviation_maps,
         'patch_bank': patch_bank,
         'calibration_df': calibration_df,
