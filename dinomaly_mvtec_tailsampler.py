@@ -185,6 +185,7 @@ if __name__ == '__main__':
             hrt_result['sample_scores_df'],
             hrt_result['group_decisions_df'],
             hrt_result['final_selection_df'],
+            hrt_result['calibration_df'],
             metadata=hrt_metadata,
             deviation_maps=hrt_result['deviation_maps'],
             patch_bank=hrt_result['patch_bank'],

@@ -14,6 +14,8 @@ EPS = 1e-12
 
 def _normalize_np(array: np.ndarray) -> np.ndarray:
     array = np.asarray(array, dtype=np.float32)
+    if array.ndim == 1:
+        array = array.reshape(1, -1)
     norms = np.linalg.norm(array, axis=1, keepdims=True)
     norms = np.clip(norms, a_min=EPS, a_max=None)
     return array / norms
@@ -21,6 +23,19 @@ def _normalize_np(array: np.ndarray) -> np.ndarray:
 
 def _as_sample_index_set(values) -> set:
     return {int(value) for value in values}
+
+
+def _patch_feature_mean(patch_tokens: torch.Tensor, keep_mask: np.ndarray = None) -> np.ndarray:
+    if keep_mask is None:
+        feature = patch_tokens.mean(dim=0)
+    else:
+        keep_tensor = torch.as_tensor(np.asarray(keep_mask, dtype=bool), device=patch_tokens.device)
+        if int(keep_tensor.sum().item()) == 0:
+            feature = patch_tokens.mean(dim=0)
+        else:
+            feature = patch_tokens[keep_tensor].mean(dim=0)
+    feature = feature.detach().cpu().numpy().astype(np.float32, copy=False)
+    return _normalize_np(feature)[0]
 
 
 def _build_group_tables(candidate_df: pd.DataFrame, group_assignments: Dict[int, int]) -> Tuple[pd.DataFrame, Dict[int, List[int]]]:
@@ -51,12 +66,10 @@ def _retrieve_head_references(
 
     head_reference_rows = []
     group_head_refs = {}
-    pooled_group_embeddings = {}
 
     for group_id, sample_indices in group_to_sample_indices.items():
         group_embeddings = _normalize_np(np.stack([embedding_by_sample[int(sample_idx)] for sample_idx in sample_indices], axis=0))
         group_center = _normalize_np(group_embeddings.mean(axis=0, keepdims=True))[0]
-        pooled_group_embeddings[int(group_id)] = group_center
 
         similarities = head_embeddings @ group_center
         order = np.argsort(-similarities)
@@ -76,7 +89,7 @@ def _retrieve_head_references(
             })
         group_head_refs[int(group_id)] = refs
 
-    return pd.DataFrame(head_reference_rows), group_head_refs, pooled_group_embeddings
+    return pd.DataFrame(head_reference_rows), group_head_refs
 
 
 @torch.no_grad()
@@ -187,47 +200,226 @@ def _jaccard_mean(neighbor_sets: List[set]) -> float:
     return float(np.mean(overlaps))
 
 
-def _compute_group_decisions(sample_scores_df: pd.DataFrame, calibration: Dict[str, float]) -> pd.DataFrame:
+def _pairwise_cosine_mean(vectors: List[np.ndarray]) -> float:
+    if len(vectors) <= 1:
+        return 1.0
+    matrix = _normalize_np(np.stack([np.asarray(vector, dtype=np.float32).reshape(-1) for vector in vectors], axis=0))
+    similarity = matrix @ matrix.T
+    upper = similarity[np.triu_indices(similarity.shape[0], k=1)]
+    if upper.size == 0:
+        return 1.0
+    return float(np.mean(upper))
+
+
+@torch.no_grad()
+def _build_head_calibration(
+    head_df: pd.DataFrame,
+    head_embeddings_map: Dict[int, np.ndarray],
+    head_patch_bank: Dict[int, Dict],
+    top_m: int,
+    top_k_mean: int,
+    trim_lambda: float,
+    min_keep_ratio: float,
+    max_drop_ratio: float,
+    chunk_size: int,
+):
+    head_rows = head_df.reset_index(drop=True)
+    sample_indices = head_rows['sample_idx'].astype(int).tolist()
+    raw_patch_features = {
+        int(sample_idx): _patch_feature_mean(head_patch_bank[int(sample_idx)]['patch_tokens'])
+        for sample_idx in sample_indices
+        if int(sample_idx) in head_patch_bank
+    }
+
+    temp_cache = {}
+    for sample_idx in sample_indices:
+        sample_idx = int(sample_idx)
+        if sample_idx not in head_patch_bank:
+            continue
+        candidate_embedding = head_embeddings_map[int(sample_idx)]
+        reference_indices = [int(other_idx) for other_idx in sample_indices if int(other_idx) != int(sample_idx) and int(other_idx) in head_patch_bank]
+        if len(reference_indices) == 0:
+            continue
+        reference_embeddings = _normalize_np(np.stack([head_embeddings_map[idx] for idx in reference_indices], axis=0))
+        similarities = reference_embeddings @ _normalize_np(candidate_embedding)[0]
+        order = np.argsort(-similarities)[: min(int(top_m), len(similarities))]
+        selected_reference_indices = [reference_indices[position] for position in order.tolist()]
+        head_memory = torch.cat([head_patch_bank[idx]['patch_tokens'] for idx in selected_reference_indices], dim=0)
+        patch_scores = compute_memory_patch_scores(
+            head_patch_bank[int(sample_idx)]['patch_tokens'],
+            head_memory,
+            chunk_size=int(chunk_size),
+        ).detach().cpu().numpy()
+        keep_mask = _robust_keep_mask(
+            patch_scores,
+            trim_lambda=trim_lambda,
+            min_keep_ratio=min_keep_ratio,
+            max_drop_ratio=max_drop_ratio,
+        )
+        removed_mask = ~keep_mask
+        temp_cache[sample_idx] = {
+            'reference_indices': selected_reference_indices,
+            'raw_patch_feature': raw_patch_features[sample_idx],
+            'clean_patch_feature': _patch_feature_mean(head_patch_bank[int(sample_idx)]['patch_tokens'], keep_mask=keep_mask),
+            'patch_scores': patch_scores,
+            'drop_ratio': float(removed_mask.mean()),
+            'keep_ratio': float(keep_mask.mean()),
+            'largest_dev_cc_ratio': float(_largest_component_ratio(removed_mask, head_patch_bank[int(sample_idx)]['spatial_size'])),
+        }
+
+    rows = []
+    for sample_idx, entry in temp_cache.items():
+        reference_indices = entry['reference_indices']
+        reference_clean_features = np.stack([
+            temp_cache[idx]['clean_patch_feature'] if idx in temp_cache else raw_patch_features[idx]
+            for idx in reference_indices
+        ], axis=0)
+        reference_raw_embeddings = np.stack([head_embeddings_map[idx] for idx in reference_indices], axis=0)
+
+        s_raw_cls = _mean_topk_cosine(head_embeddings_map[sample_idx], reference_raw_embeddings, top_k_mean)
+        s_raw_patch = _mean_topk_cosine(entry['raw_patch_feature'], reference_clean_features, top_k_mean)
+        s_clean = _mean_topk_cosine(entry['clean_patch_feature'], reference_clean_features, top_k_mean)
+        neighbor_scores = _normalize_np(reference_clean_features) @ _normalize_np(entry['clean_patch_feature'])[0]
+        neighbor_order = np.argsort(-neighbor_scores)[: min(int(top_k_mean), len(neighbor_scores))]
+        clean_neighbors = [int(reference_indices[position]) for position in neighbor_order.tolist()]
+        rows.append({
+            'sample_idx': int(sample_idx),
+            's_raw_cls': float(s_raw_cls),
+            's_raw_patch': float(s_raw_patch),
+            's_clean': float(s_clean),
+            'delta': float(s_clean - s_raw_patch),
+            'drop_ratio': float(entry['drop_ratio']),
+            'keep_ratio': float(entry['keep_ratio']),
+            'largest_dev_cc_ratio': float(entry['largest_dev_cc_ratio']),
+            'clean_head_neighbor_ids': '|'.join(str(value) for value in clean_neighbors),
+        })
+
+    calibration_df = pd.DataFrame(rows)
+    return calibration_df, temp_cache
+
+
+def _build_calibration_summary(calibration_df: pd.DataFrame, sample_scores_df: pd.DataFrame) -> Dict[str, float]:
+    source_df = calibration_df if len(calibration_df) > 0 else sample_scores_df
+    if len(source_df) == 0:
+        return {
+            'head_patch_raw_similarity_q10': 0.0,
+            'head_patch_raw_similarity_q25': 0.0,
+            'head_clean_similarity_q10': 0.0,
+            'head_clean_similarity_q25': 0.0,
+            'head_gain_q50': 0.0,
+            'head_gain_q75': 0.0,
+            'head_gain_q90': 0.0,
+            'head_drop_ratio_q75': 0.0,
+            'head_drop_ratio_q90': 0.0,
+            'head_largest_dev_cc_ratio_q75': 0.0,
+            'head_largest_dev_cc_ratio_q90': 0.0,
+            'neighbor_consistency_q50': 0.35,
+        }
+
+    if 'clean_head_neighbor_ids' in source_df.columns and len(source_df) > 0:
+        calibration_neighbor_consistency = _jaccard_mean([
+            {int(value) for value in str(text).split('|') if str(value).strip()}
+            for text in source_df['clean_head_neighbor_ids'].fillna('')
+        ])
+    else:
+        calibration_neighbor_consistency = 0.35
+
+    s_raw_col = 's_raw_patch' if 's_raw_patch' in source_df.columns else 's_raw'
+    return {
+        'head_patch_raw_similarity_q10': float(source_df[s_raw_col].quantile(0.10)),
+        'head_patch_raw_similarity_q25': float(source_df[s_raw_col].quantile(0.25)),
+        'head_clean_similarity_q10': float(source_df['s_clean'].quantile(0.10)),
+        'head_clean_similarity_q25': float(source_df['s_clean'].quantile(0.25)),
+        'head_gain_q50': float(source_df['delta'].quantile(0.50)),
+        'head_gain_q75': float(source_df['delta'].quantile(0.75)),
+        'head_gain_q90': float(source_df['delta'].quantile(0.90)),
+        'head_drop_ratio_q75': float(source_df['drop_ratio'].quantile(0.75)),
+        'head_drop_ratio_q90': float(source_df['drop_ratio'].quantile(0.90)),
+        'head_largest_dev_cc_ratio_q75': float(source_df['largest_dev_cc_ratio'].quantile(0.75)),
+        'head_largest_dev_cc_ratio_q90': float(source_df['largest_dev_cc_ratio'].quantile(0.90)),
+        'neighbor_consistency_q50': float(calibration_neighbor_consistency),
+    }
+
+
+def _compute_group_decisions(sample_scores_df: pd.DataFrame, calibration: Dict[str, float], deviation_maps: Dict[int, torch.Tensor]) -> pd.DataFrame:
     columns = [
         'group_id',
         'group_size',
+        'median_s_raw_cls',
+        'median_s_raw_patch',
         'median_s_clean',
         'median_delta',
+        'median_drop_ratio',
         'median_largest_dev_cc_ratio',
         'neighbor_consistency',
+        'deviation_map_consistency',
+        'head_like',
+        'strong_gain',
+        'localized_pattern',
+        'consistent_reattachment',
+        'decision_reason',
         'decision',
     ]
     rows = []
     for group_id, group_df in sample_scores_df.groupby('group_id'):
+        median_s_raw_cls = float(group_df['s_raw_cls'].median()) if 's_raw_cls' in group_df.columns else 0.0
+        median_s_raw_patch = float(group_df['s_raw'].median())
         median_s_clean = float(group_df['s_clean'].median())
         median_delta = float(group_df['delta'].median())
+        median_drop_ratio = float(group_df['drop_ratio'].median())
         median_cc = float(group_df['largest_dev_cc_ratio'].median())
         neighbor_consistency = _jaccard_mean([
             {int(value) for value in str(text).split('|') if str(value).strip()}
             for text in group_df['clean_head_neighbor_ids'].fillna('')
         ])
+        map_vectors = [
+            deviation_maps[int(sample_idx)].detach().cpu().numpy().reshape(-1)
+            for sample_idx in group_df['sample_idx'].astype(int).tolist()
+            if int(sample_idx) in deviation_maps
+        ]
+        deviation_map_consistency = _pairwise_cosine_mean(map_vectors)
 
-        if (
-            median_s_clean >= float(calibration['head_clean_similarity_q10'])
-            and median_delta >= float(calibration['head_gain_q90'])
-            and neighbor_consistency >= float(calibration['neighbor_consistency_q50'])
-        ):
+        head_like = median_s_clean >= float(calibration['head_clean_similarity_q10'])
+        strong_gain = median_delta >= float(calibration['head_gain_q75'])
+        moderate_gain = median_delta >= float(calibration['head_gain_q50'])
+        localized_pattern = (
+            median_drop_ratio <= float(calibration['head_drop_ratio_q90']) + 0.10
+            and median_cc >= max(0.25, float(calibration['head_largest_dev_cc_ratio_q75']))
+        )
+        consistent_reattachment = (
+            neighbor_consistency >= max(0.35, float(calibration['neighbor_consistency_q50']))
+            or deviation_map_consistency >= 0.60
+        )
+
+        if head_like and strong_gain and (localized_pattern or consistent_reattachment):
             decision = 'noise_subcluster'
-        elif (
-            median_s_clean < float(calibration['head_clean_similarity_q10'])
-            and median_delta < float(calibration['head_gain_q90'])
-        ):
+            decision_reason = 'head_like_after_cleaning_with_structured_gain'
+        elif median_s_clean < float(calibration['head_clean_similarity_q25']) and not moderate_gain:
             decision = 'clean_tail'
+            decision_reason = 'still_far_from_head_after_cleaning'
+        elif median_s_clean < float(calibration['head_clean_similarity_q10']) and median_delta < float(calibration['head_gain_q75']):
+            decision = 'clean_tail'
+            decision_reason = 'low_reattachment_and_limited_recovery_gain'
         else:
             decision = 'uncertain_tail'
+            decision_reason = 'mixed_or_borderline_group'
 
         rows.append({
             'group_id': int(group_id),
             'group_size': int(len(group_df)),
+            'median_s_raw_cls': median_s_raw_cls,
+            'median_s_raw_patch': median_s_raw_patch,
             'median_s_clean': median_s_clean,
             'median_delta': median_delta,
+            'median_drop_ratio': median_drop_ratio,
             'median_largest_dev_cc_ratio': median_cc,
             'neighbor_consistency': float(neighbor_consistency),
+            'deviation_map_consistency': float(deviation_map_consistency),
+            'head_like': int(head_like),
+            'strong_gain': int(strong_gain),
+            'localized_pattern': int(localized_pattern),
+            'consistent_reattachment': int(consistent_reattachment),
+            'decision_reason': decision_reason,
             'decision': decision,
         })
     return pd.DataFrame(rows, columns=columns)
@@ -243,12 +435,29 @@ def build_final_hrt_selection(details_df: pd.DataFrame, sample_scores_df: pd.Dat
     if len(sample_scores_df) > 0 and sample_scores_df['sample_idx'].duplicated().any():
         raise ValueError('sample_scores_df sample_idx values must be unique')
 
-    decision_columns = ['sample_idx', 'group_id', 'decision']
+    merge_columns = [
+        'sample_idx',
+        'group_id',
+        'group_size',
+        's_raw_cls',
+        's_raw',
+        's_clean',
+        'delta',
+        'drop_ratio',
+        'keep_ratio',
+        'largest_dev_cc_ratio',
+        'clean_head_neighbor_ids',
+        'decision',
+    ]
+    available_columns = [column for column in merge_columns if column in sample_scores_df.columns]
     if len(sample_scores_df) == 0:
-        decision_df = pd.DataFrame(columns=decision_columns)
+        decision_df = pd.DataFrame(columns=available_columns)
     else:
-        decision_df = sample_scores_df[decision_columns].copy()
-    decision_df = decision_df.rename(columns={'decision': 'hrt_decision'})
+        decision_df = sample_scores_df[available_columns].copy()
+    if 'decision' in decision_df.columns:
+        decision_df = decision_df.rename(columns={'decision': 'hrt_decision'})
+    else:
+        decision_df['hrt_decision'] = pd.Series(dtype=object)
 
     final_selection_df = details_df.copy()
     final_selection_df['sample_idx'] = final_selection_df['sample_idx'].astype(int)
@@ -265,7 +474,8 @@ def build_final_hrt_selection(details_df: pd.DataFrame, sample_scores_df: pd.Dat
     candidate_mask = final_selection_df['is_selected_before_hrt'] == 1
     missing_candidate_decision = candidate_mask & final_selection_df['hrt_decision'].isna()
     final_selection_df.loc[missing_candidate_decision, 'hrt_decision'] = 'uncertain_tail'
-    final_selection_df.loc[~candidate_mask, 'hrt_decision'] = 'not_candidate'
+    final_selection_df.loc[~candidate_mask, 'hrt_decision'] = 'reliable_head'
+    final_selection_df['hrt_role'] = final_selection_df['hrt_decision']
 
     noise_mask = candidate_mask & (final_selection_df['hrt_decision'] == 'noise_subcluster')
     final_selection_df['is_selected_after_hrt'] = candidate_mask.astype(int)
@@ -287,62 +497,9 @@ def build_final_hrt_selection(details_df: pd.DataFrame, sample_scores_df: pd.Dat
         'num_selected_after_hrt': int(final_selection_df['is_selected_after_hrt'].sum()),
         'num_removed_by_hrt': int(final_selection_df['hrt_removed'].sum()),
         'num_candidates_defaulted_to_uncertain': int(missing_candidate_decision.sum()),
+        'num_reliable_head_samples': int((final_selection_df['hrt_role'] == 'reliable_head').sum()),
     }
     return final_selection_df, processing_summary
-
-
-def _build_calibration_rows(
-    head_df: pd.DataFrame,
-    head_embeddings_map: Dict[int, np.ndarray],
-    head_patch_bank: Dict[int, Dict],
-    top_m: int,
-    top_k_mean: int,
-    trim_lambda: float,
-    min_keep_ratio: float,
-    max_drop_ratio: float,
-    chunk_size: int,
-):
-    rows = []
-    head_rows = head_df.reset_index(drop=True)
-    sample_indices = head_rows['sample_idx'].astype(int).tolist()
-
-    for sample_idx in sample_indices:
-        candidate_embedding = head_embeddings_map[int(sample_idx)]
-        reference_indices = [int(other_idx) for other_idx in sample_indices if int(other_idx) != int(sample_idx)]
-        if len(reference_indices) == 0:
-            continue
-        reference_embeddings = _normalize_np(np.stack([head_embeddings_map[idx] for idx in reference_indices], axis=0))
-        similarities = reference_embeddings @ _normalize_np(candidate_embedding.reshape(1, -1))[0]
-        order = np.argsort(-similarities)[: min(int(top_m), len(similarities))]
-        selected_reference_indices = [reference_indices[position] for position in order.tolist()]
-        head_memory = torch.cat([head_patch_bank[idx]['patch_tokens'] for idx in selected_reference_indices], dim=0)
-        patch_scores = compute_memory_patch_scores(
-            head_patch_bank[int(sample_idx)]['patch_tokens'],
-            head_memory,
-            chunk_size=int(chunk_size),
-        ).detach().cpu().numpy()
-        keep_mask = _robust_keep_mask(patch_scores, trim_lambda=trim_lambda, min_keep_ratio=min_keep_ratio, max_drop_ratio=max_drop_ratio)
-        removed_mask = ~keep_mask
-        clean_feature = head_patch_bank[int(sample_idx)]['patch_tokens'][torch.as_tensor(keep_mask)].mean(dim=0).numpy()
-        head_reference_features = np.stack([
-            head_patch_bank[idx]['patch_tokens'].mean(dim=0).numpy()
-            for idx in selected_reference_indices
-        ], axis=0)
-        s_raw = _mean_topk_cosine(candidate_embedding, np.stack([head_embeddings_map[idx] for idx in selected_reference_indices], axis=0), top_k_mean)
-        s_clean = _mean_topk_cosine(clean_feature, head_reference_features, top_k_mean)
-        neighbor_scores = _normalize_np(head_reference_features) @ _normalize_np(clean_feature.reshape(1, -1))[0]
-        neighbor_order = np.argsort(-neighbor_scores)[: min(int(top_k_mean), len(neighbor_scores))]
-        clean_neighbors = [int(selected_reference_indices[position]) for position in neighbor_order.tolist()]
-        rows.append({
-            'sample_idx': int(sample_idx),
-            's_raw': float(s_raw),
-            's_clean': float(s_clean),
-            'delta': float(s_clean - s_raw),
-            'drop_ratio': float(removed_mask.mean()),
-            'largest_dev_cc_ratio': float(_largest_component_ratio(removed_mask, head_patch_bank[int(sample_idx)]['spatial_size'])),
-            'clean_head_neighbor_ids': '|'.join(str(value) for value in clean_neighbors),
-        })
-    return pd.DataFrame(rows)
 
 
 @torch.no_grad()
@@ -376,7 +533,7 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
     )
     candidate_groups_df, group_to_sample_indices = _build_group_tables(candidate_df, group_assignments)
 
-    head_references_df, group_head_refs, group_embeddings = _retrieve_head_references(
+    head_references_df, group_head_refs = _retrieve_head_references(
         hrt_embeddings=hrt_embeddings,
         metadata_df=hrt_metadata_df,
         group_to_sample_indices=group_to_sample_indices,
@@ -405,14 +562,25 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
 
     head_embeddings_map = {int(sample_idx): embedding_map[int(sample_idx)] for sample_idx in head_df['sample_idx'].astype(int).tolist()}
     head_patch_bank = {int(sample_idx): patch_bank[int(sample_idx)] for sample_idx in head_df['sample_idx'].astype(int).tolist() if int(sample_idx) in patch_bank}
+    calibration_df, head_feature_cache = _build_head_calibration(
+        head_df=head_df,
+        head_embeddings_map=head_embeddings_map,
+        head_patch_bank=head_patch_bank,
+        top_m=int(getattr(args, 'hrt_head_topm', 20)),
+        top_k_mean=top_k_mean,
+        trim_lambda=trim_lambda,
+        min_keep_ratio=min_keep_ratio,
+        max_drop_ratio=max_drop_ratio,
+        chunk_size=chunk_size,
+    )
 
     for group_id, sample_indices in group_to_sample_indices.items():
         reference_indices = [int(value) for value in group_head_refs[int(group_id)] if int(value) in patch_bank]
         if len(reference_indices) == 0:
             continue
         head_memory = torch.cat([patch_bank[idx]['patch_tokens'] for idx in reference_indices], dim=0)
-        head_reference_features = np.stack([
-            patch_bank[idx]['patch_tokens'].mean(dim=0).numpy()
+        head_reference_clean_features = np.stack([
+            head_feature_cache[idx]['clean_patch_feature'] if idx in head_feature_cache else _patch_feature_mean(patch_bank[idx]['patch_tokens'])
             for idx in reference_indices
         ], axis=0)
         raw_reference_embeddings = np.stack([embedding_map[idx] for idx in reference_indices], axis=0)
@@ -432,10 +600,12 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
                 max_drop_ratio=max_drop_ratio,
             )
             removed_mask = ~keep_mask
-            clean_feature = sample_entry['patch_tokens'][torch.as_tensor(keep_mask)].mean(dim=0).numpy()
-            s_raw = _mean_topk_cosine(embedding_map[sample_idx], raw_reference_embeddings, top_k_mean)
-            s_clean = _mean_topk_cosine(clean_feature, head_reference_features, top_k_mean)
-            clean_neighbor_scores = _normalize_np(head_reference_features) @ _normalize_np(clean_feature.reshape(1, -1))[0]
+            raw_patch_feature = _patch_feature_mean(sample_entry['patch_tokens'])
+            clean_feature = _patch_feature_mean(sample_entry['patch_tokens'], keep_mask=keep_mask)
+            s_raw_cls = _mean_topk_cosine(embedding_map[sample_idx], raw_reference_embeddings, top_k_mean)
+            s_raw_patch = _mean_topk_cosine(raw_patch_feature, head_reference_clean_features, top_k_mean)
+            s_clean = _mean_topk_cosine(clean_feature, head_reference_clean_features, top_k_mean)
+            clean_neighbor_scores = _normalize_np(head_reference_clean_features) @ _normalize_np(clean_feature)[0]
             clean_neighbor_order = np.argsort(-clean_neighbor_scores)[: min(int(top_k_mean), len(clean_neighbor_scores))]
             clean_neighbors = [int(reference_indices[position]) for position in clean_neighbor_order.tolist()]
             deviation_maps[sample_idx] = torch.from_numpy(patch_scores.reshape(sample_entry['spatial_size']).astype(np.float32))
@@ -450,9 +620,10 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
                 'group_size': int(detail_row['group_size']),
                 'pred_class_size': float(detail_row['pred_class_size']),
                 'tail_score': float(detail_row['tail_score']),
-                's_raw': float(s_raw),
+                's_raw_cls': float(s_raw_cls),
+                's_raw': float(s_raw_patch),
                 's_clean': float(s_clean),
-                'delta': float(s_clean - s_raw),
+                'delta': float(s_clean - s_raw_patch),
                 'drop_ratio': float(removed_mask.mean()),
                 'keep_ratio': float(keep_mask.mean()),
                 'largest_dev_cc_ratio': float(_largest_component_ratio(removed_mask, sample_entry['spatial_size'])),
@@ -460,36 +631,8 @@ def run_hrt_postprocess(model, dataloader, device, metadata_df: pd.DataFrame, de
             })
 
     sample_scores_df = pd.DataFrame(sample_rows)
-    calibration_df = _build_calibration_rows(
-        head_df=head_df,
-        head_embeddings_map=head_embeddings_map,
-        head_patch_bank=head_patch_bank,
-        top_m=int(getattr(args, 'hrt_head_topm', 20)),
-        top_k_mean=top_k_mean,
-        trim_lambda=trim_lambda,
-        min_keep_ratio=min_keep_ratio,
-        max_drop_ratio=max_drop_ratio,
-        chunk_size=chunk_size,
-    )
-
-    if len(calibration_df) == 0:
-        calibration = {
-            'head_clean_similarity_q10': float(sample_scores_df['s_clean'].quantile(0.10)) if len(sample_scores_df) > 0 else 0.0,
-            'head_gain_q90': float(sample_scores_df['delta'].quantile(0.90)) if len(sample_scores_df) > 0 else 0.0,
-            'neighbor_consistency_q50': 0.5,
-        }
-    else:
-        calibration_neighbor_consistency = _jaccard_mean([
-            {int(value) for value in str(text).split('|') if str(value).strip()}
-            for text in calibration_df['clean_head_neighbor_ids'].fillna('')
-        ])
-        calibration = {
-            'head_clean_similarity_q10': float(calibration_df['s_clean'].quantile(0.10)),
-            'head_gain_q90': float(calibration_df['delta'].quantile(0.90)),
-            'neighbor_consistency_q50': float(calibration_neighbor_consistency),
-        }
-
-    group_decisions_df = _compute_group_decisions(sample_scores_df, calibration)
+    calibration = _build_calibration_summary(calibration_df, sample_scores_df)
+    group_decisions_df = _compute_group_decisions(sample_scores_df, calibration, deviation_maps)
     sample_scores_df = sample_scores_df.merge(group_decisions_df[['group_id', 'decision']], on='group_id', how='left')
     final_selection_df, processing_summary = build_final_hrt_selection(details_df, sample_scores_df)
 
