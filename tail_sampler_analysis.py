@@ -102,6 +102,23 @@ def _build_noise_proxy(metadata_df: pd.DataFrame) -> np.ndarray:
     return np.array([0 if stem.isnumeric() else 1 for stem in image_stems], dtype=int)
 
 
+def _compute_cutoff_summary(class_sizes_pred: np.ndarray, selected: np.ndarray) -> Dict[str, float]:
+    selected_scores = class_sizes_pred[selected == 1]
+    if selected_scores.size == 0:
+        return {
+            'selected_cutoff_max_pred_class_size': None,
+            'selected_cutoff_min_tail_score': None,
+        }
+    return {
+        'selected_cutoff_max_pred_class_size': float(np.max(selected_scores)),
+        'selected_cutoff_min_tail_score': float(np.min(-selected_scores)),
+    }
+
+
+def _count_pred_class_size_le(class_sizes_pred: np.ndarray, threshold: float) -> int:
+    return int(np.sum(class_sizes_pred <= float(threshold)))
+
+
 def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2:
@@ -127,6 +144,7 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
     tail_score = -class_sizes_pred
     ranking_metrics = compute_ranking_metrics(tail_score, is_gt_tail)
     selection_metrics = compute_selection_metrics(selected, is_gt_tail)
+    cutoff_summary = _compute_cutoff_summary(class_sizes_pred, selected)
 
     is_noise_proxy = _build_noise_proxy(metadata_df)
     selected_noise_proxy_count = int(np.sum(is_noise_proxy[selected == 1]))
@@ -174,6 +192,12 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
         'selected_noise_proxy_count': selected_noise_proxy_count,
         'selected_noise_proxy_rate': float(selected_noise_proxy_rate),
         'selected_gt_tail_noise_proxy_rate': float(selected_gt_tail_noise_proxy_rate),
+        'selected_cutoff_max_pred_class_size': cutoff_summary['selected_cutoff_max_pred_class_size'],
+        'selected_cutoff_min_tail_score': cutoff_summary['selected_cutoff_min_tail_score'],
+        'num_pred_class_size_le_1': _count_pred_class_size_le(class_sizes_pred, 1),
+        'num_pred_class_size_le_5': _count_pred_class_size_le(class_sizes_pred, 5),
+        'num_pred_class_size_le_10': _count_pred_class_size_le(class_sizes_pred, 10),
+        'num_pred_class_size_le_20': _count_pred_class_size_le(class_sizes_pred, 20),
         'mean_pred_class_size': float(class_sizes_pred.mean()) if len(class_sizes_pred) > 0 else None,
         'mean_pred_class_size_tail': float(class_sizes_pred[is_gt_tail == 1].mean()) if np.any(is_gt_tail == 1) else None,
         'mean_pred_class_size_head': float(class_sizes_pred[is_gt_tail == 0].mean()) if np.any(is_gt_tail == 0) else None,

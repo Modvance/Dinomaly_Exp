@@ -37,8 +37,30 @@ def _normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
     return embeddings / norms
 
 
-def extract_image_embeddings(model, dataloader, device, embedding_source="encoder"):
-    if embedding_source != "encoder":
+def _extract_encoder_gap_embeddings(model, images: torch.Tensor) -> np.ndarray:
+    en, _ = model(images)
+    feature_map = en[-1]
+    pooled = F.adaptive_avg_pool2d(feature_map, output_size=1).flatten(1)
+    return pooled.detach().cpu().numpy().astype(np.float32)
+
+
+def _extract_encoder_cls_embeddings(model, images: torch.Tensor) -> np.ndarray:
+    encoder = getattr(model, 'encoder', None)
+    if encoder is None:
+        raise ValueError('model does not expose encoder for cls embedding extraction')
+    if not hasattr(encoder, 'prepare_tokens_with_masks'):
+        raise ValueError('encoder_cls embedding_source requires a DINOv2-style encoder')
+
+    x = encoder.prepare_tokens_with_masks(images)
+    for blk in encoder.blocks:
+        x = blk(x)
+    x = encoder.norm(x)
+    cls_token = x[:, 0]
+    return cls_token.detach().cpu().numpy().astype(np.float32)
+
+
+def extract_image_embeddings(model, dataloader, device, embedding_source='encoder'):
+    if embedding_source not in {'encoder', 'encoder_cls'}:
         raise ValueError(f"unsupported embedding_source: {embedding_source}")
 
     was_training = model.training
@@ -49,19 +71,19 @@ def extract_image_embeddings(model, dataloader, device, embedding_source="encode
     with torch.no_grad():
         for images, _, meta in dataloader:
             images = images.to(device)
-            en, _ = model(images)
-            feature_map = en[-1]
-            pooled = F.adaptive_avg_pool2d(feature_map, output_size=1).flatten(1)
-            pooled = pooled.detach().cpu().numpy().astype(np.float32)
+            if embedding_source == 'encoder':
+                batch_embeddings = _extract_encoder_gap_embeddings(model, images)
+            else:
+                batch_embeddings = _extract_encoder_cls_embeddings(model, images)
 
-            batch_size = pooled.shape[0]
+            batch_size = batch_embeddings.shape[0]
             for index in range(batch_size):
                 row = {}
                 for key, value in meta.items():
                     row[key] = _to_python_scalar(value[index])
                 row['sample_key'] = int(row['sample_idx'])
                 rows.append(row)
-                embedding_list.append(pooled[index])
+                embedding_list.append(batch_embeddings[index])
 
     if was_training:
         model.train()
@@ -74,24 +96,24 @@ def extract_image_embeddings(model, dataloader, device, embedding_source="encode
 def fit_latent_groups(
     embeddings,
     sample_keys,
-    method="kmeans",
+    method='kmeans',
     num_groups=None,
     auto_k=True,
     k_candidates=DEFAULT_K_CANDIDATES,
     pca_dim=64,
     random_state=0,
 ):
-    if method != "kmeans":
+    if method != 'kmeans':
         raise ValueError(f"unsupported grouping method: {method}")
 
     sample_keys = [int(key) for key in sample_keys]
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2:
-        raise ValueError("embeddings must be a 2D array")
+        raise ValueError('embeddings must be a 2D array')
     if embeddings.shape[0] != len(sample_keys):
-        raise ValueError("embeddings and sample_keys length mismatch")
+        raise ValueError('embeddings and sample_keys length mismatch')
     if embeddings.shape[0] == 0:
-        raise ValueError("cannot fit latent groups on empty embeddings")
+        raise ValueError('cannot fit latent groups on empty embeddings')
 
     normalized = _normalize_embeddings(embeddings)
     selected_pca_dim = None

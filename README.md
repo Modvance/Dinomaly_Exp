@@ -205,7 +205,11 @@ python dinomaly_mvtec_one_shot_memory_eval.py --checkpoint_path ../results/test/
 
 TailedCore
 ```bash
-python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-pareto-seed01 --save_dir ../results/tailedcore --save_name dino_pareto --save_sampler_details --gpus 1
-python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/tailedcore --save_name dino_k4 --save_sampler_details --gpus 2
-python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/tailedcore --save_name dino_k1 --save_sampler_details --gpus 3
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-pareto-seed01 --save_dir ../results/tailedcore --save_name dino_pareto_2 --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --tailsampler_dataset_name mvtecad-pareto-seed01 --save_sampler_details --gpus 1
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/tailedcore --save_name dino_k4_2 --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --tailsampler_dataset_name mvtecad-step_k4-seed01 --save_sampler_details --gpus 2
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/tailedcore --save_name dino_k1_2 --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --tailsampler_dataset_name mvtecad-step_k1-seed01 --save_sampler_details --gpus 3
+
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-pareto-seed01 --save_dir ../results/tailedcore --save_name dino_cls_pareto --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --tailsampler_dataset_name mvtecad-pareto-seed01 --tailsampler_embedding_source encoder_cls --save_sampler_details --gpus 1
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/tailedcore --save_name dino_cls_k4 --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --tailsampler_dataset_name mvtecad-step_k4-seed01 --tailsampler_embedding_source encoder_cls --save_sampler_details --gpus 2
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/tailedcore --save_name dino_cls_k1 --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --tailsampler_dataset_name mvtecad-step_k1-seed01 --tailsampler_embedding_source encoder_cls --save_sampler_details --gpus 3
 ```

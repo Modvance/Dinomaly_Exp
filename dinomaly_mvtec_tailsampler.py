@@ -52,7 +52,7 @@ if __name__ == '__main__':
     parser.add_argument('--tailsampler_gt_mode', type=str, default='dataset_rule', choices=['true_class', 'dataset_rule'])
     parser.add_argument('--tailsampler_tail_count_thr', type=int, default=8)
     parser.add_argument('--tailsampler_dataset_name', type=str, default=None)
-    parser.add_argument('--tailsampler_embedding_source', type=str, default='encoder')
+    parser.add_argument('--tailsampler_embedding_source', type=str, default='encoder', choices=['encoder', 'encoder_cls'])
     parser.add_argument('--save_sampler_details', action='store_true')
     args = parser.parse_args()
 
