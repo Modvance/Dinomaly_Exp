@@ -206,6 +206,6 @@ python dinomaly_mvtec_one_shot_memory_eval.py --checkpoint_path ../results/test/
 TailedCore
 ```bash
 python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-pareto-seed01 --save_dir ../results/tailedcore --save_name dino_pareto --save_sampler_details --gpus 1
-python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/tailedcore --save_name dino_k4 --save_sampler_details --gpus 1
-python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/tailedcore --save_name dino_k1 --save_sampler_details --gpus 1
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/tailedcore --save_name dino_k4 --save_sampler_details --gpus 2
+python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/tailedcore --save_name dino_k1 --save_sampler_details --gpus 3
 ```

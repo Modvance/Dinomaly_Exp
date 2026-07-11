@@ -22,34 +22,40 @@ def _safe_binary_metric(metric_fn, y_true, y_score):
     return float(metric_fn(y_true.astype(int), y_score.astype(float)))
 
 
-def build_tail_ground_truth(metadata_df: pd.DataFrame, args) -> Tuple[np.ndarray, np.ndarray, Dict[int, int], int, str]:
+def _normalize_dataset_name(dataset_name: str) -> str:
+    return str(dataset_name or '').lower().replace('_', '').replace('-', '')
+
+
+def build_tail_ground_truth(metadata_df: pd.DataFrame, args) -> Tuple[np.ndarray, np.ndarray, Dict[int, int], int, str, str]:
     metadata_df = metadata_df.copy()
     class_counts = metadata_df.groupby('class_id').size().to_dict()
     gt_class_counts = metadata_df['class_id'].map(class_counts).astype(int).to_numpy()
-    gt_mode = getattr(args, 'tailsampler_gt_mode', 'true_class')
+    gt_mode = getattr(args, 'tailsampler_gt_mode', 'dataset_rule')
 
     if gt_mode == 'true_class':
         threshold = int(getattr(args, 'tailsampler_tail_count_thr', 8))
         is_gt_tail = (gt_class_counts <= threshold).astype(int)
         gt_rule = f'class_count<={threshold}'
-        return gt_class_counts, is_gt_tail, {int(k): int(v) for k, v in class_counts.items()}, threshold, gt_rule
+        return gt_class_counts, is_gt_tail, {int(k): int(v) for k, v in class_counts.items()}, threshold, gt_rule, 'true_class'
 
     if gt_mode == 'dataset_rule':
         dataset_name = str(getattr(args, 'tailsampler_dataset_name', '') or '')
-        dataset_name_lower = dataset_name.lower()
-        if 'step_k1' in dataset_name_lower or 'step-k1' in dataset_name_lower:
+        dataset_name_norm = _normalize_dataset_name(dataset_name)
+        if 'stepk1' in dataset_name_norm:
             threshold = 1
             gt_rule = 'dataset_rule:step_k1'
-        elif 'step_k4' in dataset_name_lower or 'step-k4' in dataset_name_lower:
+            is_gt_tail = (gt_class_counts <= threshold).astype(int)
+        elif 'stepk4' in dataset_name_norm:
             threshold = 4
             gt_rule = 'dataset_rule:step_k4'
-        elif 'pareto' in dataset_name_lower:
+            is_gt_tail = (gt_class_counts <= threshold).astype(int)
+        elif 'pareto' in dataset_name_norm:
             threshold = 19
             gt_rule = 'dataset_rule:pareto(<20)'
+            is_gt_tail = (gt_class_counts < 20).astype(int)
         else:
-            raise ValueError('tailsampler_gt_mode=dataset_rule requires dataset name containing step_k1, step_k4, or pareto')
-        is_gt_tail = (gt_class_counts <= threshold).astype(int) if threshold != 19 else (gt_class_counts < 20).astype(int)
-        return gt_class_counts, is_gt_tail, {int(k): int(v) for k, v in class_counts.items()}, threshold, gt_rule
+            raise ValueError('tailsampler_gt_mode=dataset_rule requires dataset name containing step_k1/stepk1, step_k4/stepk4, or pareto')
+        return gt_class_counts, is_gt_tail, {int(k): int(v) for k, v in class_counts.items()}, threshold, gt_rule, 'paper'
 
     raise ValueError(f'unsupported tailsampler_gt_mode: {gt_mode}')
 
@@ -84,6 +90,18 @@ def compute_ranking_metrics(tail_score: np.ndarray, is_gt_tail: np.ndarray) -> D
     }
 
 
+def _build_noise_proxy(metadata_df: pd.DataFrame) -> np.ndarray:
+    if 'rel_path' in metadata_df.columns:
+        image_names = metadata_df['rel_path'].astype(str).map(os.path.basename)
+    elif 'img_path' in metadata_df.columns:
+        image_names = metadata_df['img_path'].astype(str).map(os.path.basename)
+    else:
+        return np.zeros(len(metadata_df), dtype=int)
+
+    image_stems = image_names.map(lambda value: os.path.splitext(value)[0])
+    return np.array([0 if stem.isnumeric() else 1 for stem in image_stems], dtype=int)
+
+
 def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2:
@@ -92,7 +110,7 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
         raise ValueError('metadata and embeddings size mismatch')
 
     sampler, sampler_name = build_tail_sampler(
-        sampler_type=getattr(args, 'tailsampler_type', 'adaptive_trim_mode'),
+        sampler_type=getattr(args, 'tailsampler_type', 'adaptive'),
         threshold_type=getattr(args, 'tailsampler_th_type', None),
         vote_type=getattr(args, 'tailsampler_vote_type', None),
         percentile=float(getattr(args, 'tailsampler_percentile', 0.15)),
@@ -105,10 +123,20 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
     selected = np.zeros(len(metadata_df), dtype=int)
     selected[tail_indices.detach().cpu().numpy()] = 1
 
-    gt_class_counts, is_gt_tail, class_counts, tail_max_count, gt_rule = build_tail_ground_truth(metadata_df, args)
+    gt_class_counts, is_gt_tail, class_counts, tail_max_count, gt_rule, gt_mode_name = build_tail_ground_truth(metadata_df, args)
     tail_score = -class_sizes_pred
     ranking_metrics = compute_ranking_metrics(tail_score, is_gt_tail)
     selection_metrics = compute_selection_metrics(selected, is_gt_tail)
+
+    is_noise_proxy = _build_noise_proxy(metadata_df)
+    selected_noise_proxy_count = int(np.sum(is_noise_proxy[selected == 1]))
+    num_selected = int(selected.sum())
+    selected_noise_proxy_rate = selected_noise_proxy_count / num_selected if num_selected > 0 else 0.0
+    selected_gt_tail_noise_proxy_rate = (
+        float(np.mean(is_noise_proxy[(selected == 1) & (is_gt_tail == 1)]))
+        if np.any((selected == 1) & (is_gt_tail == 1))
+        else 0.0
+    )
 
     details_df = metadata_df.copy()
     details_df['gt_class_count'] = gt_class_counts.astype(int)
@@ -116,22 +144,23 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
     details_df['pred_class_size'] = class_sizes_pred.astype(float)
     details_df['tail_score'] = tail_score.astype(float)
     details_df['is_selected'] = selected.astype(int)
+    details_df['is_noise_proxy'] = is_noise_proxy.astype(int)
 
     summary_row = {
         'run_name': getattr(args, 'save_name', 'tailsampler_run'),
         'dataset_name': getattr(args, 'tailsampler_dataset_name', os.path.basename(str(getattr(args, 'data_path', '')))),
         'sampler_name': sampler_name,
-        'tailsampler_type': getattr(args, 'tailsampler_type', 'adaptive_trim_mode'),
+        'tailsampler_type': getattr(args, 'tailsampler_type', 'adaptive'),
         'tail_th_type': getattr(args, 'tailsampler_th_type', None),
         'vote_type': getattr(args, 'tailsampler_vote_type', None),
         'embedding_source': getattr(args, 'tailsampler_embedding_source', 'encoder'),
         'num_samples': int(len(details_df)),
         'num_classes': int(len(class_counts)),
-        'gt_mode': getattr(args, 'tailsampler_gt_mode', 'true_class'),
+        'gt_mode': gt_mode_name,
         'gt_rule': gt_rule,
         'tail_max_count': int(tail_max_count),
         'num_gt_tail_samples': int(is_gt_tail.sum()),
-        'num_selected': int(selected.sum()),
+        'num_selected': num_selected,
         'selection_precision': float(selection_metrics['precision']),
         'selection_recall': float(selection_metrics['recall']),
         'selection_f1': float(selection_metrics['f1']),
@@ -142,9 +171,12 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
         'selected_ratio': float(selection_metrics['selected_ratio']),
         'tail_auroc': float(ranking_metrics['auroc']) if not np.isnan(ranking_metrics['auroc']) else None,
         'tail_auprc': float(ranking_metrics['auprc']) if not np.isnan(ranking_metrics['auprc']) else None,
-        'mean_pred_class_size': float(np.mean(class_sizes_pred)) if len(class_sizes_pred) > 0 else None,
-        'mean_pred_class_size_tail': float(np.mean(class_sizes_pred[is_gt_tail == 1])) if np.any(is_gt_tail == 1) else None,
-        'mean_pred_class_size_head': float(np.mean(class_sizes_pred[is_gt_tail == 0])) if np.any(is_gt_tail == 0) else None,
+        'selected_noise_proxy_count': selected_noise_proxy_count,
+        'selected_noise_proxy_rate': float(selected_noise_proxy_rate),
+        'selected_gt_tail_noise_proxy_rate': float(selected_gt_tail_noise_proxy_rate),
+        'mean_pred_class_size': float(class_sizes_pred.mean()) if len(class_sizes_pred) > 0 else None,
+        'mean_pred_class_size_tail': float(class_sizes_pred[is_gt_tail == 1].mean()) if np.any(is_gt_tail == 1) else None,
+        'mean_pred_class_size_head': float(class_sizes_pred[is_gt_tail == 0].mean()) if np.any(is_gt_tail == 0) else None,
     }
 
     return summary_row, details_df
