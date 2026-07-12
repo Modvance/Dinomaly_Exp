@@ -524,7 +524,8 @@ if __name__ == '__main__':
     parser.add_argument('--gbps_min_checks_before_trigger', type=int, default=2)
     parser.add_argument('--gbps_min_checks_after_best', type=int, default=1)
 
-    parser.add_argument('--tg_enable_global_group_risk', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--tg_enable_global_group_risk', dest='tg_enable_global_group_risk', action='store_true', default=True)
+    parser.add_argument('--no-tg_enable_global_group_risk', dest='tg_enable_global_group_risk', action='store_false')
     parser.add_argument('--tg_global_tau_bic', type=float, default=0.0)
     parser.add_argument('--tg_global_tau_sep', type=float, default=0.5)
     parser.add_argument('--tg_global_tau_conf', type=float, default=0.1)
@@ -533,7 +534,8 @@ if __name__ == '__main__':
     parser.add_argument('--tg_risk_lookback_checks', type=int, default=3)
     parser.add_argument('--tg_tail_risk_remove_thr', type=float, default=0.5)
 
-    parser.add_argument('--tg_memory_enable', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--tg_memory_enable', dest='tg_memory_enable', action='store_true', default=True)
+    parser.add_argument('--no-tg_memory_enable', dest='tg_memory_enable', action='store_false')
     parser.add_argument('--tg_memory_artifact_dir', type=str, default='tail_group_memory')
     parser.add_argument('--tg_mem_min_support_images', type=int, default=1)
     parser.add_argument('--tg_mem_gate_quantile', type=float, default=0.9)
