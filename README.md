@@ -217,9 +217,49 @@ python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-pareto-
 python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --save_dir ../results/tailedcore --save_name dino_cls_hrt_k4_1 --tailsampler_embedding_source encoder_cls --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --save_sampler_details --enable_hrt --hrt_embedding_source encoder_cls --hrt_group_k 7 --hrt_head_topm 20 --hrt_head_topk_mean 5 --hrt_trim_lambda 2.5 --hrt_min_keep_ratio 0.70 --hrt_max_drop_ratio 0.30 --hrt_save_patch_maps --gpus 2
 python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --save_dir ../results/tailedcore --save_name dino_cls_hrt_k1_1 --tailsampler_embedding_source encoder_cls --tailsampler_type adaptive_trim_mode --tailsampler_gt_mode dataset_rule --save_sampler_details --enable_hrt --hrt_embedding_source encoder_cls --hrt_group_k 7 --hrt_head_topm 20 --hrt_head_topk_mean 5 --hrt_trim_lambda 2.5 --hrt_min_keep_ratio 0.70 --hrt_max_drop_ratio 0.30 --hrt_save_patch_maps --gpus 3
 ```
+
 tailguard
 ```bash
 python dinomaly_mvtec_tailguard.py --data_path ../LTN_datasets/mvtecad-pareto-seed01 --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed01/inject_defects.txt --save_dir ../results/tailguard --save_name tailguard_pareto --tailsampler_type adaptive_trim_mode --tg_tail_embedding_source encoder_cls --gbps_auto_k --gbps_k_candidates 8,10,12,15,20 --gbps_embedding_source encoder --gbps_postprocess_mode remove --tg_memory_enable --gpus 1
 python dinomaly_mvtec_tailguard.py --data_path ../LTN_datasets/mvtecad-step_k4-seed01 --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt --save_dir ../results/tailguard --save_name tailguard_k4 --tailsampler_type adaptive_trim_mode --tg_tail_embedding_source encoder_cls --gbps_auto_k --gbps_k_candidates 8,10,12,15,20 --gbps_embedding_source encoder --gbps_postprocess_mode remove --tg_memory_enable --gpus 2
 python dinomaly_mvtec_tailguard.py --data_path ../LTN_datasets/mvtecad-step_k1-seed01 --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed01/inject_defects.txt --save_dir ../results/tailguard --save_name tailguard_k1 --tailsampler_type adaptive_trim_mode --tg_tail_embedding_source encoder_cls --gbps_auto_k --gbps_k_candidates 8,10,12,15,20 --gbps_embedding_source encoder --gbps_postprocess_mode remove --tg_memory_enable --gpus 3
+
+python dinomaly_mvtec_tailguard_b.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b \
+  --save_name pareto \
+  --tailsampler_type adaptive_trim_mode \
+  --tgb_tail_embedding_source encoder_cls \
+  --gbps_auto_k \
+  --tgb_group_embedding_source encoder \
+  --gbps_postprocess_mode remove \
+  --tgb_memory_enable \
+  --gpus 4
+
+python dinomaly_mvtec_tailguard_b.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b \
+  --save_name k4 \
+  --tailsampler_type adaptive_trim_mode \
+  --tgb_tail_embedding_source encoder_cls \
+  --gbps_auto_k \
+  --tgb_group_embedding_source encoder \
+  --gbps_postprocess_mode remove \
+  --tgb_memory_enable \
+  --gpus 5
+
+python dinomaly_mvtec_tailguard_b.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b \
+  --save_name k1 \
+  --tailsampler_type adaptive_trim_mode \
+  --tgb_tail_embedding_source encoder_cls \
+  --gbps_auto_k \
+  --tgb_group_embedding_source encoder \
+  --gbps_postprocess_mode remove \
+  --tgb_memory_enable \
+  --gpus 6
 ```
