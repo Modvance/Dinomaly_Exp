@@ -158,6 +158,14 @@ def train(item_list):
         prepare_result['summary']['num_tail_candidates'],
         prepare_result['summary']['num_groups'],
     ))
+    analysis_summary = prepare_result['summary'].get('tail_sampler_analysis_only_summary')
+    if analysis_summary is not None:
+        print_fn('tail sampler analysis-only: precision={:.4f}, recall={:.4f}, f1={:.4f}, noisy_proxy_rate={:.4f}'.format(
+            float(analysis_summary['selection_precision']),
+            float(analysis_summary['selection_recall']),
+            float(analysis_summary['selection_f1']),
+            float(analysis_summary['selected_noise_proxy_rate']),
+        ))
     print_fn('train image number:{}'.format(len(train_data)))
 
     gbps_best_U = None
@@ -395,6 +403,7 @@ def train(item_list):
             'tg_mem_min_support_images': int(args.tg_mem_min_support_images),
             'tg_mem_gate_quantile': float(args.tg_mem_gate_quantile),
             'tg_mem_gate_mad_scale': float(args.tg_mem_gate_mad_scale),
+            'tg_mem_min_gate_angle': float(args.tg_mem_min_gate_angle),
             'tg_mem_fusion_lambda': float(args.tg_mem_fusion_lambda),
             'tg_mem_topk_ratio': float(args.tg_mem_topk_ratio),
         }
@@ -495,8 +504,15 @@ if __name__ == '__main__':
     parser.add_argument('--tailsampler_vote_type', type=str, default=None)
     parser.add_argument('--tailsampler_percentile', type=float, default=0.15)
     parser.add_argument('--tailsampler_embedding_source', type=str, default='encoder', choices=['encoder', 'encoder_cls'])
+    parser.add_argument('--tailsampler_gt_mode', type=str, default='dataset_rule', choices=['true_class', 'dataset_rule'])
+    parser.add_argument('--tailsampler_tail_count_thr', type=int, default=8)
+    parser.add_argument('--tailsampler_dataset_name', type=str, default=None)
     parser.add_argument('--tg_tail_embedding_source', type=str, default='encoder_cls', choices=['encoder', 'encoder_cls'])
     parser.add_argument('--tg_save_cls_embeddings', action='store_true')
+    parser.add_argument('--tg_save_tailsampler_analysis', dest='tg_save_tailsampler_analysis', action='store_true', default=True)
+    parser.add_argument('--no-tg_save_tailsampler_analysis', dest='tg_save_tailsampler_analysis', action='store_false')
+    parser.add_argument('--tg_save_tailsampler_analysis_details', dest='tg_save_tailsampler_analysis_details', action='store_true', default=True)
+    parser.add_argument('--no-tg_save_tailsampler_analysis_details', dest='tg_save_tailsampler_analysis_details', action='store_false')
 
     parser.add_argument('--gbps_check_start_ratio', type=float, default=0.01)
     parser.add_argument('--gbps_check_end_ratio', type=float, default=0.15)
@@ -540,6 +556,7 @@ if __name__ == '__main__':
     parser.add_argument('--tg_mem_min_support_images', type=int, default=1)
     parser.add_argument('--tg_mem_gate_quantile', type=float, default=0.9)
     parser.add_argument('--tg_mem_gate_mad_scale', type=float, default=1.0)
+    parser.add_argument('--tg_mem_min_gate_angle', type=float, default=5.0)
     parser.add_argument('--tg_mem_fusion_lambda', type=float, default=1.0)
     parser.add_argument('--tg_mem_topk_ratio', type=float, default=0.05)
     parser.add_argument('--tg_mem_chunk_size', type=int, default=4096)

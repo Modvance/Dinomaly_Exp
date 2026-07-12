@@ -38,15 +38,15 @@ def _angles_from_centroid(vectors: torch.Tensor, centroid: torch.Tensor) -> torc
     return torch.rad2deg(torch.acos(similarity))
 
 
-def _compute_adaptive_angle(support_cls: torch.Tensor, quantile: float, mad_scale: float) -> float:
+def _compute_adaptive_angle(support_cls: torch.Tensor, quantile: float, mad_scale: float, min_gate_angle: float) -> float:
     centroid = _normalize_rows(support_cls.mean(dim=0, keepdim=True))[0]
     if support_cls.shape[0] == 1:
-        return 0.0
+        return float(min_gate_angle)
     angles = _angles_from_centroid(support_cls, centroid)
     base = torch.quantile(angles, q=float(quantile)).item()
     median = torch.median(angles).item()
     mad = torch.median(torch.abs(angles - median)).item()
-    return float(base + float(mad_scale) * mad)
+    return float(max(base + float(mad_scale) * mad, float(min_gate_angle)))
 
 
 @torch.no_grad()
@@ -109,6 +109,7 @@ def build_tail_group_memory_bank(model,
     max_patches_per_group = int(getattr(args, 'mem_max_patches_per_class', 20000))
     gate_quantile = float(getattr(args, 'tg_mem_gate_quantile', 0.9))
     gate_mad_scale = float(getattr(args, 'tg_mem_gate_mad_scale', 1.0))
+    min_gate_angle = float(getattr(args, 'tg_mem_min_gate_angle', 5.0))
 
     for group_id, entry in bank.items():
         if int(entry['num_images']) < min_support_images:
@@ -119,7 +120,12 @@ def build_tail_group_memory_bank(model,
             features = features.index_select(0, keep_indices)
         support_cls = torch.stack(entry['support_cls'], dim=0)
         centroid = _normalize_rows(support_cls.mean(dim=0, keepdim=True))[0]
-        adaptive_angle = _compute_adaptive_angle(support_cls, quantile=gate_quantile, mad_scale=gate_mad_scale)
+        adaptive_angle = _compute_adaptive_angle(
+            support_cls,
+            quantile=gate_quantile,
+            mad_scale=gate_mad_scale,
+            min_gate_angle=min_gate_angle,
+        )
         final_bank[group_id] = {
             'group_id': int(group_id),
             'features': features.contiguous().cpu(),

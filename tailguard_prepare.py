@@ -8,6 +8,7 @@ import torch
 
 from feature_grouping import extract_image_embeddings, fit_latent_groups
 from tail_sampler import build_tail_sampler
+from tail_sampler_analysis import run_tail_sampler_analysis, save_tail_sampler_artifacts
 from tailguard_artifacts import save_tailguard_prepare_artifacts
 
 
@@ -174,6 +175,28 @@ def prepare_tailguard_training_metadata(model,
         'embedding_source': 'encoder_cls',
     }
 
+    analysis_saved = None
+    analysis_summary = None
+    if bool(getattr(args, 'tg_save_tailsampler_analysis', True)):
+        if getattr(args, 'tailsampler_dataset_name', None) is None:
+            setattr(args, 'tailsampler_dataset_name', os.path.basename(os.path.normpath(str(getattr(args, 'data_path', '')))))
+        analysis_summary, analysis_details_df = run_tail_sampler_analysis(tail_embeddings, full_metadata_df, args)
+        if output_dir is not None:
+            analysis_output_dir = os.path.join(output_dir, 'tail_sampler_analysis_only')
+            analysis_saved = save_tail_sampler_artifacts(
+                analysis_output_dir,
+                analysis_summary,
+                analysis_details_df,
+                metadata={
+                    'analysis_only': True,
+                    'not_used_by_tailguard_decision_logic': True,
+                    'tail_embedding_source': tail_embedding_source,
+                    'gt_mode': getattr(args, 'tailsampler_gt_mode', 'dataset_rule'),
+                    'dataset_name': getattr(args, 'tailsampler_dataset_name', None),
+                },
+                save_details=bool(getattr(args, 'tg_save_tailsampler_analysis_details', True)),
+            )
+
     prepare_summary = {
         'num_samples': int(len(train_metadata_df)),
         'num_tail_candidates': int(train_metadata_df['tail_candidate'].sum()),
@@ -184,6 +207,8 @@ def prepare_tailguard_training_metadata(model,
         'tail_embedding_source': tail_embedding_source,
         'group_embedding_source': group_embedding_source,
         'group_info': group_info,
+        'tail_sampler_analysis_only_summary': analysis_summary,
+        'tail_sampler_analysis_only_artifacts': analysis_saved,
     }
 
     saved = None
