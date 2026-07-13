@@ -18,8 +18,11 @@ def _iter_number_from_name(name: str):
     return int(match.group(1))
 
 
-def _build_retained_index_map(samples_df: pd.DataFrame):
+def _build_retained_index_map(samples_df: pd.DataFrame, all_samples_df: Optional[pd.DataFrame] = None):
     retained_index_map = {}
+    if all_samples_df is not None and 'class_id' in all_samples_df.columns:
+        for class_id in sorted(all_samples_df['class_id'].astype(int).unique().tolist()):
+            retained_index_map[int(class_id)] = []
     if len(samples_df) == 0:
         return retained_index_map
     for class_id, class_df in samples_df.groupby('class_id', sort=True):
@@ -67,8 +70,9 @@ def run_tailguard_b_gbps_iteration(scored_df: pd.DataFrame,
     if len(h_scores_df) == 0:
         raise ValueError('TailGuard-B GBPS requires non-empty H scores')
 
+    h_scores_for_gbps_df = h_scores_df.drop(columns=['group_id', 'group_size'], errors='ignore')
     gbps_result = compute_gbps_u_with_bootstrap(
-        h_scores_df.copy(),
+        h_scores_for_gbps_df.copy(),
         head_group_assignments_df.copy(),
         B=int(getattr(args, 'gbps_bootstrap_B', 20)),
         args=args,
@@ -312,9 +316,11 @@ def build_tailguard_b_stage2_plan(h_clean_df: pd.DataFrame,
         'num_tail_head_normal': int(len(tail_head_normal_df)),
         'num_tail_head_noise': int(len(tail_head_noise_df)),
     }
+    all_frames = [frame for frame in [retained_df, removed_df] if frame is not None and len(frame) > 0]
+    all_samples_df = pd.concat(all_frames, ignore_index=True, sort=False) if len(all_frames) > 0 else None
     return {
         'retained_samples': retained_df,
         'removed_samples': removed_df,
-        'retained_index_map': _build_retained_index_map(retained_df),
+        'retained_index_map': _build_retained_index_map(retained_df, all_samples_df=all_samples_df),
         'summary': summary,
     }

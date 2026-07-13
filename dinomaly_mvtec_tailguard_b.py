@@ -65,8 +65,11 @@ MVTec_ITEM_LIST = [
 ]
 
 
-def _build_retained_index_map(samples_df: pd.DataFrame):
+def _build_retained_index_map(samples_df: pd.DataFrame, num_classes=None):
     retained_index_map = {}
+    if num_classes is not None:
+        for class_id in range(int(num_classes)):
+            retained_index_map[int(class_id)] = []
     for class_id, class_df in samples_df.groupby('class_id', sort=True):
         retained_index_map[int(class_id)] = [int(value) for value in class_df['base_idx'].astype(int).tolist()]
     return retained_index_map
@@ -189,7 +192,7 @@ def train(item_list):
 
     full_metadata_df = prepare_result['full_metadata_df'].copy()
     h_metadata_df = full_metadata_df.loc[full_metadata_df['tail_candidate'].astype(int) == 0].copy().reset_index(drop=True)
-    h_index_map = _build_retained_index_map(h_metadata_df)
+    h_index_map = _build_retained_index_map(h_metadata_df, num_classes=len(base_train_data_list))
     stage1_loaders = rebuild_pruned_train_loaders(
         base_train_data_list,
         h_index_map,
