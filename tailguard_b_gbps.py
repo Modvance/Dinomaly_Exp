@@ -135,9 +135,17 @@ def load_tailguard_b_selected_checkpoint(path: str, model, optimizer=None, sched
     if restore_rng and checkpoint.get('rng_state') is not None:
         rng_state = checkpoint['rng_state']
         if rng_state.get('torch') is not None:
-            torch.set_rng_state(rng_state['torch'])
+            torch_state = rng_state['torch']
+            if torch.is_tensor(torch_state):
+                torch_state = torch_state.detach().cpu().byte()
+            torch.set_rng_state(torch_state)
         if torch.cuda.is_available() and rng_state.get('cuda') is not None:
-            torch.cuda.set_rng_state_all(rng_state['cuda'])
+            cuda_states = []
+            for cuda_state in rng_state['cuda']:
+                if torch.is_tensor(cuda_state):
+                    cuda_state = cuda_state.detach().cpu().byte()
+                cuda_states.append(cuda_state)
+            torch.cuda.set_rng_state_all(cuda_states)
         if rng_state.get('numpy') is not None:
             np.random.set_state(rng_state['numpy'])
         if rng_state.get('python') is not None:
