@@ -8,7 +8,6 @@ import pandas as pd
 import torch
 
 from gbps_runner_utils import build_gbps_hard_delete_plan
-from safe_gbps import compute_gbps_u_with_bootstrap
 
 
 def _iter_number_from_name(name: str):
@@ -71,6 +70,7 @@ def run_tailguard_b_gbps_iteration(scored_df: pd.DataFrame,
         raise ValueError('TailGuard-B GBPS requires non-empty H scores')
 
     h_scores_for_gbps_df = h_scores_df.drop(columns=['group_id', 'group_size'], errors='ignore')
+    from safe_gbps import compute_gbps_u_with_bootstrap
     gbps_result = compute_gbps_u_with_bootstrap(
         h_scores_for_gbps_df.copy(),
         head_group_assignments_df.copy(),
@@ -126,7 +126,10 @@ def save_tailguard_b_selected_checkpoint(path: str,
 
 
 def load_tailguard_b_selected_checkpoint(path: str, model, optimizer=None, scheduler=None, map_location=None, restore_rng: bool = True):
-    checkpoint = torch.load(path, map_location=map_location)
+    try:
+        checkpoint = torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=map_location)
     model.load_state_dict(checkpoint['model_state_dict'])
     if optimizer is not None and checkpoint.get('optimizer_state_dict') is not None:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -240,6 +243,19 @@ def classify_tail_attached_stable_risk(tail_attached_df: pd.DataFrame,
     window_iters = _list_window_iters(gbps_dir, int(selected_iter), int(getattr(args, 'tgb_stable_window', 3)))
     p_high_thr = float(getattr(args, 'tgb_t_attached_noise_p_high_thr', 0.5))
     min_valid = int(getattr(args, 'tgb_stable_min_observations', 1))
+    window_data = {}
+    for iter_number in window_iters:
+        iter_dir = os.path.join(gbps_dir, 'iter_{:05d}'.format(int(iter_number)))
+        score_path = os.path.join(iter_dir, 'train_scores.csv')
+        metrics_path = os.path.join(iter_dir, 'h_group_metrics.csv')
+        if not os.path.isfile(score_path) or not os.path.isfile(metrics_path):
+            continue
+        train_scores_df = pd.read_csv(score_path, usecols=['sample_idx', 'image_score'])
+        group_metrics_df = pd.read_csv(metrics_path)
+        window_data[int(iter_number)] = (
+            train_scores_df.set_index('sample_idx')['image_score'],
+            group_metrics_df.set_index('group_id', drop=False),
+        )
     rows = []
 
     for _, row in attached_df.iterrows():
@@ -249,20 +265,13 @@ def classify_tail_attached_stable_risk(tail_attached_df: pd.DataFrame,
         active_values = []
         source_iters = []
         selected_active = False
-        for iter_number in window_iters:
-            iter_dir = os.path.join(gbps_dir, 'iter_{:05d}'.format(int(iter_number)))
-            score_path = os.path.join(iter_dir, 'train_scores.csv')
-            metrics_path = os.path.join(iter_dir, 'h_group_metrics.csv')
-            if not os.path.isfile(score_path) or not os.path.isfile(metrics_path):
+        for iter_number, (image_scores_by_sample, group_metrics_by_group) in window_data.items():
+            if sample_idx not in image_scores_by_sample.index or best_group_id not in group_metrics_by_group.index:
                 continue
-            train_scores_df = pd.read_csv(score_path)
-            group_metrics_df = pd.read_csv(metrics_path)
-            score_rows = train_scores_df.loc[train_scores_df['sample_idx'].astype(int) == sample_idx]
-            metric_rows = group_metrics_df.loc[group_metrics_df['group_id'].astype(int) == best_group_id]
-            if len(score_rows) == 0 or len(metric_rows) == 0:
-                continue
-            metric_row = metric_rows.iloc[0]
-            p_high = _posterior_high_from_metrics(float(score_rows.iloc[0]['image_score']), metric_row)
+            metric_row = group_metrics_by_group.loc[best_group_id]
+            if isinstance(metric_row, pd.DataFrame):
+                metric_row = metric_row.iloc[0]
+            p_high = _posterior_high_from_metrics(float(image_scores_by_sample.loc[sample_idx]), metric_row)
             if p_high is None:
                 continue
             is_active = bool(metric_row.get('is_active_group', False))
@@ -306,7 +315,8 @@ def build_tailguard_b_stage2_plan(h_clean_df: pd.DataFrame,
                                   h_removed_df: pd.DataFrame,
                                   tail_open_df: pd.DataFrame,
                                   tail_head_normal_df: pd.DataFrame,
-                                  tail_head_noise_df: pd.DataFrame):
+                                  tail_head_noise_df: pd.DataFrame,
+                                  all_samples_df: Optional[pd.DataFrame] = None):
     retained_frames = [frame for frame in [h_clean_df, tail_head_normal_df, tail_open_df] if frame is not None and len(frame) > 0]
     removed_frames = [frame for frame in [h_removed_df, tail_head_noise_df] if frame is not None and len(frame) > 0]
     retained_df = pd.concat(retained_frames, ignore_index=True, sort=False) if len(retained_frames) > 0 else pd.DataFrame()
@@ -324,8 +334,9 @@ def build_tailguard_b_stage2_plan(h_clean_df: pd.DataFrame,
         'num_tail_head_normal': int(len(tail_head_normal_df)),
         'num_tail_head_noise': int(len(tail_head_noise_df)),
     }
-    all_frames = [frame for frame in [retained_df, removed_df] if frame is not None and len(frame) > 0]
-    all_samples_df = pd.concat(all_frames, ignore_index=True, sort=False) if len(all_frames) > 0 else None
+    if all_samples_df is None:
+        all_frames = [frame for frame in [retained_df, removed_df] if frame is not None and len(frame) > 0]
+        all_samples_df = pd.concat(all_frames, ignore_index=True, sort=False) if len(all_frames) > 0 else None
     return {
         'retained_samples': retained_df,
         'removed_samples': removed_df,

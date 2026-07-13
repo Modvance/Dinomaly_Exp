@@ -246,23 +246,31 @@ def prepare_tailguard_b_metadata(model,
     analysis_summary = None
     analysis_saved = None
     if bool(getattr(args, 'tgb_save_tailsampler_analysis', True)):
-        if getattr(args, 'tailsampler_dataset_name', None) is None:
-            setattr(args, 'tailsampler_dataset_name', os.path.basename(os.path.normpath(str(getattr(args, 'data_path', '')))))
-        analysis_summary, analysis_details_df = run_tail_sampler_analysis(tail_embeddings, full_metadata_df, args)
-        if output_dir is not None:
-            analysis_saved = save_tail_sampler_artifacts(
-                os.path.join(output_dir, 'tail_sampler_analysis_only'),
-                analysis_summary,
-                analysis_details_df,
-                metadata={
-                    'analysis_only': True,
-                    'not_used_by_tailguard_b_decision_logic': True,
-                    'tail_embedding_source': tail_embedding_source,
-                    'gt_mode': getattr(args, 'tailsampler_gt_mode', 'dataset_rule'),
-                    'dataset_name': getattr(args, 'tailsampler_dataset_name', None),
-                },
-                save_details=bool(getattr(args, 'tgb_save_tailsampler_analysis_details', True)),
-            )
+        try:
+            if getattr(args, 'tailsampler_dataset_name', None) is None:
+                setattr(args, 'tailsampler_dataset_name', os.path.basename(os.path.normpath(str(getattr(args, 'data_path', '')))))
+            analysis_summary, analysis_details_df = run_tail_sampler_analysis(tail_embeddings, full_metadata_df, args)
+            if output_dir is not None:
+                analysis_saved = save_tail_sampler_artifacts(
+                    os.path.join(output_dir, 'tail_sampler_analysis_only'),
+                    analysis_summary,
+                    analysis_details_df,
+                    metadata={
+                        'analysis_only': True,
+                        'not_used_by_tailguard_b_decision_logic': True,
+                        'tail_embedding_source': tail_embedding_source,
+                        'gt_mode': getattr(args, 'tailsampler_gt_mode', 'dataset_rule'),
+                        'dataset_name': getattr(args, 'tailsampler_dataset_name', None),
+                    },
+                    save_details=bool(getattr(args, 'tgb_save_tailsampler_analysis_details', True)),
+                )
+        except Exception as exc:
+            analysis_summary = {
+                'status': 'analysis_failed',
+                'error': str(exc),
+                'analysis_only': True,
+                'not_used_by_tailguard_b_decision_logic': True,
+            }
 
     prepare_summary = {
         'num_samples': int(len(train_metadata_df)),

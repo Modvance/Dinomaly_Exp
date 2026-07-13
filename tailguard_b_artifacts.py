@@ -18,10 +18,10 @@ def _make_json_safe(value):
         if np.isnan(value) or np.isinf(value):
             return None
         return float(value)
-    if isinstance(value, (np.integer, int)):
-        return int(value)
     if isinstance(value, (np.bool_, bool)):
         return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
     return value
 
 
@@ -30,13 +30,6 @@ def _write_json(path: str, payload: Dict):
     with open(path, 'w', encoding='utf-8') as file:
         json.dump(_make_json_safe(payload), file, indent=2, ensure_ascii=False)
 
-
-def _write_df(path: str, df: Optional[pd.DataFrame]):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if df is None:
-        pd.DataFrame().to_csv(path, index=False)
-    else:
-        df.to_csv(path, index=False)
 
 
 def save_tailguard_b_prepare_artifacts(output_dir: str,
@@ -112,15 +105,24 @@ def save_tailguard_b_trigger_summary(output_dir: str, summary: Dict):
     return path
 
 
+def save_tailguard_b_attachment_replay_config(output_dir: str, config: Dict):
+    path = os.path.join(output_dir, 'attachment_replay_config.json')
+    _write_json(path, config)
+    return path
+
+
 def save_tailguard_b_attachment_artifacts(output_dir: str,
                                           geometry: Dict,
                                           conformity_df: pd.DataFrame,
-                                          attachment_scores_df: pd.DataFrame,
+                                          attachment_scores_df: Optional[pd.DataFrame],
                                           elbow_summary: Dict,
                                           tail_open_df: pd.DataFrame,
                                           tail_attached_df: pd.DataFrame,
                                           tail_head_normal_df: pd.DataFrame,
-                                          tail_head_noise_df: pd.DataFrame):
+                                          tail_head_noise_df: pd.DataFrame,
+                                          membership_scores_df: Optional[pd.DataFrame] = None,
+                                          membership_calibration_df: Optional[pd.DataFrame] = None,
+                                          membership_summary: Optional[Dict] = None):
     os.makedirs(output_dir, exist_ok=True)
     geometry_path = os.path.join(output_dir, 'clean_head_group_geometry.pt')
     conformity_path = os.path.join(output_dir, 'tail_group_conformity.csv')
@@ -130,15 +132,33 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
     tail_attached_path = os.path.join(output_dir, 'tail_attached_samples.csv')
     tail_head_normal_path = os.path.join(output_dir, 'tail_head_normal_samples.csv')
     tail_head_noise_path = os.path.join(output_dir, 'tail_head_noise_samples.csv')
+    membership_scores_path = os.path.join(output_dir, 'tail_group_membership_scores.csv')
+    membership_calibration_path = os.path.join(output_dir, 'head_group_membership_calibration.csv')
+    membership_summary_path = os.path.join(output_dir, 'attachment_membership_summary.json')
 
     torch.save(geometry, geometry_path)
     conformity_df.to_csv(conformity_path, index=False)
-    attachment_scores_df.to_csv(attachment_scores_path, index=False)
+    if attachment_scores_df is not None:
+        attachment_scores_df.to_csv(attachment_scores_path, index=False)
+    else:
+        attachment_scores_path = None
     tail_open_df.to_csv(tail_open_path, index=False)
     tail_attached_df.to_csv(tail_attached_path, index=False)
     tail_head_normal_df.to_csv(tail_head_normal_path, index=False)
     tail_head_noise_df.to_csv(tail_head_noise_path, index=False)
     _write_json(elbow_summary_path, elbow_summary)
+    if membership_scores_df is not None:
+        membership_scores_df.to_csv(membership_scores_path, index=False)
+    else:
+        membership_scores_path = None
+    if membership_calibration_df is not None:
+        membership_calibration_df.to_csv(membership_calibration_path, index=False)
+    else:
+        membership_calibration_path = None
+    if membership_summary is not None:
+        _write_json(membership_summary_path, membership_summary)
+    else:
+        membership_summary_path = None
     return {
         'clean_head_group_geometry_pt': geometry_path,
         'tail_group_conformity_csv': conformity_path,
@@ -148,6 +168,9 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
         'tail_attached_samples_csv': tail_attached_path,
         'tail_head_normal_samples_csv': tail_head_normal_path,
         'tail_head_noise_samples_csv': tail_head_noise_path,
+        'tail_group_membership_scores_csv': membership_scores_path,
+        'head_group_membership_calibration_csv': membership_calibration_path,
+        'attachment_membership_summary_json': membership_summary_path,
     }
 
 

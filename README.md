@@ -262,4 +262,7 @@ python dinomaly_mvtec_tailguard_b.py \
   --gbps_postprocess_mode remove \
   --tgb_memory_enable \
   --gpus 6
+
+python dinomaly_mvtec_tailguard_b_attachment_replay.py --source_tailguard_b_dir /home/linux/projects/results/tailguard_b/k4/ tailguard_b --output_dir /home/linux/projects/results/tailguard_b/k4/attachment_h_calibrated_v2 --tgb_attachment_membership_mode h_calibrated
+python dinomaly_mvtec_tailguard_b_attachment_replay.py --source_tailguard_b_dir /home/linux/projects/results/tailguard_b/k4/tailguard_b --output_dir /home/linux/projects/results/tailguard_b/k4/attachment_hcal_test --tgb_attachment_membership_mode h_calibrated
 ```

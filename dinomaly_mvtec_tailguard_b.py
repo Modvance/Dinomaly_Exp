@@ -31,6 +31,7 @@ from dinomaly_train_base import (
 )
 from gbps_runner_utils import evaluate_gbps_ci_peak_trigger, resolve_gbps_best_scored_df
 from tailguard_b_artifacts import (
+    save_tailguard_b_attachment_replay_config,
     save_tailguard_b_attachment_artifacts,
     save_tailguard_b_gbps_iteration_artifacts,
     save_tailguard_b_memory_artifacts,
@@ -38,11 +39,7 @@ from tailguard_b_artifacts import (
     save_tailguard_b_summary,
     save_tailguard_b_trigger_summary,
 )
-from tailguard_b_attachment import (
-    build_clean_head_geometry,
-    compute_tail_attachment,
-    split_tail_by_attachment_elbow,
-)
+from tailguard_b_attachment import build_tail_attachment_plan
 from tailguard_b_gbps import (
     build_tailguard_b_head_delete_plan,
     build_tailguard_b_stage2_plan,
@@ -182,13 +179,15 @@ def train(item_list):
         prepare_result['summary']['num_head_groups'],
     ))
     analysis_summary = prepare_result['summary'].get('tail_sampler_analysis_only_summary')
-    if analysis_summary is not None:
+    if analysis_summary is not None and 'selection_precision' in analysis_summary:
         print_fn('tail sampler analysis-only: precision={:.4f}, recall={:.4f}, f1={:.4f}, noisy_proxy_rate={:.4f}'.format(
             float(analysis_summary['selection_precision']),
             float(analysis_summary['selection_recall']),
             float(analysis_summary['selection_f1']),
             float(analysis_summary['selected_noise_proxy_rate']),
         ))
+    elif analysis_summary is not None:
+        print_fn('tail sampler analysis-only skipped: {}'.format(analysis_summary.get('error', analysis_summary.get('status', 'unknown'))))
 
     full_metadata_df = prepare_result['full_metadata_df'].copy()
     h_metadata_df = full_metadata_df.loc[full_metadata_df['tail_candidate'].astype(int) == 0].copy().reset_index(drop=True)
@@ -353,19 +352,22 @@ def train(item_list):
                         )
                         selected_scores_df = head_delete_plan['selected_scores_df']
                         tail_df = selected_scores_df.loc[selected_scores_df['tail_candidate'].astype(int) == 1].copy().reset_index(drop=True)
-                        geometry, conformity_summary_df = build_clean_head_geometry(
+                        attachment_plan = build_tail_attachment_plan(
+                            tail_df,
                             head_delete_plan['h_clean_samples'],
                             prepare_result['grouping_embeddings_payload'],
                             args,
+                            getattr(args, 'tgb_attachment_membership_mode', 'empirical_conformity'),
                         )
-                        conformity_df, attachment_scores_df = compute_tail_attachment(
-                            tail_df,
-                            geometry,
-                            prepare_result['grouping_embeddings_payload'],
-                        )
-                        if len(conformity_df) == 0:
-                            conformity_df = conformity_summary_df.copy()
-                        tail_open_df, tail_attached_df, elbow_summary = split_tail_by_attachment_elbow(attachment_scores_df, args)
+                        geometry = attachment_plan['geometry']
+                        conformity_df = attachment_plan['conformity_df']
+                        attachment_scores_df = attachment_plan['attachment_scores_df']
+                        tail_open_df = attachment_plan['tail_open_df']
+                        tail_attached_df = attachment_plan['tail_attached_df']
+                        elbow_summary = attachment_plan['attachment_summary']
+                        membership_scores_df = attachment_plan['membership_scores_df']
+                        membership_calibration_df = attachment_plan['membership_calibration_df']
+                        membership_summary = attachment_plan['membership_summary']
                         tail_head_normal_df, tail_head_noise_df, stable_risk_df = classify_tail_attached_stable_risk(
                             tail_attached_df,
                             args.diag_save_dir,
@@ -382,6 +384,9 @@ def train(item_list):
                             tail_attached_df,
                             tail_head_normal_df,
                             tail_head_noise_df,
+                            membership_scores_df=membership_scores_df,
+                            membership_calibration_df=membership_calibration_df,
+                            membership_summary=membership_summary,
                         )
                         stable_risk_df.to_csv(os.path.join(args.tgb_attachment_dir, 'tail_attached_stable_risk.csv'), index=False)
 
@@ -391,6 +396,7 @@ def train(item_list):
                             tail_open_df,
                             tail_head_normal_df,
                             tail_head_noise_df,
+                            all_samples_df=prepare_result['full_metadata_df'],
                         )
                         stage2_saved = save_tailguard_b_stage2_artifacts(
                             args.tgb_stage2_dir,
@@ -541,6 +547,7 @@ def train(item_list):
         'gbps_trigger_summary': gbps_trigger_summary,
         'stage2_summary': None if stage2_plan is None else stage2_plan['summary'],
         'attachment_artifacts': attachment_saved,
+        'attachment_replay_config_path': getattr(args, 'tgb_attachment_replay_config_path', None),
         'stage2_artifacts': stage2_saved,
         'final_eval_summary': final_eval_summary,
         'memory_eval_summary': memory_eval_summary,
@@ -632,6 +639,12 @@ if __name__ == '__main__':
     parser.add_argument('--no-tgb_save_tailsampler_analysis_details', dest='tgb_save_tailsampler_analysis_details', action='store_false')
     parser.add_argument('--tgb_default_adaptive_angle', type=float, default=5.0)
     parser.add_argument('--tgb_min_clean_group_size', type=int, default=3)
+    parser.add_argument(
+        '--tgb_attachment_membership_mode',
+        type=str,
+        default='empirical_conformity',
+        choices=['empirical_conformity', 'h_calibrated'],
+    )
     parser.add_argument('--tgb_elbow_min_segment', type=int, default=3)
     parser.add_argument('--tgb_stable_window', type=int, default=3)
     parser.add_argument('--tgb_stable_min_observations', type=int, default=1)
@@ -658,6 +671,19 @@ if __name__ == '__main__':
         args.diag_save_dir = os.path.join(args.tgb_root_dir, args.diag_save_dir)
     os.makedirs(args.diag_save_dir, exist_ok=True)
     os.makedirs(args.tgb_checkpoint_dir, exist_ok=True)
+    args.tgb_attachment_replay_config_path = save_tailguard_b_attachment_replay_config(
+        args.tgb_root_dir,
+        {
+            'tgb_attachment_membership_mode': args.tgb_attachment_membership_mode,
+            'tgb_min_clean_group_size': args.tgb_min_clean_group_size,
+            'tgb_elbow_min_segment': args.tgb_elbow_min_segment,
+            'tgb_stable_window': args.tgb_stable_window,
+            'tgb_stable_min_observations': args.tgb_stable_min_observations,
+            'tgb_t_attached_noise_p_high_thr': args.tgb_t_attached_noise_p_high_thr,
+            'gbps_prune_ratio': args.gbps_prune_ratio,
+            'gbps_min_keep_per_group': args.gbps_min_keep_per_group,
+        },
+    )
 
     device = 'cuda:{}'.format(args.gpus) if torch.cuda.is_available() else 'cpu'
     print_fn(device)
