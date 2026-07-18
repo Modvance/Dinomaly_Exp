@@ -190,29 +190,42 @@ def train(item_list):
         print_fn('tail sampler analysis-only skipped: {}'.format(analysis_summary.get('error', analysis_summary.get('status', 'unknown'))))
 
     full_metadata_df = prepare_result['full_metadata_df'].copy()
-    h_metadata_df = full_metadata_df.loc[full_metadata_df['tail_candidate'].astype(int) == 0].copy().reset_index(drop=True)
-    h_index_map = _build_retained_index_map(h_metadata_df, num_classes=len(base_train_data_list))
-    stage1_loaders = rebuild_pruned_train_loaders(
-        base_train_data_list,
-        h_index_map,
-        data_root=args.data_path,
-        item_list=item_list,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        diag_batch_size=args.diag_batch_size,
-        diag_num_workers=args.diag_num_workers,
-        contaminated_paths=contaminated_paths,
-        sampler=None,
-        epoch_num_samples=None,
-        phase6_plan=None,
-        use_phase6_meta=False,
-    )
-    train_data_list = stage1_loaders['train_data_list']
-    train_data = stage1_loaders['train_data']
-    train_dataloader = stage1_loaders['train_dataloader']
-    train_eval_dataloader = stage1_loaders['train_eval_dataloader']
+    stage1_training_scope = args.tgb_stage1_training_scope
+    if stage1_training_scope == 'h_only':
+        h_metadata_df = full_metadata_df.loc[
+            full_metadata_df['tail_candidate'].astype(int) == 0
+        ].copy().reset_index(drop=True)
+        h_index_map = _build_retained_index_map(h_metadata_df, num_classes=len(base_train_data_list))
+        stage1_loaders = rebuild_pruned_train_loaders(
+            base_train_data_list,
+            h_index_map,
+            data_root=args.data_path,
+            item_list=item_list,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            diag_batch_size=args.diag_batch_size,
+            diag_num_workers=args.diag_num_workers,
+            contaminated_paths=contaminated_paths,
+            sampler=None,
+            epoch_num_samples=None,
+            phase6_plan=None,
+            use_phase6_meta=False,
+        )
+        train_data_list = stage1_loaders['train_data_list']
+        train_data = stage1_loaders['train_data']
+        train_dataloader = stage1_loaders['train_dataloader']
+        train_eval_dataloader = stage1_loaders['train_eval_dataloader']
+    else:
+        train_data_list = base_train_data_list
+        train_data = full_train_data
+        train_dataloader = full_train_dataloader
+        train_eval_dataloader = full_train_eval_dataloader
     memory_train_eval_dataloader = full_train_eval_dataloader
-    print_fn('stage1 H-only train image number:{} / full {}'.format(len(train_data), len(full_train_data)))
+    print_fn('stage1 training scope={} train image number:{} / full {}'.format(
+        stage1_training_scope,
+        len(train_data),
+        len(full_train_data),
+    ))
 
     gbps_best_U = None
     gbps_best_SE = None
@@ -629,6 +642,12 @@ if __name__ == '__main__':
 
     parser.add_argument('--tgb_tail_embedding_source', type=str, default='encoder_cls', choices=['encoder', 'encoder_cls'])
     parser.add_argument('--tgb_group_embedding_source', type=str, default='encoder', choices=['encoder', 'encoder_cls'])
+    parser.add_argument(
+        '--tgb_stage1_training_scope',
+        type=str,
+        default='h_only',
+        choices=['h_only', 'all_samples'],
+    )
     parser.add_argument('--tgb_save_cls_embeddings', dest='tgb_save_cls_embeddings', action='store_true', default=True)
     parser.add_argument('--no-tgb_save_cls_embeddings', dest='tgb_save_cls_embeddings', action='store_false')
     parser.add_argument('--tgb_save_grouping_embeddings', dest='tgb_save_grouping_embeddings', action='store_true', default=True)
