@@ -38,10 +38,12 @@ def save_tailguard_b_prepare_artifacts(output_dir: str,
                                        head_group_assignments_df: pd.DataFrame,
                                        metadata: Dict,
                                        cls_embeddings_payload: Optional[Dict] = None,
-                                       grouping_embeddings_payload: Optional[Dict] = None):
+                                       grouping_embeddings_payload: Optional[Dict] = None,
+                                       analysis_metadata_df: Optional[pd.DataFrame] = None):
     os.makedirs(output_dir, exist_ok=True)
     candidates_path = os.path.join(output_dir, 'tailsampler_candidates.csv')
     train_metadata_path = os.path.join(output_dir, 'tailguard_train_metadata.csv')
+    analysis_metadata_path = os.path.join(output_dir, 'tailguard_train_analysis_metadata.csv')
     head_group_assignments_path = os.path.join(output_dir, 'head_group_assignments.csv')
     cls_embeddings_path = os.path.join(output_dir, 'cls_embeddings.pt')
     grouping_embeddings_path = os.path.join(output_dir, 'grouping_embeddings.pt')
@@ -50,6 +52,10 @@ def save_tailguard_b_prepare_artifacts(output_dir: str,
     candidates_df.to_csv(candidates_path, index=False)
     train_metadata_df.to_csv(train_metadata_path, index=False)
     head_group_assignments_df.to_csv(head_group_assignments_path, index=False)
+    if analysis_metadata_df is not None:
+        analysis_metadata_df.to_csv(analysis_metadata_path, index=False)
+    else:
+        analysis_metadata_path = None
 
     if cls_embeddings_payload is not None:
         torch.save(cls_embeddings_payload, cls_embeddings_path)
@@ -63,6 +69,7 @@ def save_tailguard_b_prepare_artifacts(output_dir: str,
     artifacts = {
         'tailsampler_candidates_csv': candidates_path,
         'tailguard_train_metadata_csv': train_metadata_path,
+        'tailguard_train_analysis_metadata_csv': analysis_metadata_path,
         'head_group_assignments_csv': head_group_assignments_path,
         'cls_embeddings_pt': cls_embeddings_path,
         'grouping_embeddings_pt': grouping_embeddings_path,
@@ -125,7 +132,8 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
                                           membership_summary: Optional[Dict] = None,
                                           rgd_distances_df: Optional[pd.DataFrame] = None,
                                           rgd_scores_df: Optional[pd.DataFrame] = None,
-                                          rgd_split_summary: Optional[Dict] = None):
+                                          rgd_split_summary: Optional[Dict] = None,
+                                          rgd_bic_candidates_df: Optional[pd.DataFrame] = None):
     os.makedirs(output_dir, exist_ok=True)
     geometry_path = os.path.join(output_dir, 'clean_head_group_geometry.pt')
     conformity_path = os.path.join(output_dir, 'tail_group_conformity.csv')
@@ -141,6 +149,7 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
     rgd_distances_path = os.path.join(output_dir, 'tail_rgd_group_distances.csv')
     rgd_scores_path = os.path.join(output_dir, 'tail_rgd_scores.csv')
     rgd_split_summary_path = os.path.join(output_dir, 'rgd_split_summary.json')
+    rgd_bic_candidates_path = os.path.join(output_dir, 'rgd_segmented_bic_candidates.csv')
 
     torch.save(geometry, geometry_path)
     conformity_df.to_csv(conformity_path, index=False)
@@ -177,6 +186,12 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
         _write_json(rgd_split_summary_path, rgd_split_summary)
     else:
         rgd_split_summary_path = None
+    if rgd_bic_candidates_df is None:
+        rgd_bic_candidates_df = pd.DataFrame(columns=[
+            'split_index', 'left_count', 'right_count', 'left_sse', 'right_sse',
+            'sse_2', 'bic_2', 'is_selected',
+        ])
+    rgd_bic_candidates_df.to_csv(rgd_bic_candidates_path, index=False)
     return {
         'clean_head_group_geometry_pt': geometry_path,
         'tail_group_conformity_csv': conformity_path,
@@ -192,6 +207,7 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
         'tail_rgd_group_distances_csv': rgd_distances_path,
         'tail_rgd_scores_csv': rgd_scores_path,
         'rgd_split_summary_json': rgd_split_summary_path,
+        'rgd_segmented_bic_candidates_csv': rgd_bic_candidates_path,
     }
 
 
@@ -213,34 +229,92 @@ def save_tailguard_b_stage2_artifacts(output_dir: str,
     }
 
 
+def save_tailguard_b_pseudoclass_artifacts(output_dir: str,
+                                           members_df: pd.DataFrame,
+                                           classes_df: pd.DataFrame,
+                                           tail_edges_df: pd.DataFrame,
+                                           summary: Dict):
+    os.makedirs(output_dir, exist_ok=True)
+    members_path = os.path.join(output_dir, 'pseudo_class_members.csv')
+    classes_path = os.path.join(output_dir, 'pseudo_classes.csv')
+    tail_edges_path = os.path.join(output_dir, 'tail_adaptive_neighborhood_edges.csv')
+    summary_path = os.path.join(output_dir, 'pseudo_class_registry.json')
+    members_df.to_csv(members_path, index=False)
+    classes_df.to_csv(classes_path, index=False)
+    tail_edges_df.to_csv(tail_edges_path, index=False)
+    _write_json(summary_path, summary)
+    return {
+        'pseudo_class_members_csv': members_path,
+        'pseudo_classes_csv': classes_path,
+        'tail_adaptive_neighborhood_edges_csv': tail_edges_path,
+        'pseudo_class_registry_json': summary_path,
+    }
+
+
+def save_tailguard_b_pseudoclass_report_artifacts(output_dir: str,
+                                                  summary: Dict,
+                                                  predictions_df: pd.DataFrame,
+                                                  class_summary_df: pd.DataFrame,
+                                                  contingency_df: pd.DataFrame):
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_report.json')
+    predictions_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_predictions.csv')
+    class_summary_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_summary.csv')
+    contingency_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_contingency.csv')
+    _write_json(summary_path, summary)
+    predictions_df.to_csv(predictions_path, index=False)
+    class_summary_df.to_csv(class_summary_path, index=False)
+    contingency_df.to_csv(contingency_path, index=False)
+    return {
+        'stage1_cleanup_pseudoclass_report_json': summary_path,
+        'stage1_cleanup_pseudoclass_predictions_csv': predictions_path,
+        'stage1_cleanup_pseudoclass_summary_csv': class_summary_path,
+        'stage1_cleanup_pseudoclass_contingency_csv': contingency_path,
+    }
+
+
+def save_tailguard_b_denoising_diagnostics(output_dir: str,
+                                            summary: Dict,
+                                            class_rows_df: pd.DataFrame):
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, 'denoising_diagnostics.json')
+    class_rows_path = os.path.join(output_dir, 'denoising_diagnostics_by_class.csv')
+    _write_json(summary_path, summary)
+    class_rows_df.to_csv(class_rows_path, index=False)
+    return {
+        'denoising_diagnostics_json': summary_path,
+        'denoising_diagnostics_by_class_csv': class_rows_path,
+    }
+
+
 def save_tailguard_b_memory_artifacts(output_dir: str,
-                                      memory_bank: Dict,
+                                      memory_system: Dict,
                                       score_df: pd.DataFrame,
                                       per_class_metrics,
                                       summary: Dict,
                                       metadata: Dict,
                                       metrics_by_mode: Optional[Dict] = None):
     os.makedirs(output_dir, exist_ok=True)
-    bank_path = os.path.join(output_dir, 'tail_support_memory_bank.pt')
-    bank_summary_path = os.path.join(output_dir, 'tail_support_memory_summary.csv')
+    system_path = os.path.join(output_dir, 'pseudo_class_memory_system.pt')
+    class_summary_path = os.path.join(output_dir, 'pseudo_class_memory_summary.csv')
     score_path = os.path.join(output_dir, 'memory_eval_scores.csv')
     summary_path = os.path.join(output_dir, 'memory_eval_summary.json')
 
-    torch.save(memory_bank, bank_path)
+    torch.save(memory_system, system_path)
     rows = []
-    for support_key, entry in sorted(memory_bank.items(), key=lambda item: int(item[0])):
+    for pseudo_class_id, entry in sorted(memory_system['class_entries'].items(), key=lambda item: int(item[0])):
+        spatial_size = entry.get('spatial_size') or (0, 0)
         rows.append({
-            'support_key': int(support_key),
-            'sample_idx': int(entry.get('sample_idx', support_key)),
-            'sample_key': int(entry.get('sample_key', support_key)),
-            'img_path': str(entry.get('img_path', '')),
-            'num_patches': int(entry.get('num_patches', 0)),
-            'feature_dim': int(entry.get('feature_dim', 0)),
-            'spatial_h': int(entry.get('spatial_size', (0, 0))[0]),
-            'spatial_w': int(entry.get('spatial_size', (0, 0))[1]),
-            'adaptive_angle': float(entry.get('adaptive_angle', 0.0)),
+            'pseudo_class_id': int(pseudo_class_id),
+            'pseudo_class_type': str(entry['pseudo_class_type']),
+            'num_members': int(entry['num_members']),
+            'has_memory_bank': bool(entry['has_memory_bank']),
+            'num_patches': int(entry['num_patches']),
+            'feature_dim': int(entry['feature_dim']),
+            'spatial_h': int(spatial_size[0]),
+            'spatial_w': int(spatial_size[1]),
         })
-    pd.DataFrame(rows).to_csv(bank_summary_path, index=False)
+    pd.DataFrame(rows).to_csv(class_summary_path, index=False)
     score_df.to_csv(score_path, index=False)
 
     payload = {
@@ -252,8 +326,8 @@ def save_tailguard_b_memory_artifacts(output_dir: str,
         payload['metrics_by_mode'] = metrics_by_mode
     _write_json(summary_path, payload)
     return {
-        'tail_support_memory_bank_pt': bank_path,
-        'tail_support_memory_summary_csv': bank_summary_path,
+        'pseudo_class_memory_system_pt': system_path,
+        'pseudo_class_memory_summary_csv': class_summary_path,
         'memory_eval_scores_csv': score_path,
         'memory_eval_summary_json': summary_path,
     }

@@ -314,4 +314,43 @@ python dinomaly_mvtec_tailguard_b.py \
   --tgb_attachment_membership_mode rgd \
   --tgb_memory_enable \
   --gpus 1
+
+python dinomaly_mvtec_tailguard_b.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b \
+  --save_name seg_pareto \
+  --gbps_auto_k \
+  --tgb_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --tgb_attachment_membership_mode rgd \
+  --tgb_rgd_split_mode segmented_bic \
+  --tgb_memory_enable \
+  --gpus 1
+
+python dinomaly_mvtec_tailguard_b.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b \
+  --save_name seg_k4 \
+  --gbps_auto_k \
+  --tgb_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --tgb_attachment_membership_mode rgd \
+  --tgb_rgd_split_mode segmented_bic \
+  --tgb_memory_enable \
+  --gpus 1
+
+python dinomaly_mvtec_tailguard_b.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b \
+  --save_name seg_k1 \
+  --gbps_auto_k \
+  --tgb_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --tgb_attachment_membership_mode rgd \
+  --tgb_rgd_split_mode segmented_bic \
+  --tgb_memory_enable \
+  --gpus 1
 ```

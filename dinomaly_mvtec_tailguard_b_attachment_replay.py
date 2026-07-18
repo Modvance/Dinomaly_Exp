@@ -8,14 +8,22 @@ import torch
 
 from tailguard_b_artifacts import (
     save_tailguard_b_attachment_artifacts,
+    save_tailguard_b_denoising_diagnostics,
+    save_tailguard_b_pseudoclass_artifacts,
+    save_tailguard_b_pseudoclass_report_artifacts,
     save_tailguard_b_stage2_artifacts,
 )
 from tailguard_b_attachment import build_tail_attachment_plan
+from tailguard_b_diagnostics import (
+    build_tailguard_b_denoising_diagnostics,
+    build_tailguard_b_pseudoclass_report,
+)
 from tailguard_b_gbps import (
     build_tailguard_b_head_delete_plan,
     build_tailguard_b_stage2_plan,
     classify_tail_attached_stable_risk,
 )
+from tailguard_b_pseudoclasses import build_tailguard_b_pseudoclass_registry
 
 
 def _load_json(path):
@@ -34,6 +42,7 @@ REPLAY_DEFAULTS = {
     'tgb_attachment_membership_mode': 'empirical_conformity',
     'tgb_min_clean_group_size': 3,
     'tgb_elbow_min_segment': 3,
+    'tgb_rgd_split_mode': 'largest_positive_gap',
     'tgb_stable_window': 3,
     'tgb_stable_min_observations': 1,
     'tgb_t_attached_noise_p_high_thr': 0.5,
@@ -78,15 +87,37 @@ def replay(parsed_args):
     os.makedirs(output_dir, exist_ok=True)
 
     prepare_dir = os.path.join(source_dir, 'prepare')
-    gbps_dir = os.path.join(source_dir, 'gbps')
+    source_replay_config_path = os.path.join(source_dir, 'attachment_replay_config.json')
+    source_replay_config = _load_json(source_replay_config_path) if os.path.isfile(source_replay_config_path) else {}
+    configured_gbps_dir = source_replay_config.get('tgb_gbps_dir')
+    if configured_gbps_dir is not None:
+        gbps_dir = os.path.realpath(configured_gbps_dir)
+    else:
+        gbps_dir_relpath = source_replay_config.get('tgb_gbps_dir_relpath', 'gbps')
+        gbps_dir = os.path.realpath(os.path.join(source_dir, gbps_dir_relpath))
     metadata_df = pd.read_csv(os.path.join(prepare_dir, 'tailguard_train_metadata.csv'))
     head_group_assignments_df = pd.read_csv(os.path.join(prepare_dir, 'head_group_assignments.csv'))
     grouping_embeddings_payload = _load_torch(os.path.join(prepare_dir, 'grouping_embeddings.pt'))
+    cls_embeddings_path = os.path.join(prepare_dir, 'cls_embeddings.pt')
+    cls_embeddings_payload = _load_torch(cls_embeddings_path) if os.path.isfile(cls_embeddings_path) else None
     selected_iter, score_source_iter = _resolve_selected_score_source(source_dir, parsed_args.gbps_selected_iter)
     selected_scores_path = os.path.join(gbps_dir, 'iter_{:05d}'.format(score_source_iter), 'train_scores.csv')
     if not os.path.isfile(selected_scores_path):
         raise FileNotFoundError('selected GBPS score artifact does not exist: {}'.format(selected_scores_path))
     selected_scores_df = pd.read_csv(selected_scores_path)
+    analysis_metadata_path = os.path.join(prepare_dir, 'tailguard_train_analysis_metadata.csv')
+    if os.path.isfile(analysis_metadata_path):
+        analysis_metadata_df = pd.read_csv(analysis_metadata_path)
+        analysis_metadata_source = analysis_metadata_path
+    else:
+        analysis_metadata_df = selected_scores_df.copy()
+        analysis_metadata_source = selected_scores_path
+    prepare_summary_path = os.path.join(prepare_dir, 'prepare_summary.json')
+    prepare_artifact_summary = _load_json(prepare_summary_path) if os.path.isfile(prepare_summary_path) else {}
+    analysis_metadata_provenance = prepare_artifact_summary.get('metadata', {}).get('summary', {}).get(
+        'analysis_metadata_provenance',
+        {},
+    )
     replay_args, config_status, config_path = _resolve_replay_config(source_dir, parsed_args)
     if config_status != 'source_config':
         print('warning: source run has no attachment replay config; using explicit CLI values or documented defaults')
@@ -119,6 +150,7 @@ def replay(parsed_args):
     rgd_distances_df = attachment_plan['rgd_distances_df']
     rgd_scores_df = attachment_plan['rgd_scores_df']
     rgd_split_summary = attachment_plan['rgd_split_summary']
+    rgd_bic_candidates_df = attachment_plan['rgd_bic_candidates_df']
 
     tail_head_normal_df, tail_head_noise_df, stable_risk_df = classify_tail_attached_stable_risk(
         tail_attached_df,
@@ -143,6 +175,7 @@ def replay(parsed_args):
         rgd_distances_df=rgd_distances_df,
         rgd_scores_df=rgd_scores_df,
         rgd_split_summary=rgd_split_summary,
+        rgd_bic_candidates_df=rgd_bic_candidates_df,
     )
     stable_risk_path = os.path.join(attachment_dir, 'tail_attached_stable_risk.csv')
     stable_risk_df.to_csv(stable_risk_path, index=False)
@@ -161,11 +194,67 @@ def replay(parsed_args):
         stage2_plan['removed_samples'],
         stage2_plan['summary'],
     )
+    denoising_diagnostics_summary, denoising_diagnostics_by_class = build_tailguard_b_denoising_diagnostics(
+        analysis_metadata_df,
+        stage2_plan['retained_samples'],
+        stage2_plan['removed_samples'],
+        h_removed_samples_df=head_delete_plan['h_removed_samples'],
+        tail_head_noise_samples_df=tail_head_noise_df,
+        manifest_path=analysis_metadata_provenance.get('manifest_path'),
+        manifest_requested_path=analysis_metadata_provenance.get('manifest_requested_path'),
+        label_source=analysis_metadata_source,
+    )
+    denoising_diagnostics_artifacts = save_tailguard_b_denoising_diagnostics(
+        output_dir,
+        denoising_diagnostics_summary,
+        denoising_diagnostics_by_class,
+    )
+    pseudoclass_registry = None
+    pseudoclass_artifacts = None
+    pseudoclass_report_artifacts = None
+    if cls_embeddings_payload is None:
+        pseudoclass_status = 'not_available_missing_cls_embeddings'
+        pseudoclass_reason = 'prepare/cls_embeddings.pt is unavailable'
+    else:
+        pseudoclass_registry = build_tailguard_b_pseudoclass_registry(
+            head_delete_plan['h_clean_samples'],
+            tail_head_normal_df,
+            tail_open_df,
+            stage2_plan['retained_samples'],
+            stage2_plan['removed_samples'],
+            cls_embeddings_payload,
+        )
+        pseudoclass_artifacts = save_tailguard_b_pseudoclass_artifacts(
+            os.path.join(output_dir, 'pseudoclasses'),
+            pseudoclass_registry['members_df'],
+            pseudoclass_registry['classes_df'],
+            pseudoclass_registry['tail_edges_df'],
+            pseudoclass_registry['summary'],
+        )
+        pseudoclass_report, pseudoclass_predictions, pseudoclass_summary_df, pseudoclass_contingency_df = (
+            build_tailguard_b_pseudoclass_report(
+                pseudoclass_registry['members_df'],
+                pseudoclass_registry['classes_df'],
+                cls_embeddings_payload,
+                analysis_metadata_df,
+            )
+        )
+        pseudoclass_report_artifacts = save_tailguard_b_pseudoclass_report_artifacts(
+            output_dir,
+            pseudoclass_report,
+            pseudoclass_predictions,
+            pseudoclass_summary_df,
+            pseudoclass_contingency_df,
+        )
+        pseudoclass_status = 'completed'
+        pseudoclass_reason = None
     summary = {
         'source_tailguard_b_dir': source_dir,
+        'source_gbps_dir': gbps_dir,
         'selected_iter': int(selected_iter),
         'score_source_iter': int(score_source_iter),
         'attachment_membership_mode': replay_args.tgb_attachment_membership_mode,
+        'rgd_split_mode': replay_args.tgb_rgd_split_mode,
         'replay_config_status': config_status,
         'source_replay_config_path': config_path,
         'attachment_summary': attachment_summary,
@@ -174,6 +263,23 @@ def replay(parsed_args):
         'attachment_artifacts': attachment_artifacts,
         'tail_attached_stable_risk_csv': stable_risk_path,
         'stage2_artifacts': stage2_artifacts,
+        'pseudo_class_status': pseudoclass_status,
+        'pseudo_class_reason': pseudoclass_reason,
+        'pseudo_class_artifacts': pseudoclass_artifacts,
+        'pseudo_class_report_artifacts': pseudoclass_report_artifacts,
+        'pseudo_class_summary': None if pseudoclass_registry is None else {
+            'num_pseudo_classes': pseudoclass_registry['summary']['num_pseudo_classes'],
+            'num_head_pseudo_classes': pseudoclass_registry['summary']['num_head_pseudo_classes'],
+            'num_tail_pseudo_classes': pseudoclass_registry['summary']['num_tail_pseudo_classes'],
+        },
+        'final_memory_rebuilt': False,
+        'denoising_diagnostics_artifacts': denoising_diagnostics_artifacts,
+        'denoising_diagnostics_summary': {
+            'cleanup_status': denoising_diagnostics_summary['cleanup_status'],
+            'decision_counts': denoising_diagnostics_summary['decision_counts'],
+            'contamination_counts': denoising_diagnostics_summary['contamination_counts'],
+            'contamination_metrics': denoising_diagnostics_summary['contamination_metrics'],
+        },
     }
     summary_path = os.path.join(output_dir, 'attachment_replay_summary.json')
     with open(summary_path, 'w', encoding='utf-8') as file:
@@ -194,6 +300,12 @@ if __name__ == '__main__':
     )
     parser.add_argument('--tgb_min_clean_group_size', type=int, default=None)
     parser.add_argument('--tgb_elbow_min_segment', type=int, default=None)
+    parser.add_argument(
+        '--tgb_rgd_split_mode',
+        type=str,
+        default=None,
+        choices=['segmented_bic', 'largest_positive_gap'],
+    )
     parser.add_argument('--tgb_stable_window', type=int, default=None)
     parser.add_argument('--tgb_stable_min_observations', type=int, default=None)
     parser.add_argument('--tgb_t_attached_noise_p_high_thr', type=float, default=None)

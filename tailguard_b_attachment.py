@@ -367,9 +367,26 @@ def compute_tail_relative_group_dominance(tail_df: pd.DataFrame,
     return raw_distances_df, scores_df, int(len(valid_groups))
 
 
+RGD_BIC_CANDIDATE_COLUMNS = [
+    'split_index',
+    'left_count',
+    'right_count',
+    'left_sse',
+    'right_sse',
+    'sse_2',
+    'bic_2',
+    'is_selected',
+]
+
+
+def _empty_rgd_bic_candidates() -> pd.DataFrame:
+    return pd.DataFrame(columns=RGD_BIC_CANDIDATE_COLUMNS)
+
+
 def _rgd_fallback(scores_df: pd.DataFrame,
                   scoreable_index: pd.Index,
-                  summary: Dict):
+                  summary: Dict,
+                  bic_candidates_df: Optional[pd.DataFrame] = None):
     output_df = scores_df.copy()
     if len(scoreable_index) > 0:
         output_df.loc[scoreable_index, 'rgd_status'] = 'open_no_valid_rgd_split'
@@ -380,21 +397,71 @@ def _rgd_fallback(scores_df: pd.DataFrame,
         'num_open': int(len(open_df)),
         'num_head_affiliated': 0,
     })
-    return output_df, open_df, attached_df, summary
+    return output_df, open_df, attached_df, summary, (
+        _empty_rgd_bic_candidates() if bic_candidates_df is None else bic_candidates_df
+    )
+
+
+def _apply_rgd_split(scores_df: pd.DataFrame,
+                     scoreable_mask: pd.Series,
+                     scoreable_index: pd.Index,
+                     threshold: float,
+                     summary: Dict,
+                     bic_candidates_df: pd.DataFrame):
+    output_df = scores_df.copy()
+    output_df.loc[scoreable_index, 'rgd_threshold'] = threshold
+    attached_mask = scoreable_mask & (output_df['relative_group_dominance'] > threshold)
+    output_df.loc[scoreable_mask & ~attached_mask, 'rgd_status'] = 'open'
+    output_df.loc[attached_mask, 'rgd_status'] = 'head_affiliated'
+    open_df = output_df.loc[output_df['rgd_status'] != 'head_affiliated'].copy().reset_index(drop=True)
+    attached_df = output_df.loc[output_df['rgd_status'] == 'head_affiliated'].copy().reset_index(drop=True)
+    summary.update({
+        'split_valid': True,
+        'num_open': int(len(open_df)),
+        'num_head_affiliated': int(len(attached_df)),
+    })
+    return output_df, open_df, attached_df, summary, bic_candidates_df
+
+
+def _rgd_candidate_row(split_index: int,
+                       x: np.ndarray,
+                       values: np.ndarray):
+    lower_count = int(split_index + 1)
+    right_count = int(len(values) - lower_count)
+    left_sse = _linear_sse(x[:lower_count], values[:lower_count])
+    right_sse = _linear_sse(x[lower_count:], values[lower_count:])
+    sse_2 = float(left_sse + right_sse)
+    return {
+        'split_index': int(split_index),
+        'left_count': lower_count,
+        'right_count': right_count,
+        'left_sse': float(left_sse),
+        'right_sse': float(right_sse),
+        'sse_2': sse_2,
+        'bic_2': _bic(sse_2, len(values), q=4),
+        'is_selected': False,
+    }
 
 
 def split_tail_by_relative_group_dominance(rgd_scores_df: pd.DataFrame,
                                             num_valid_groups: int,
                                             args):
     scores_df = rgd_scores_df.copy().reset_index(drop=True)
-    min_segment = max(1, int(getattr(args, 'tgb_elbow_min_segment', 3)))
+    split_mode = getattr(args, 'tgb_rgd_split_mode', 'segmented_bic')
+    if split_mode not in {'segmented_bic', 'largest_positive_gap'}:
+        raise ValueError('unknown TailGuard-B RGD split mode: {}'.format(split_mode))
+    configured_min_segment = int(getattr(args, 'tgb_elbow_min_segment', 3))
+    min_segment = max(3, configured_min_segment) if split_mode == 'segmented_bic' else max(1, configured_min_segment)
     base_summary = {
         'mode': 'rgd',
+        'split_mode': split_mode,
+        'candidate_selection': 'all_legal_breakpoints' if split_mode == 'segmented_bic' else 'largest_positive_gap',
         'num_tail': int(len(scores_df)),
         'num_valid_groups': int(num_valid_groups),
         'min_segment': int(min_segment),
         'num_scoreable_rgd': 0,
         'num_unique_scores': 0,
+        'num_legal_breakpoints': 0,
         'max_gap': None,
         'split_index': None,
         'threshold': None,
@@ -410,7 +477,7 @@ def split_tail_by_relative_group_dominance(rgd_scores_df: pd.DataFrame,
             'split_valid': False,
             'num_open': 0,
             'num_head_affiliated': 0,
-        }
+        }, _empty_rgd_bic_candidates()
     if num_valid_groups < 2:
         return _rgd_fallback(
             scores_df,
@@ -429,15 +496,62 @@ def split_tail_by_relative_group_dominance(rgd_scores_df: pd.DataFrame,
     )
     scoreable_index = scoreable_df.index
     values = scoreable_df['relative_group_dominance'].to_numpy(dtype=np.float64)
+    x = np.arange(len(scoreable_df), dtype=float)
     base_summary.update({
         'num_scoreable_rgd': int(len(scoreable_df)),
         'num_unique_scores': int(np.unique(values).size),
     })
-    if len(scoreable_df) < max(2 * min_segment, 4):
+    minimum_scoreable = max(2 * min_segment, 4) if split_mode == 'largest_positive_gap' else 2 * min_segment
+    if len(scoreable_df) < minimum_scoreable:
         return _rgd_fallback(scores_df, scoreable_index, {
             **base_summary,
             'status': 'fallback_insufficient_scoreable_tail',
         })
+
+    if split_mode == 'segmented_bic':
+        sse_1 = _linear_sse(x, values)
+        bic_1 = _bic(sse_1, len(scoreable_df), q=2)
+        base_summary.update({'sse_1': float(sse_1), 'bic_1': float(bic_1)})
+        candidate_rows = [
+            _rgd_candidate_row(split_index, x, values)
+            for split_index in range(min_segment - 1, len(scoreable_df) - min_segment)
+            if values[split_index] < values[split_index + 1]
+        ]
+        candidates_df = pd.DataFrame(candidate_rows, columns=RGD_BIC_CANDIDATE_COLUMNS)
+        base_summary['num_legal_breakpoints'] = int(len(candidates_df))
+        if len(candidates_df) == 0:
+            return _rgd_fallback(scores_df, scoreable_index, {
+                **base_summary,
+                'status': 'fallback_no_legal_breakpoint',
+            }, candidates_df)
+        best_position = int(candidates_df['bic_2'].idxmin())
+        candidates_df.loc[best_position, 'is_selected'] = True
+        best = candidates_df.loc[best_position]
+        base_summary.update({
+            'split_index': int(best['split_index']),
+            'sse_2': float(best['sse_2']),
+            'bic_2': float(best['bic_2']),
+        })
+        if not (float(best['bic_2']) < bic_1):
+            return _rgd_fallback(scores_df, scoreable_index, {
+                **base_summary,
+                'status': 'fallback_no_bic_gain',
+            }, candidates_df)
+        split_index = int(best['split_index'])
+        threshold = float((values[split_index] + values[split_index + 1]) / 2.0)
+        summary = {
+            **base_summary,
+            'status': 'segmented_bic_split',
+            'threshold': threshold,
+        }
+        return _apply_rgd_split(
+            scores_df,
+            scoreable_mask,
+            scoreable_index,
+            threshold,
+            summary,
+            candidates_df,
+        )
 
     gaps = np.diff(values)
     positive_gap_indices = np.flatnonzero(gaps > 0.0)
@@ -446,58 +560,47 @@ def split_tail_by_relative_group_dominance(rgd_scores_df: pd.DataFrame,
             **base_summary,
             'status': 'fallback_no_positive_gap',
         })
-
-    candidate_position = int(positive_gap_indices[np.argmax(gaps[positive_gap_indices])])
-    max_gap = float(gaps[candidate_position])
-    lower_count = candidate_position + 1
-    upper_count = len(scoreable_df) - lower_count
+    split_index = int(positive_gap_indices[np.argmax(gaps[positive_gap_indices])])
+    candidate = _rgd_candidate_row(split_index, x, values)
+    candidates_df = pd.DataFrame([candidate], columns=RGD_BIC_CANDIDATE_COLUMNS)
     base_summary.update({
-        'max_gap': max_gap,
-        'split_index': candidate_position,
+        'max_gap': float(gaps[split_index]),
+        'split_index': split_index,
     })
-    if lower_count < min_segment or upper_count < min_segment:
+    if candidate['left_count'] < min_segment or candidate['right_count'] < min_segment:
         return _rgd_fallback(scores_df, scoreable_index, {
             **base_summary,
             'status': 'fallback_largest_gap_violates_min_segment',
-        })
-
-    threshold = float((values[candidate_position] + values[candidate_position + 1]) / 2.0)
-    x = np.arange(len(scoreable_df), dtype=float)
+        }, candidates_df)
+    candidates_df.loc[0, 'is_selected'] = True
     sse_1 = _linear_sse(x, values)
-    sse_2 = (
-        _linear_sse(x[:lower_count], values[:lower_count])
-        + _linear_sse(x[lower_count:], values[lower_count:])
-    )
     bic_1 = _bic(sse_1, len(scoreable_df), q=2)
-    bic_2 = _bic(sse_2, len(scoreable_df), q=4)
     base_summary.update({
-        'threshold': threshold,
+        'num_legal_breakpoints': 1,
         'sse_1': float(sse_1),
-        'sse_2': float(sse_2),
+        'sse_2': float(candidate['sse_2']),
         'bic_1': float(bic_1),
-        'bic_2': float(bic_2),
+        'bic_2': float(candidate['bic_2']),
     })
-    if not (bic_2 < bic_1):
+    if not (float(candidate['bic_2']) < bic_1):
         return _rgd_fallback(scores_df, scoreable_index, {
             **base_summary,
             'status': 'fallback_no_bic_gain',
-        })
-
-    output_df = scores_df.copy()
-    output_df.loc[scoreable_index, 'rgd_threshold'] = threshold
-    attached_mask = scoreable_mask & (output_df['relative_group_dominance'] > threshold)
-    output_df.loc[scoreable_mask & ~attached_mask, 'rgd_status'] = 'open'
-    output_df.loc[attached_mask, 'rgd_status'] = 'head_affiliated'
-    open_df = output_df.loc[output_df['rgd_status'] != 'head_affiliated'].copy().reset_index(drop=True)
-    attached_df = output_df.loc[output_df['rgd_status'] == 'head_affiliated'].copy().reset_index(drop=True)
+        }, candidates_df)
+    threshold = float((values[split_index] + values[split_index + 1]) / 2.0)
     summary = {
         **base_summary,
         'status': 'largest_gap_bic_split',
-        'split_valid': True,
-        'num_open': int(len(open_df)),
-        'num_head_affiliated': int(len(attached_df)),
+        'threshold': threshold,
     }
-    return output_df, open_df, attached_df, summary
+    return _apply_rgd_split(
+        scores_df,
+        scoreable_mask,
+        scoreable_index,
+        threshold,
+        summary,
+        candidates_df,
+    )
 
 
 MEMBERSHIP_SCORE_COLUMNS = [
@@ -856,6 +959,7 @@ def build_tail_attachment_plan(tail_df: pd.DataFrame,
             'rgd_distances_df': None,
             'rgd_scores_df': None,
             'rgd_split_summary': None,
+            'rgd_bic_candidates_df': None,
         }
     if membership_mode == 'rgd':
         raw_distances_df, scores_df, num_valid_groups = compute_tail_relative_group_dominance(
@@ -863,7 +967,7 @@ def build_tail_attachment_plan(tail_df: pd.DataFrame,
             geometry,
             grouping_embeddings_payload,
         )
-        scores_df, tail_open_df, tail_attached_df, rgd_summary = split_tail_by_relative_group_dominance(
+        scores_df, tail_open_df, tail_attached_df, rgd_summary, rgd_bic_candidates_df = split_tail_by_relative_group_dominance(
             scores_df,
             num_valid_groups,
             args,
@@ -888,6 +992,7 @@ def build_tail_attachment_plan(tail_df: pd.DataFrame,
             'rgd_distances_df': raw_distances_df,
             'rgd_scores_df': scores_df,
             'rgd_split_summary': rgd_summary,
+            'rgd_bic_candidates_df': rgd_bic_candidates_df,
         }
     if membership_mode != 'empirical_conformity':
         raise ValueError('unknown TailGuard-B attachment membership mode: {}'.format(membership_mode))
@@ -912,4 +1017,5 @@ def build_tail_attachment_plan(tail_df: pd.DataFrame,
         'rgd_distances_df': None,
         'rgd_scores_df': None,
         'rgd_split_summary': None,
+        'rgd_bic_candidates_df': None,
     }

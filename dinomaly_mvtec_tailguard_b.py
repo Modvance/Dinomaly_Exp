@@ -33,6 +33,9 @@ from gbps_runner_utils import evaluate_gbps_ci_peak_trigger, resolve_gbps_best_s
 from tailguard_b_artifacts import (
     save_tailguard_b_attachment_replay_config,
     save_tailguard_b_attachment_artifacts,
+    save_tailguard_b_denoising_diagnostics,
+    save_tailguard_b_pseudoclass_artifacts,
+    save_tailguard_b_pseudoclass_report_artifacts,
     save_tailguard_b_gbps_iteration_artifacts,
     save_tailguard_b_memory_artifacts,
     save_tailguard_b_stage2_artifacts,
@@ -48,8 +51,16 @@ from tailguard_b_gbps import (
     run_tailguard_b_gbps_iteration,
     save_tailguard_b_selected_checkpoint,
 )
-from tailguard_b_memory import build_tail_support_memory_bank, run_tail_support_memory_evaluation
+from tailguard_b_diagnostics import (
+    build_tailguard_b_denoising_diagnostics,
+    build_tailguard_b_pseudoclass_report,
+)
+from tailguard_b_memory import (
+    build_tailguard_b_pseudoclass_memory_system,
+    run_pseudoclass_memory_evaluation,
+)
 from tailguard_b_prepare import prepare_tailguard_b_metadata
+from tailguard_b_pseudoclasses import build_tailguard_b_pseudoclass_registry
 from warmup_diag import load_injected_manifest
 
 warnings = __import__('warnings')
@@ -112,6 +123,13 @@ def train(item_list):
     stage2_plan = None
     attachment_saved = None
     stage2_saved = None
+    denoising_diagnostics_artifacts = None
+    denoising_diagnostics_summary = None
+    pseudoclass_registry = None
+    pseudoclass_artifacts = None
+    pseudoclass_report_artifacts = None
+    pseudoclass_status = 'not_performed'
+    pseudoclass_reason = None
     gbps_trigger_summary = None
     selected_checkpoint_path = os.path.join(args.tgb_checkpoint_dir, 'tailguard_b_selected_checkpoint.pt')
 
@@ -172,6 +190,8 @@ def train(item_list):
         device,
         args.tgb_prepare_dir,
         args,
+        manifest_path=manifest_path,
+        manifest_requested_path=args.diag_manifest_path,
     )
     print_fn('tailguard-b prepare: T={}, H={}, head_groups={}'.format(
         prepare_result['summary']['num_tail_candidates'],
@@ -190,10 +210,11 @@ def train(item_list):
         print_fn('tail sampler analysis-only skipped: {}'.format(analysis_summary.get('error', analysis_summary.get('status', 'unknown'))))
 
     full_metadata_df = prepare_result['full_metadata_df'].copy()
+    method_metadata_df = full_metadata_df.drop(columns=['is_contaminated', 'class_name'], errors='ignore')
     stage1_training_scope = args.tgb_stage1_training_scope
     if stage1_training_scope == 'h_only':
-        h_metadata_df = full_metadata_df.loc[
-            full_metadata_df['tail_candidate'].astype(int) == 0
+        h_metadata_df = method_metadata_df.loc[
+            method_metadata_df['tail_candidate'].astype(int) == 0
         ].copy().reset_index(drop=True)
         h_index_map = _build_retained_index_map(h_metadata_df, num_classes=len(base_train_data_list))
         stage1_loaders = rebuild_pruned_train_loaders(
@@ -276,7 +297,7 @@ def train(item_list):
                 gbps_result = run_tailguard_b_gbps_iteration(
                     scored_df,
                     prepare_result['head_group_assignments_df'],
-                    prepare_result['full_metadata_df'],
+                    method_metadata_df,
                     args,
                 )
                 t_max = max(1, int(total_iters * float(args.gbps_check_end_ratio)))
@@ -360,7 +381,7 @@ def train(item_list):
                         head_delete_plan = build_tailguard_b_head_delete_plan(
                             selected_scored_df,
                             prepare_result['head_group_assignments_df'],
-                            prepare_result['full_metadata_df'],
+                            method_metadata_df,
                             args,
                         )
                         selected_scores_df = head_delete_plan['selected_scores_df']
@@ -384,6 +405,7 @@ def train(item_list):
                         rgd_distances_df = attachment_plan['rgd_distances_df']
                         rgd_scores_df = attachment_plan['rgd_scores_df']
                         rgd_split_summary = attachment_plan['rgd_split_summary']
+                        rgd_bic_candidates_df = attachment_plan['rgd_bic_candidates_df']
                         tail_head_normal_df, tail_head_noise_df, stable_risk_df = classify_tail_attached_stable_risk(
                             tail_attached_df,
                             args.diag_save_dir,
@@ -406,6 +428,7 @@ def train(item_list):
                             rgd_distances_df=rgd_distances_df,
                             rgd_scores_df=rgd_scores_df,
                             rgd_split_summary=rgd_split_summary,
+                            rgd_bic_candidates_df=rgd_bic_candidates_df,
                         )
                         stable_risk_df.to_csv(os.path.join(args.tgb_attachment_dir, 'tail_attached_stable_risk.csv'), index=False)
 
@@ -415,7 +438,7 @@ def train(item_list):
                             tail_open_df,
                             tail_head_normal_df,
                             tail_head_noise_df,
-                            all_samples_df=prepare_result['full_metadata_df'],
+                            all_samples_df=method_metadata_df,
                         )
                         stage2_saved = save_tailguard_b_stage2_artifacts(
                             args.tgb_stage2_dir,
@@ -423,6 +446,62 @@ def train(item_list):
                             stage2_plan['removed_samples'],
                             stage2_plan['summary'],
                         )
+                        denoising_diagnostics_summary, denoising_diagnostics_by_class = build_tailguard_b_denoising_diagnostics(
+                            prepare_result['analysis_metadata_df'],
+                            stage2_plan['retained_samples'],
+                            stage2_plan['removed_samples'],
+                            h_removed_samples_df=head_delete_plan['h_removed_samples'],
+                            tail_head_noise_samples_df=tail_head_noise_df,
+                            manifest_path=manifest_path,
+                            manifest_requested_path=args.diag_manifest_path,
+                            label_source=prepare_result['saved'].get('tailguard_train_analysis_metadata_csv') if prepare_result['saved'] else None,
+                        )
+                        denoising_diagnostics_artifacts = save_tailguard_b_denoising_diagnostics(
+                            args.tgb_root_dir,
+                            denoising_diagnostics_summary,
+                            denoising_diagnostics_by_class,
+                        )
+                        cls_embeddings_payload = prepare_result['cls_embeddings_payload']
+                        if cls_embeddings_payload is None:
+                            raise ValueError(
+                                'TailGuard-B pseudo-classification requires --tgb_save_cls_embeddings'
+                            )
+                        pseudoclass_registry = build_tailguard_b_pseudoclass_registry(
+                            head_delete_plan['h_clean_samples'],
+                            tail_head_normal_df,
+                            tail_open_df,
+                            stage2_plan['retained_samples'],
+                            stage2_plan['removed_samples'],
+                            cls_embeddings_payload,
+                        )
+                        pseudoclass_artifacts = save_tailguard_b_pseudoclass_artifacts(
+                            os.path.join(args.tgb_root_dir, 'pseudoclasses'),
+                            pseudoclass_registry['members_df'],
+                            pseudoclass_registry['classes_df'],
+                            pseudoclass_registry['tail_edges_df'],
+                            pseudoclass_registry['summary'],
+                        )
+                        pseudoclass_report, pseudoclass_predictions, pseudoclass_summary_df, pseudoclass_contingency_df = (
+                            build_tailguard_b_pseudoclass_report(
+                                pseudoclass_registry['members_df'],
+                                pseudoclass_registry['classes_df'],
+                                cls_embeddings_payload,
+                                prepare_result['analysis_metadata_df'],
+                            )
+                        )
+                        pseudoclass_report_artifacts = save_tailguard_b_pseudoclass_report_artifacts(
+                            args.tgb_root_dir,
+                            pseudoclass_report,
+                            pseudoclass_predictions,
+                            pseudoclass_summary_df,
+                            pseudoclass_contingency_df,
+                        )
+                        pseudoclass_status = 'completed'
+                        print_fn('tailguard-b pseudo-classes: total={}, head={}, tail={}'.format(
+                            pseudoclass_registry['summary']['num_pseudo_classes'],
+                            pseudoclass_registry['summary']['num_head_pseudo_classes'],
+                            pseudoclass_registry['summary']['num_tail_pseudo_classes'],
+                        ))
 
                         checkpoint = load_tailguard_b_selected_checkpoint(
                             selected_checkpoint_path,
@@ -482,32 +561,61 @@ def train(item_list):
         else:
             break
 
+    if denoising_diagnostics_artifacts is None:
+        if gbps_trigger_iter is None:
+            cleanup_reason = 'gbps_not_triggered'
+        elif args.gbps_postprocess_mode != 'remove':
+            cleanup_reason = 'gbps_postprocess_mode_{}'.format(args.gbps_postprocess_mode)
+        elif not os.path.isfile(selected_checkpoint_path):
+            cleanup_reason = 'selected_checkpoint_unavailable'
+        else:
+            cleanup_reason = 'stage2_plan_unavailable'
+        denoising_diagnostics_summary, denoising_diagnostics_by_class = build_tailguard_b_denoising_diagnostics(
+            prepare_result['analysis_metadata_df'],
+            method_metadata_df,
+            method_metadata_df.iloc[0:0].copy(),
+            manifest_path=manifest_path,
+            manifest_requested_path=args.diag_manifest_path,
+            label_source=prepare_result['saved'].get('tailguard_train_analysis_metadata_csv') if prepare_result['saved'] else None,
+            cleanup_status='not_performed',
+            cleanup_reason=cleanup_reason,
+        )
+        denoising_diagnostics_artifacts = save_tailguard_b_denoising_diagnostics(
+            args.tgb_root_dir,
+            denoising_diagnostics_summary,
+            denoising_diagnostics_by_class,
+        )
+
+    if pseudoclass_status != 'completed':
+        pseudoclass_reason = 'cleanup_status_{}'.format(
+            denoising_diagnostics_summary['cleanup_status']
+        )
+
     if last_eval_iter != int(it):
         final_eval_summary = _evaluate_current_model(model, test_data_list, item_list, device, args, print_fn=print_fn)
         last_eval_iter = int(it)
         model.train()
 
-    support_df = None
-    memory_bank = {}
-    if bool(args.tgb_memory_enable):
-        if stage2_plan is not None:
-            support_path = os.path.join(args.tgb_attachment_dir, 'tail_open_samples.csv')
-            support_df = pd.read_csv(support_path) if os.path.isfile(support_path) else pd.DataFrame()
-        else:
-            support_df = full_metadata_df.loc[full_metadata_df['tail_candidate'].astype(int) == 1].copy().reset_index(drop=True)
-        memory_bank = build_tail_support_memory_bank(
+    memory_system = None
+    memory_status = 'disabled' if not bool(args.tgb_memory_enable) else 'skipped_pseudoclasses_unavailable'
+    if bool(args.tgb_memory_enable) and pseudoclass_registry is not None:
+        memory_system = build_tailguard_b_pseudoclass_memory_system(
             model,
             memory_train_eval_dataloader,
             device,
-            support_df,
+            pseudoclass_registry['members_df'],
+            pseudoclass_registry['classes_df'],
             args,
         )
-        print_fn('tailguard-b memory: built {} per-support banks from {} T_open samples'.format(len(memory_bank), len(support_df)))
-        score_df, per_class_metrics, memory_eval_summary, metrics_by_mode = run_tail_support_memory_evaluation(
+        print_fn('tailguard-b memory: built {} class-wise tail banks across {} pseudo-classes'.format(
+            memory_system['num_tail_memory_banks'],
+            memory_system['num_pseudo_classes'],
+        ))
+        score_df, per_class_metrics, memory_eval_summary, metrics_by_mode = run_pseudoclass_memory_evaluation(
             model,
             test_data_list,
             item_list,
-            memory_bank,
+            memory_system,
             args,
             device,
         )
@@ -516,20 +624,24 @@ def train(item_list):
             'encoder_name': checkpoint_metadata['encoder_name'] if checkpoint_metadata is not None else args.encoder_name,
             'image_size': image_size,
             'crop_size': crop_size,
-            'num_memory_supports': int(len(memory_bank)),
-            'num_t_open_support_samples': int(len(support_df)),
+            'num_pseudo_classes': int(memory_system['num_pseudo_classes']),
+            'num_head_pseudo_classes': int(memory_system['num_head_pseudo_classes']),
+            'num_tail_pseudo_classes': int(memory_system['num_tail_pseudo_classes']),
+            'num_tail_memory_banks': int(memory_system['num_tail_memory_banks']),
             'tgb_memory_fusion_lambda': float(args.tgb_memory_fusion_lambda),
             'tgb_memory_topk_ratio': float(args.tgb_memory_topk_ratio),
+            'tgb_mem_max_patches_per_class': int(args.tgb_mem_max_patches_per_class),
         }
         memory_saved = save_tailguard_b_memory_artifacts(
             args.tgb_memory_dir,
-            memory_bank,
+            memory_system,
             score_df,
             per_class_metrics,
             memory_eval_summary,
             memory_metadata,
             metrics_by_mode=metrics_by_mode,
         )
+        memory_status = 'completed'
         print_fn('saved tailguard-b memory artifacts to {}'.format(args.tgb_memory_dir))
         print_fn(json.dumps(memory_eval_summary, indent=2, ensure_ascii=False))
 
@@ -568,14 +680,41 @@ def train(item_list):
         'attachment_artifacts': attachment_saved,
         'attachment_replay_config_path': getattr(args, 'tgb_attachment_replay_config_path', None),
         'stage2_artifacts': stage2_saved,
+        'denoising_diagnostics_artifacts': denoising_diagnostics_artifacts,
+        'denoising_diagnostics_summary': {
+            'cleanup_status': denoising_diagnostics_summary['cleanup_status'],
+            'cleanup_reason': denoising_diagnostics_summary['cleanup_reason'],
+            'decision_counts': denoising_diagnostics_summary['decision_counts'],
+            'contamination_counts': denoising_diagnostics_summary['contamination_counts'],
+            'contamination_metrics': denoising_diagnostics_summary['contamination_metrics'],
+        },
+        'pseudo_class_status': pseudoclass_status,
+        'pseudo_class_reason': pseudoclass_reason,
+        'pseudo_class_artifacts': pseudoclass_artifacts,
+        'pseudo_class_report_artifacts': pseudoclass_report_artifacts,
+        'pseudo_class_summary': None if pseudoclass_registry is None else {
+            'num_pseudo_classes': pseudoclass_registry['summary']['num_pseudo_classes'],
+            'num_head_pseudo_classes': pseudoclass_registry['summary']['num_head_pseudo_classes'],
+            'num_tail_pseudo_classes': pseudoclass_registry['summary']['num_tail_pseudo_classes'],
+            'num_tail_singleton_classes': pseudoclass_registry['summary']['num_tail_singleton_classes'],
+        },
         'final_eval_summary': final_eval_summary,
+        'memory_status': memory_status,
+        'memory_config': {
+            'tgb_memory_fusion_lambda': float(args.tgb_memory_fusion_lambda),
+            'tgb_memory_topk_ratio': float(args.tgb_memory_topk_ratio),
+            'tgb_mem_max_patches_per_class': int(args.tgb_mem_max_patches_per_class),
+        },
         'memory_eval_summary': memory_eval_summary,
         'memory_artifacts': memory_saved,
+        'num_pseudo_classes': 0 if memory_system is None else int(memory_system['num_pseudo_classes']),
+        'num_head_pseudo_classes': 0 if memory_system is None else int(memory_system['num_head_pseudo_classes']),
+        'num_tail_pseudo_classes': 0 if memory_system is None else int(memory_system['num_tail_pseudo_classes']),
+        'num_tail_memory_banks': 0 if memory_system is None else int(memory_system['num_tail_memory_banks']),
         'total_time_s': float(total_time),
         'time_per_iter_s': float(time_per_iter),
         'iters_per_sec': float(iters_per_sec),
         'samples_per_sec': float(samples_per_sec),
-        'num_memory_supports': int(len(memory_bank)),
     }
     summary_path = save_tailguard_b_summary(args.tgb_root_dir, tailguard_b_summary)
     print_fn('saved tailguard-b summary to {}'.format(summary_path))
@@ -671,6 +810,12 @@ if __name__ == '__main__':
         choices=['empirical_conformity', 'h_calibrated', 'rgd'],
     )
     parser.add_argument('--tgb_elbow_min_segment', type=int, default=3)
+    parser.add_argument(
+        '--tgb_rgd_split_mode',
+        type=str,
+        default='segmented_bic',
+        choices=['segmented_bic', 'largest_positive_gap'],
+    )
     parser.add_argument('--tgb_stable_window', type=int, default=3)
     parser.add_argument('--tgb_stable_min_observations', type=int, default=1)
     parser.add_argument('--tgb_t_attached_noise_p_high_thr', type=float, default=0.5)
@@ -679,9 +824,10 @@ if __name__ == '__main__':
     parser.add_argument('--tgb_memory_fusion_lambda', type=float, default=1.0)
     parser.add_argument('--tgb_memory_topk_ratio', type=float, default=0.05)
     parser.add_argument('--tgb_mem_chunk_size', type=int, default=4096)
-    parser.add_argument('--tgb_mem_max_patches_per_support', type=int, default=20000)
-    parser.add_argument('--mem_max_patches_per_class', type=int, default=20000)
+    parser.add_argument('--tgb_mem_max_patches_per_class', type=int, default=20000)
     args = parser.parse_args()
+    if not args.tgb_save_cls_embeddings:
+        parser.error('--tgb_save_cls_embeddings is required for TailGuard-B pseudo-class artifacts and replay')
 
     logger = get_logger(args.save_name, os.path.join(args.save_dir, args.save_name))
     print_fn = logger.info
@@ -702,11 +848,14 @@ if __name__ == '__main__':
             'tgb_attachment_membership_mode': args.tgb_attachment_membership_mode,
             'tgb_min_clean_group_size': args.tgb_min_clean_group_size,
             'tgb_elbow_min_segment': args.tgb_elbow_min_segment,
+            'tgb_rgd_split_mode': args.tgb_rgd_split_mode,
             'tgb_stable_window': args.tgb_stable_window,
             'tgb_stable_min_observations': args.tgb_stable_min_observations,
             'tgb_t_attached_noise_p_high_thr': args.tgb_t_attached_noise_p_high_thr,
             'gbps_prune_ratio': args.gbps_prune_ratio,
             'gbps_min_keep_per_group': args.gbps_min_keep_per_group,
+            'tgb_gbps_dir_relpath': os.path.relpath(args.diag_save_dir, args.tgb_root_dir),
+            'tgb_gbps_dir': args.diag_save_dir,
         },
     )
 

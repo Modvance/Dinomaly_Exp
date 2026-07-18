@@ -34,10 +34,6 @@ def _metadata_view(metadata_df: pd.DataFrame):
         'sample_idx', 'sample_key', 'img_path', 'base_idx', 'tail_candidate', 'pred_class_size',
         'tail_score', 'adaptive_angle', 'group_id', 'group_size',
     ]
-    optional_columns = ['class_id', 'class_name', 'is_contaminated']
-    for column in optional_columns:
-        if column in metadata_df.columns:
-            columns.append(column)
     view = metadata_df[columns].copy()
     view['sample_idx'] = view['sample_idx'].astype(int)
     view['tail_candidate'] = view['tail_candidate'].astype(int)
@@ -46,7 +42,7 @@ def _metadata_view(metadata_df: pd.DataFrame):
 
 
 def enrich_scores_with_tailguard_b_metadata(scored_df: pd.DataFrame, metadata_df: pd.DataFrame):
-    scored = scored_df.copy()
+    scored = scored_df.drop(columns=['is_contaminated', 'class_name'], errors='ignore').copy()
     scored['sample_idx'] = scored['sample_idx'].astype(int)
     metadata_view = _metadata_view(metadata_df)
     drop_columns = [column for column in metadata_view.columns if column in scored.columns and column != 'sample_idx']

@@ -47,6 +47,25 @@ METHOD_METADATA_COLUMNS = [
     'group_size',
 ]
 
+ANALYSIS_METADATA_COLUMNS = [
+    'sample_idx',
+    'sample_key',
+    'img_path',
+    'base_idx',
+    'class_id',
+    'class_name',
+    'is_contaminated',
+]
+
+
+def _analysis_metadata_view(full_metadata_df: pd.DataFrame) -> pd.DataFrame:
+    available_columns = [column for column in ANALYSIS_METADATA_COLUMNS if column in full_metadata_df.columns]
+    analysis_metadata_df = full_metadata_df[available_columns].copy()
+    for column in ANALYSIS_METADATA_COLUMNS:
+        if column not in analysis_metadata_df.columns:
+            analysis_metadata_df[column] = np.nan
+    return analysis_metadata_df[ANALYSIS_METADATA_COLUMNS]
+
 
 def _parse_k_candidates(values):
     if values is None:
@@ -153,7 +172,9 @@ def prepare_tailguard_b_metadata(model,
                                  train_eval_dataloader,
                                  device,
                                  output_dir: Optional[str],
-                                 args):
+                                 args,
+                                 manifest_path: Optional[str] = None,
+                                 manifest_requested_path: Optional[str] = None):
     tail_embedding_source = getattr(args, 'tgb_tail_embedding_source', None) or getattr(args, 'tailsampler_embedding_source', 'encoder_cls')
     group_embedding_source = getattr(args, 'tgb_group_embedding_source', None) or getattr(args, 'gbps_embedding_source', 'encoder')
 
@@ -214,6 +235,7 @@ def prepare_tailguard_b_metadata(model,
     full_metadata_df = full_metadata_df.sort_values('sample_idx').reset_index(drop=True)
 
     train_metadata_df = full_metadata_df[METHOD_METADATA_COLUMNS].copy()
+    analysis_metadata_df = _analysis_metadata_view(full_metadata_df)
     candidates_df = candidates_df.sort_values('sample_idx').reset_index(drop=True)
     head_group_assignments_df = head_group_assignments_df.sort_values('sample_idx').reset_index(drop=True)
 
@@ -283,6 +305,11 @@ def prepare_tailguard_b_metadata(model,
         'tail_embedding_source': tail_embedding_source,
         'group_embedding_source': group_embedding_source,
         'adaptive_angle_source': angle_source,
+        'analysis_metadata_provenance': {
+            'manifest_path': manifest_path,
+            'manifest_requested_path': manifest_requested_path,
+            'label_column': 'is_contaminated',
+        },
         'group_info': group_info,
         'tail_sampler_analysis_only_summary': analysis_summary,
         'tail_sampler_analysis_only_artifacts': analysis_saved,
@@ -312,12 +339,14 @@ def prepare_tailguard_b_metadata(model,
             metadata=metadata,
             cls_embeddings_payload=cls_payload if bool(getattr(args, 'tgb_save_cls_embeddings', True)) else None,
             grouping_embeddings_payload=grouping_payload if bool(getattr(args, 'tgb_save_grouping_embeddings', True)) else None,
+            analysis_metadata_df=analysis_metadata_df,
         )
 
     return {
         'candidates_df': candidates_df,
         'head_group_assignments_df': head_group_assignments_df,
         'train_metadata_df': train_metadata_df,
+        'analysis_metadata_df': analysis_metadata_df,
         'full_metadata_df': full_metadata_df,
         'cls_embeddings_payload': cls_payload,
         'grouping_embeddings_payload': grouping_payload,
