@@ -116,6 +116,9 @@ def replay(parsed_args):
     membership_scores_df = attachment_plan['membership_scores_df']
     membership_calibration_df = attachment_plan['membership_calibration_df']
     membership_summary = attachment_plan['membership_summary']
+    rgd_distances_df = attachment_plan['rgd_distances_df']
+    rgd_scores_df = attachment_plan['rgd_scores_df']
+    rgd_split_summary = attachment_plan['rgd_split_summary']
 
     tail_head_normal_df, tail_head_noise_df, stable_risk_df = classify_tail_attached_stable_risk(
         tail_attached_df,
@@ -137,6 +140,9 @@ def replay(parsed_args):
         membership_scores_df=membership_scores_df,
         membership_calibration_df=membership_calibration_df,
         membership_summary=membership_summary,
+        rgd_distances_df=rgd_distances_df,
+        rgd_scores_df=rgd_scores_df,
+        rgd_split_summary=rgd_split_summary,
     )
     stable_risk_path = os.path.join(attachment_dir, 'tail_attached_stable_risk.csv')
     stable_risk_df.to_csv(stable_risk_path, index=False)
@@ -184,7 +190,7 @@ if __name__ == '__main__':
         '--tgb_attachment_membership_mode',
         type=str,
         default=None,
-        choices=['empirical_conformity', 'h_calibrated'],
+        choices=['empirical_conformity', 'h_calibrated', 'rgd'],
     )
     parser.add_argument('--tgb_min_clean_group_size', type=int, default=None)
     parser.add_argument('--tgb_elbow_min_segment', type=int, default=None)

@@ -122,7 +122,10 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
                                           tail_head_noise_df: pd.DataFrame,
                                           membership_scores_df: Optional[pd.DataFrame] = None,
                                           membership_calibration_df: Optional[pd.DataFrame] = None,
-                                          membership_summary: Optional[Dict] = None):
+                                          membership_summary: Optional[Dict] = None,
+                                          rgd_distances_df: Optional[pd.DataFrame] = None,
+                                          rgd_scores_df: Optional[pd.DataFrame] = None,
+                                          rgd_split_summary: Optional[Dict] = None):
     os.makedirs(output_dir, exist_ok=True)
     geometry_path = os.path.join(output_dir, 'clean_head_group_geometry.pt')
     conformity_path = os.path.join(output_dir, 'tail_group_conformity.csv')
@@ -135,6 +138,9 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
     membership_scores_path = os.path.join(output_dir, 'tail_group_membership_scores.csv')
     membership_calibration_path = os.path.join(output_dir, 'head_group_membership_calibration.csv')
     membership_summary_path = os.path.join(output_dir, 'attachment_membership_summary.json')
+    rgd_distances_path = os.path.join(output_dir, 'tail_rgd_group_distances.csv')
+    rgd_scores_path = os.path.join(output_dir, 'tail_rgd_scores.csv')
+    rgd_split_summary_path = os.path.join(output_dir, 'rgd_split_summary.json')
 
     torch.save(geometry, geometry_path)
     conformity_df.to_csv(conformity_path, index=False)
@@ -159,6 +165,18 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
         _write_json(membership_summary_path, membership_summary)
     else:
         membership_summary_path = None
+    if rgd_distances_df is not None:
+        rgd_distances_df.to_csv(rgd_distances_path, index=False)
+    else:
+        rgd_distances_path = None
+    if rgd_scores_df is not None:
+        rgd_scores_df.to_csv(rgd_scores_path, index=False)
+    else:
+        rgd_scores_path = None
+    if rgd_split_summary is not None:
+        _write_json(rgd_split_summary_path, rgd_split_summary)
+    else:
+        rgd_split_summary_path = None
     return {
         'clean_head_group_geometry_pt': geometry_path,
         'tail_group_conformity_csv': conformity_path,
@@ -171,6 +189,9 @@ def save_tailguard_b_attachment_artifacts(output_dir: str,
         'tail_group_membership_scores_csv': membership_scores_path,
         'head_group_membership_calibration_csv': membership_calibration_path,
         'attachment_membership_summary_json': membership_summary_path,
+        'tail_rgd_group_distances_csv': rgd_distances_path,
+        'tail_rgd_scores_csv': rgd_scores_path,
+        'rgd_split_summary_json': rgd_split_summary_path,
     }
 
 

@@ -234,6 +234,272 @@ def split_tail_by_attachment_elbow(attachment_scores_df: pd.DataFrame, args):
     return tail_open_df, tail_attached_df, summary
 
 
+RGD_RAW_DISTANCE_COLUMNS = [
+    'sample_idx',
+    'sample_key',
+    'group_id',
+    'distance',
+    'conformity',
+]
+
+RGD_SCORE_COLUMNS = [
+    'best_group_id',
+    'best_distance',
+    'second_group_id',
+    'second_distance',
+    'other_group_median_distance',
+    'relative_group_dominance',
+    'rgd_threshold',
+    'rgd_status',
+]
+
+
+def _is_finite_nonzero_vector(vector: torch.Tensor) -> bool:
+    return bool(
+        torch.isfinite(vector).all().item()
+        and torch.linalg.vector_norm(vector).item() > 1e-12
+    )
+
+
+def _new_rgd_score_row(row: pd.Series, status: str):
+    score_row = row.to_dict()
+    score_row.update({
+        'best_group_id': -1,
+        'best_distance': np.nan,
+        'second_group_id': -1,
+        'second_distance': np.nan,
+        'other_group_median_distance': np.nan,
+        'relative_group_dominance': np.nan,
+        'rgd_threshold': np.nan,
+        'rgd_status': status,
+    })
+    return score_row
+
+
+def compute_tail_relative_group_dominance(tail_df: pd.DataFrame,
+                                          geometry: Dict,
+                                          grouping_embeddings_payload: Dict):
+    tail_df = tail_df.copy().reset_index(drop=True)
+    embedding_map = _embedding_lookup(grouping_embeddings_payload)
+    valid_groups = sorted(
+        (
+            (int(group_id), entry)
+            for group_id, entry in geometry.get('groups', {}).items()
+            if (
+                bool(entry.get('valid_group', False))
+                and _is_finite_nonzero_vector(entry['centroid'])
+            )
+        ),
+        key=lambda item: item[0],
+    )
+    raw_distance_rows = []
+    score_rows = []
+
+    for _, row in tail_df.iterrows():
+        sample_idx = int(row['sample_idx'])
+        sample_key = int(row.get('sample_key', sample_idx))
+        if len(valid_groups) < 2:
+            score_rows.append(_new_rgd_score_row(row, 'open_insufficient_valid_groups'))
+            continue
+
+        vector = embedding_map.get(sample_idx)
+        if vector is None:
+            score_rows.append(_new_rgd_score_row(row, 'open_missing_embedding'))
+            continue
+        if not _is_finite_nonzero_vector(vector):
+            score_rows.append(_new_rgd_score_row(row, 'open_invalid_embedding'))
+            continue
+
+        group_distances = []
+        has_invalid_distance = False
+        for group_id, entry in valid_groups:
+            centroid = entry['centroid'].to(vector.device)
+            distance = float(1.0 - torch.clamp(vector @ centroid, min=-1.0, max=1.0).item())
+            raw_distance_rows.append({
+                'sample_idx': sample_idx,
+                'sample_key': sample_key,
+                'group_id': group_id,
+                'distance': distance,
+                'conformity': np.nan,
+            })
+            if not np.isfinite(distance):
+                has_invalid_distance = True
+            group_distances.append((group_id, distance))
+
+        if has_invalid_distance:
+            score_rows.append(_new_rgd_score_row(row, 'open_invalid_distance'))
+            continue
+
+        group_distances.sort(key=lambda item: (item[1], item[0]))
+        best_group_id, best_distance = group_distances[0]
+        second_group_id, second_distance = group_distances[1]
+        other_distances = np.asarray(
+            [distance for _, distance in group_distances[1:]],
+            dtype=np.float64,
+        )
+        other_median = float(np.median(other_distances))
+        if not np.isfinite(other_median) or other_median <= 1e-12:
+            score_rows.append(_new_rgd_score_row(row, 'open_invalid_rgd'))
+            continue
+
+        dominance = float(1.0 - float(best_distance) / other_median)
+        if not np.isfinite(dominance):
+            score_rows.append(_new_rgd_score_row(row, 'open_invalid_rgd'))
+            continue
+
+        score_row = _new_rgd_score_row(row, 'pending_rgd_split')
+        score_row.update({
+            'best_group_id': int(best_group_id),
+            'best_distance': float(best_distance),
+            'second_group_id': int(second_group_id),
+            'second_distance': float(second_distance),
+            'other_group_median_distance': other_median,
+            'relative_group_dominance': dominance,
+        })
+        score_rows.append(score_row)
+
+    raw_distances_df = pd.DataFrame(raw_distance_rows, columns=RGD_RAW_DISTANCE_COLUMNS)
+    scores_df = pd.DataFrame(score_rows)
+    if len(scores_df) == 0:
+        scores_df = tail_df.copy()
+        for column in RGD_SCORE_COLUMNS:
+            scores_df[column] = []
+    return raw_distances_df, scores_df, int(len(valid_groups))
+
+
+def _rgd_fallback(scores_df: pd.DataFrame,
+                  scoreable_index: pd.Index,
+                  summary: Dict):
+    output_df = scores_df.copy()
+    if len(scoreable_index) > 0:
+        output_df.loc[scoreable_index, 'rgd_status'] = 'open_no_valid_rgd_split'
+    open_df = output_df.copy().reset_index(drop=True)
+    attached_df = output_df.iloc[0:0].copy().reset_index(drop=True)
+    summary.update({
+        'split_valid': False,
+        'num_open': int(len(open_df)),
+        'num_head_affiliated': 0,
+    })
+    return output_df, open_df, attached_df, summary
+
+
+def split_tail_by_relative_group_dominance(rgd_scores_df: pd.DataFrame,
+                                            num_valid_groups: int,
+                                            args):
+    scores_df = rgd_scores_df.copy().reset_index(drop=True)
+    min_segment = max(1, int(getattr(args, 'tgb_elbow_min_segment', 3)))
+    base_summary = {
+        'mode': 'rgd',
+        'num_tail': int(len(scores_df)),
+        'num_valid_groups': int(num_valid_groups),
+        'min_segment': int(min_segment),
+        'num_scoreable_rgd': 0,
+        'num_unique_scores': 0,
+        'max_gap': None,
+        'split_index': None,
+        'threshold': None,
+        'sse_1': None,
+        'sse_2': None,
+        'bic_1': None,
+        'bic_2': None,
+    }
+    if len(scores_df) == 0:
+        return scores_df, scores_df.copy(), scores_df.copy(), {
+            **base_summary,
+            'status': 'empty_tail',
+            'split_valid': False,
+            'num_open': 0,
+            'num_head_affiliated': 0,
+        }
+    if num_valid_groups < 2:
+        return _rgd_fallback(
+            scores_df,
+            scores_df.index[scores_df['rgd_status'] == 'pending_rgd_split'],
+            {**base_summary, 'status': 'fallback_insufficient_valid_groups'},
+        )
+
+    scoreable_mask = (
+        (scores_df['rgd_status'] == 'pending_rgd_split')
+        & np.isfinite(scores_df['relative_group_dominance'].to_numpy(dtype=float))
+    )
+    scoreable_df = scores_df.loc[scoreable_mask].sort_values(
+        ['relative_group_dominance', 'sample_idx'],
+        ascending=True,
+        kind='mergesort',
+    )
+    scoreable_index = scoreable_df.index
+    values = scoreable_df['relative_group_dominance'].to_numpy(dtype=np.float64)
+    base_summary.update({
+        'num_scoreable_rgd': int(len(scoreable_df)),
+        'num_unique_scores': int(np.unique(values).size),
+    })
+    if len(scoreable_df) < max(2 * min_segment, 4):
+        return _rgd_fallback(scores_df, scoreable_index, {
+            **base_summary,
+            'status': 'fallback_insufficient_scoreable_tail',
+        })
+
+    gaps = np.diff(values)
+    positive_gap_indices = np.flatnonzero(gaps > 0.0)
+    if len(positive_gap_indices) == 0:
+        return _rgd_fallback(scores_df, scoreable_index, {
+            **base_summary,
+            'status': 'fallback_no_positive_gap',
+        })
+
+    candidate_position = int(positive_gap_indices[np.argmax(gaps[positive_gap_indices])])
+    max_gap = float(gaps[candidate_position])
+    lower_count = candidate_position + 1
+    upper_count = len(scoreable_df) - lower_count
+    base_summary.update({
+        'max_gap': max_gap,
+        'split_index': candidate_position,
+    })
+    if lower_count < min_segment or upper_count < min_segment:
+        return _rgd_fallback(scores_df, scoreable_index, {
+            **base_summary,
+            'status': 'fallback_largest_gap_violates_min_segment',
+        })
+
+    threshold = float((values[candidate_position] + values[candidate_position + 1]) / 2.0)
+    x = np.arange(len(scoreable_df), dtype=float)
+    sse_1 = _linear_sse(x, values)
+    sse_2 = (
+        _linear_sse(x[:lower_count], values[:lower_count])
+        + _linear_sse(x[lower_count:], values[lower_count:])
+    )
+    bic_1 = _bic(sse_1, len(scoreable_df), q=2)
+    bic_2 = _bic(sse_2, len(scoreable_df), q=4)
+    base_summary.update({
+        'threshold': threshold,
+        'sse_1': float(sse_1),
+        'sse_2': float(sse_2),
+        'bic_1': float(bic_1),
+        'bic_2': float(bic_2),
+    })
+    if not (bic_2 < bic_1):
+        return _rgd_fallback(scores_df, scoreable_index, {
+            **base_summary,
+            'status': 'fallback_no_bic_gain',
+        })
+
+    output_df = scores_df.copy()
+    output_df.loc[scoreable_index, 'rgd_threshold'] = threshold
+    attached_mask = scoreable_mask & (output_df['relative_group_dominance'] > threshold)
+    output_df.loc[scoreable_mask & ~attached_mask, 'rgd_status'] = 'open'
+    output_df.loc[attached_mask, 'rgd_status'] = 'head_affiliated'
+    open_df = output_df.loc[output_df['rgd_status'] != 'head_affiliated'].copy().reset_index(drop=True)
+    attached_df = output_df.loc[output_df['rgd_status'] == 'head_affiliated'].copy().reset_index(drop=True)
+    summary = {
+        **base_summary,
+        'status': 'largest_gap_bic_split',
+        'split_valid': True,
+        'num_open': int(len(open_df)),
+        'num_head_affiliated': int(len(attached_df)),
+    }
+    return output_df, open_df, attached_df, summary
+
+
 MEMBERSHIP_SCORE_COLUMNS = [
     'best_group_id',
     'best_group_affinity',
@@ -587,6 +853,41 @@ def build_tail_attachment_plan(tail_df: pd.DataFrame,
             'membership_scores_df': scores_df,
             'membership_calibration_df': calibration_df,
             'membership_summary': membership_summary,
+            'rgd_distances_df': None,
+            'rgd_scores_df': None,
+            'rgd_split_summary': None,
+        }
+    if membership_mode == 'rgd':
+        raw_distances_df, scores_df, num_valid_groups = compute_tail_relative_group_dominance(
+            tail_df,
+            geometry,
+            grouping_embeddings_payload,
+        )
+        scores_df, tail_open_df, tail_attached_df, rgd_summary = split_tail_by_relative_group_dominance(
+            scores_df,
+            num_valid_groups,
+            args,
+        )
+        attachment_summary = dict(rgd_summary)
+        attachment_summary.update({
+            'elbow_valid': bool(rgd_summary['split_valid']),
+            'break_index': rgd_summary['split_index'],
+            'num_tail_open': int(rgd_summary['num_open']),
+            'num_tail_attached': int(rgd_summary['num_head_affiliated']),
+        })
+        return {
+            'geometry': geometry,
+            'conformity_df': pd.DataFrame(columns=['sample_idx', 'sample_key', 'group_id', 'distance', 'conformity']),
+            'attachment_scores_df': scores_df,
+            'tail_open_df': tail_open_df,
+            'tail_attached_df': tail_attached_df,
+            'attachment_summary': attachment_summary,
+            'membership_scores_df': None,
+            'membership_calibration_df': None,
+            'membership_summary': None,
+            'rgd_distances_df': raw_distances_df,
+            'rgd_scores_df': scores_df,
+            'rgd_split_summary': rgd_summary,
         }
     if membership_mode != 'empirical_conformity':
         raise ValueError('unknown TailGuard-B attachment membership mode: {}'.format(membership_mode))
@@ -608,4 +909,7 @@ def build_tail_attachment_plan(tail_df: pd.DataFrame,
         'membership_scores_df': None,
         'membership_calibration_df': None,
         'membership_summary': None,
+        'rgd_distances_df': None,
+        'rgd_scores_df': None,
+        'rgd_split_summary': None,
     }
