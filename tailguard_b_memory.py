@@ -59,7 +59,7 @@ def _sample_patch_features(features: torch.Tensor, quota: int) -> torch.Tensor:
 
 
 def _registry_state(members_df: pd.DataFrame, classes_df: pd.DataFrame):
-    required_members = {'sample_idx', 'img_path', 'pseudo_class_id'}
+    required_members = {'sample_idx', 'pseudo_class_id'}
     required_classes = {'pseudo_class_id', 'pseudo_class_type', 'num_members'}
     missing_members = required_members.difference(members_df.columns)
     missing_classes = required_classes.difference(classes_df.columns)
@@ -72,15 +72,25 @@ def _registry_state(members_df: pd.DataFrame, classes_df: pd.DataFrame):
     members['sample_idx'] = members['sample_idx'].astype(int)
     members['pseudo_class_id'] = members['pseudo_class_id'].astype(int)
     classes['pseudo_class_id'] = classes['pseudo_class_id'].astype(int)
-    if members['sample_idx'].duplicated().any() or members['img_path'].astype(str).duplicated().any():
-        raise ValueError('pseudo-class members must have unique sample_idx and img_path')
+    identity_columns = {'class_id', 'base_idx'}
+    present_identity_columns = identity_columns.intersection(members.columns)
+    if present_identity_columns and present_identity_columns != identity_columns:
+        raise ValueError('pseudo-class members must include both class_id and base_idx')
+    identity_mode = 'class_base' if present_identity_columns == identity_columns else 'legacy_sample_idx'
+    if identity_mode == 'class_base':
+        members['class_id'] = members['class_id'].astype(int)
+        members['base_idx'] = members['base_idx'].astype(int)
+        if members.duplicated(['class_id', 'base_idx']).any():
+            raise ValueError('pseudo-class members must have unique class_id/base_idx identities')
+    if members['sample_idx'].duplicated().any():
+        raise ValueError('pseudo-class members must have unique sample_idx values')
     if classes['pseudo_class_id'].duplicated().any() or (classes['num_members'].astype(int) <= 0).any():
         raise ValueError('pseudo-class registry has invalid classes')
     counts = members.groupby('pseudo_class_id').size().to_dict()
     expected_counts = classes.set_index('pseudo_class_id')['num_members'].astype(int).to_dict()
     if counts != expected_counts:
         raise ValueError('pseudo-class membership counts do not match class registry')
-    return members, classes
+    return members, classes, identity_mode
 
 
 @torch.no_grad()
@@ -90,16 +100,21 @@ def build_tailguard_b_pseudoclass_memory_system(model,
                                                 members_df: pd.DataFrame,
                                                 classes_df: pd.DataFrame,
                                                 args) -> Dict:
-    members, classes = _registry_state(members_df, classes_df)
+    members, classes, identity_mode = _registry_state(members_df, classes_df)
     class_type_lookup = classes.set_index('pseudo_class_id')['pseudo_class_type'].to_dict()
-    member_lookup = {
-        int(row.sample_idx): {
-            'pseudo_class_id': int(row.pseudo_class_id),
-            'img_path': str(row.img_path),
+    if identity_mode == 'class_base':
+        member_lookup = {
+            (int(row.class_id), int(row.base_idx)): int(row.sample_idx)
+            for row in members.itertuples(index=False)
         }
-        for row in members.itertuples(index=False)
-    }
+    else:
+        member_lookup = {
+            int(row.sample_idx): int(row.sample_idx)
+            for row in members.itertuples(index=False)
+        }
+    members_by_sample_idx = members.set_index('sample_idx', drop=False)
     observed = {}
+    loader_keys = set()
     was_training = model.training
     model.eval()
     try:
@@ -107,30 +122,57 @@ def build_tailguard_b_pseudoclass_memory_system(model,
             images = images.to(device)
             patch_features, spatial_size = extract_encoder_patch_tokens(model, images)
             cls_embeddings = _extract_encoder_cls_embeddings(model, images)
-            sample_indices = meta['sample_idx']
-            for index in range(images.shape[0]):
-                sample_idx = int(sample_indices[index])
-                member = member_lookup.get(sample_idx)
-                if member is None:
+            if identity_mode == 'class_base':
+                batch_keys = [
+                    (int(meta['class_id'][index]), int(meta['base_idx'][index]))
+                    for index in range(images.shape[0])
+                ]
+            else:
+                batch_keys = [int(meta['sample_idx'][index]) for index in range(images.shape[0])]
+            for index, member_key in enumerate(batch_keys):
+                if member_key in loader_keys:
+                    raise ValueError('train-eval loader yielded a duplicate member identity')
+                loader_keys.add(member_key)
+                sample_idx = member_lookup.get(member_key)
+                if sample_idx is None:
                     continue
-                if sample_idx in observed:
+                if member_key in observed:
                     raise ValueError('train-eval loader yielded a pseudo-class member more than once')
+                pseudo_class_id = int(members_by_sample_idx.loc[sample_idx, 'pseudo_class_id'])
                 record = {
-                    'pseudo_class_id': member['pseudo_class_id'],
-                    'img_path': member['img_path'],
+                    'pseudo_class_id': pseudo_class_id,
                     'cls': cls_embeddings[index].detach().cpu().contiguous(),
                 }
-                if class_type_lookup[member['pseudo_class_id']] == 'tail':
+                if class_type_lookup[pseudo_class_id] == 'tail':
                     record.update({
                         'patches': patch_features[index].detach().cpu().contiguous(),
                         'spatial_size': tuple(int(value) for value in spatial_size),
                     })
-                observed[sample_idx] = record
+                observed[member_key] = record
     finally:
         if was_training:
             model.train()
 
-    missing_members = sorted(set(member_lookup).difference(observed))
+    expected_keys = set(member_lookup)
+    if loader_keys != expected_keys:
+        missing_from_loader = sorted(expected_keys.difference(loader_keys))
+        unexpected_in_loader = sorted(loader_keys.difference(expected_keys))
+        if identity_mode == 'legacy_sample_idx':
+            raise ValueError(
+                'legacy pseudo-class registry cannot be aligned to the rebuilt train-eval loader: '
+                'registry sample_idx values differ from loader sample_idx values '
+                '(registry={}, loader={}, missing={}, unexpected={}). Regenerate pseudo-class '
+                'artifacts with class_id and base_idx before building final memory.'.format(
+                    len(expected_keys), len(loader_keys), missing_from_loader[:10], unexpected_in_loader[:10]
+                )
+            )
+        raise ValueError(
+            'pseudo-class registry identities do not match the rebuilt train-eval loader '
+            '(registry={}, loader={}, missing={}, unexpected={}).'.format(
+                len(expected_keys), len(loader_keys), missing_from_loader[:10], unexpected_in_loader[:10]
+            )
+        )
+    missing_members = sorted(expected_keys.difference(observed))
     if missing_members:
         raise ValueError('train-eval loader is missing pseudo-class members: {}'.format(missing_members[:10]))
 
@@ -140,9 +182,16 @@ def build_tailguard_b_pseudoclass_memory_system(model,
         pseudo_class_id = int(class_row.pseudo_class_id)
         pseudo_class_type = str(class_row.pseudo_class_type)
         class_members = members.loc[members['pseudo_class_id'] == pseudo_class_id].sort_values(
-            ['img_path', 'sample_idx'], kind='mergesort'
+            ['sample_idx'], kind='mergesort'
         )
-        records = [observed[int(sample_idx)] for sample_idx in class_members['sample_idx'].astype(int)]
+        if identity_mode == 'class_base':
+            class_member_keys = list(zip(
+                class_members['class_id'].astype(int),
+                class_members['base_idx'].astype(int),
+            ))
+        else:
+            class_member_keys = class_members['sample_idx'].astype(int).tolist()
+        records = [observed[member_key] for member_key in class_member_keys]
         cls_matrix = torch.stack([record['cls'] for record in records], dim=0)
         prototype = _normalize_rows(cls_matrix.mean(dim=0, keepdim=True))[0].cpu().contiguous()
         entry = {

@@ -10,6 +10,8 @@ PSEUDO_CLASS_MEMBER_COLUMNS = [
     'sample_idx',
     'sample_key',
     'img_path',
+    'class_id',
+    'base_idx',
     'pseudo_class_id',
     'pseudo_class_type',
     'source_status',
@@ -108,6 +110,8 @@ def _member_row(row: pd.Series,
         'sample_idx': int(row['sample_idx']),
         'sample_key': int(row['sample_key']),
         'img_path': str(row['img_path']),
+        'class_id': int(row['class_id']),
+        'base_idx': int(row['base_idx']),
         'pseudo_class_id': int(pseudo_class_id),
         'pseudo_class_type': pseudo_class_type,
         'source_status': source_status,
@@ -129,11 +133,12 @@ def build_tailguard_b_pseudoclass_registry(h_clean_df: pd.DataFrame,
     retained_samples_df = retained_samples_df.copy().reset_index(drop=True)
     removed_samples_df = removed_samples_df.copy().reset_index(drop=True)
 
+    identity_columns = ['class_id', 'base_idx']
     for name, frame, columns in [
-        ('h_clean_samples', h_clean_df, ['sample_idx', 'sample_key', 'img_path', 'group_id']),
-        ('tail_head_normal_samples', tail_head_normal_df, ['sample_idx', 'sample_key', 'img_path', 'best_group_id']),
-        ('tail_open_samples', tail_open_df, ['sample_idx', 'sample_key', 'img_path', 'adaptive_angle']),
-        ('stage2_retained_samples', retained_samples_df, ['sample_idx']),
+        ('h_clean_samples', h_clean_df, ['sample_idx', 'sample_key', 'img_path', 'group_id'] + identity_columns),
+        ('tail_head_normal_samples', tail_head_normal_df, ['sample_idx', 'sample_key', 'img_path', 'best_group_id'] + identity_columns),
+        ('tail_open_samples', tail_open_df, ['sample_idx', 'sample_key', 'img_path', 'adaptive_angle'] + identity_columns),
+        ('stage2_retained_samples', retained_samples_df, ['sample_idx'] + identity_columns),
         ('stage2_removed_samples', removed_samples_df, ['sample_idx']),
     ]:
         _required_columns(frame, columns, name)
@@ -143,6 +148,24 @@ def build_tailguard_b_pseudoclass_registry(h_clean_df: pd.DataFrame,
     tail_open_ids = _sample_ids(tail_open_df, 'tail_open_samples')
     retained_ids = _sample_ids(retained_samples_df, 'stage2_retained_samples')
     removed_ids = _sample_ids(removed_samples_df, 'stage2_removed_samples')
+    for frame in [h_clean_df, tail_head_normal_df, tail_open_df, retained_samples_df]:
+        frame['class_id'] = frame['class_id'].astype(int)
+        frame['base_idx'] = frame['base_idx'].astype(int)
+    if retained_samples_df.duplicated(['class_id', 'base_idx']).any():
+        raise ValueError('stage2_retained_samples contains duplicate class_id/base_idx identities')
+    retained_identity_by_sample = retained_samples_df.set_index('sample_idx')[['class_id', 'base_idx']]
+    for name, frame in [
+        ('h_clean_samples', h_clean_df),
+        ('tail_head_normal_samples', tail_head_normal_df),
+        ('tail_open_samples', tail_open_df),
+    ]:
+        identities = frame.set_index('sample_idx')[['class_id', 'base_idx']]
+        missing_identity_ids = identities.index.difference(retained_identity_by_sample.index)
+        if len(missing_identity_ids) > 0:
+            raise ValueError('{} contains samples missing from stage2_retained_samples'.format(name))
+        expected = retained_identity_by_sample.loc[identities.index]
+        if not identities.equals(expected):
+            raise ValueError('{} identity does not match stage2_retained_samples'.format(name))
 
     source_ids = h_clean_ids | tail_head_normal_ids | tail_open_ids
     source_overlap = (
@@ -277,6 +300,8 @@ def build_tailguard_b_pseudoclass_registry(h_clean_df: pd.DataFrame,
     member_ids = _sample_ids(members_df, 'pseudo_class_members') if len(members_df) > 0 else set()
     if member_ids != retained_ids:
         raise ValueError('pseudo-class registry does not exactly cover Stage 2 retained samples')
+    if members_df.duplicated(['class_id', 'base_idx']).any():
+        raise ValueError('pseudo-class registry contains duplicate class_id/base_idx identities')
     if len(classes_df) > 0 and (classes_df['num_members'].astype(int) <= 0).any():
         raise ValueError('pseudo-class registry contains an empty class')
     if len(components) != int((classes_df['pseudo_class_type'] == 'tail').sum()):
@@ -299,6 +324,8 @@ def build_tailguard_b_pseudoclass_registry(h_clean_df: pd.DataFrame,
             'source_partitions_cover_retained': True,
             'removed_absent_from_registry': True,
             'registry_member_ids_unique': True,
+            'registry_member_identities_unique': True,
+            'source_identities_match_retained': True,
             'registry_covers_retained': True,
             'tail_components_cover_t_open': len(tail_component_by_sample) == len(tail_open_ids),
             'tail_classes_nonempty': not (len(classes_df) > 0 and (classes_df['num_members'].astype(int) <= 0).any()),

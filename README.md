@@ -353,4 +353,37 @@ python dinomaly_mvtec_tailguard_b.py \
   --tgb_rgd_split_mode segmented_bic \
   --tgb_memory_enable \
   --gpus 1
+
+python dinomaly_mvtec_tailguard_b_attachment_replay.py \
+  --source_tailguard_b_dir ../results/tailguard_b/seg_pareto/tailguard_b \
+  --output_dir ../results/tailguard_b/seg_pareto_attachment_replay_v2
+
+python dinomaly_mvtec_tailguard_b_memory_rebuild.py \
+  --checkpoint_path ../results/tailguard_b/seg_pareto/final_model.pt \
+  --pseudoclass_dir ../results/tailguard_b/seg_pareto_attachment_replay_v2/pseudoclasses \
+  --output_dir ../results/tailguard_b/seg_pareto_memory_rebuild_v2 \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed01 \
+  --gpu 1
+
+python dinomaly_mvtec_tailguard_b_attachment_replay.py \
+  --source_tailguard_b_dir ../results/tailguard_b/seg_pareto/tailguard_b \
+  --output_dir ../results/tailguard_b/seg_pareto_attachment_replay_v2
+
+python dinomaly_mvtec_tailguard_b_memory_rebuild.py \
+  --checkpoint_path ../results/tailguard_b/seg_k4/final_model.pt \
+  --pseudoclass_dir ../results/tailguard_b/seg_k4_attachment_replay_v2/pseudoclasses \
+  --output_dir ../results/tailguard_b/seg_k4_memory_rebuild_v2 \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed01 \
+  --gpu 1
+
+python dinomaly_mvtec_tailguard_b_attachment_replay.py \
+  --source_tailguard_b_dir ../results/tailguard_b/seg_k1/tailguard_b \
+  --output_dir ../results/tailguard_b/seg_k1_attachment_replay_v2
+
+python dinomaly_mvtec_tailguard_b_memory_rebuild.py \
+  --checkpoint_path ../results/tailguard_b/seg_k1/final_model.pt \
+  --pseudoclass_dir ../results/tailguard_b/seg_k1_attachment_replay_v2/pseudoclasses \
+  --output_dir ../results/tailguard_b/seg_k1_memory_rebuild_v2 \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed01 \
+  --gpu 1
 ```
