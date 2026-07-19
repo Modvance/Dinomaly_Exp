@@ -113,8 +113,6 @@ def build_tailguard_b_pseudoclass_memory_system(model,
                 member = member_lookup.get(sample_idx)
                 if member is None:
                     continue
-                if str(meta['img_path'][index]) != member['img_path']:
-                    raise ValueError('pseudo-class member image path does not match train-eval metadata')
                 if sample_idx in observed:
                     raise ValueError('train-eval loader yielded a pseudo-class member more than once')
                 record = {

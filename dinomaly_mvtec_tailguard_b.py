@@ -596,6 +596,16 @@ def train(item_list):
         last_eval_iter = int(it)
         model.train()
 
+    checkpoint_path = save_train_checkpoint(
+        args.save_dir,
+        args.save_name,
+        model,
+        iteration=it,
+        args=args,
+        final_eval_summary=final_eval_summary,
+    )
+    print_fn('saved final model checkpoint to {} before memory evaluation'.format(checkpoint_path))
+
     memory_system = None
     memory_status = 'disabled' if not bool(args.tgb_memory_enable) else 'skipped_pseudoclasses_unavailable'
     if bool(args.tgb_memory_enable) and pseudoclass_registry is not None:
@@ -659,16 +669,6 @@ def train(item_list):
     print_fn('  time_per_iter_s   {:.4f}'.format(time_per_iter))
     print_fn('  iters_per_sec     {:.4f}'.format(iters_per_sec))
     print_fn('  samples_per_sec   {:.2f}'.format(samples_per_sec))
-
-    checkpoint_path = save_train_checkpoint(
-        args.save_dir,
-        args.save_name,
-        model,
-        iteration=it,
-        args=args,
-        final_eval_summary=final_eval_summary,
-    )
-    print_fn('saved final model checkpoint to {}'.format(checkpoint_path))
 
     tailguard_b_summary = {
         'checkpoint_path': checkpoint_path,
