@@ -233,7 +233,8 @@ def save_tailguard_b_pseudoclass_artifacts(output_dir: str,
                                            members_df: pd.DataFrame,
                                            classes_df: pd.DataFrame,
                                            tail_edges_df: pd.DataFrame,
-                                           summary: Dict):
+                                           summary: Dict,
+                                           metadata: Dict = None):
     os.makedirs(output_dir, exist_ok=True)
     members_path = os.path.join(output_dir, 'pseudo_class_members.csv')
     classes_path = os.path.join(output_dir, 'pseudo_classes.csv')
@@ -242,7 +243,10 @@ def save_tailguard_b_pseudoclass_artifacts(output_dir: str,
     members_df.to_csv(members_path, index=False)
     classes_df.to_csv(classes_path, index=False)
     tail_edges_df.to_csv(tail_edges_path, index=False)
-    _write_json(summary_path, summary)
+    registry = dict(summary)
+    if metadata is not None:
+        registry.update(metadata)
+    _write_json(summary_path, registry)
     return {
         'pseudo_class_members_csv': members_path,
         'pseudo_classes_csv': classes_path,

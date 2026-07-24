@@ -366,15 +366,15 @@ python dinomaly_mvtec_tailguard_b_memory_rebuild.py \
   --gpu 1
 
 python dinomaly_mvtec_tailguard_b_attachment_replay.py \
-  --source_tailguard_b_dir ../results/tailguard_b/seg_pareto/tailguard_b \
-  --output_dir ../results/tailguard_b/seg_pareto_attachment_replay_v2
+  --source_tailguard_b_dir ../results/tailguard_b/seg_k4/tailguard_b \
+  --output_dir ../results/tailguard_b/seg_k4_attachment_replay_v2
 
 python dinomaly_mvtec_tailguard_b_memory_rebuild.py \
   --checkpoint_path ../results/tailguard_b/seg_k4/final_model.pt \
   --pseudoclass_dir ../results/tailguard_b/seg_k4_attachment_replay_v2/pseudoclasses \
   --output_dir ../results/tailguard_b/seg_k4_memory_rebuild_v2 \
   --data_path ../LTN_datasets/mvtecad-step_k4-seed01 \
-  --gpu 1
+  --gpu 0
 
 python dinomaly_mvtec_tailguard_b_attachment_replay.py \
   --source_tailguard_b_dir ../results/tailguard_b/seg_k1/tailguard_b \
@@ -386,4 +386,43 @@ python dinomaly_mvtec_tailguard_b_memory_rebuild.py \
   --output_dir ../results/tailguard_b/seg_k1_memory_rebuild_v2 \
   --data_path ../LTN_datasets/mvtecad-step_k1-seed01 \
   --gpu 1
+
+python dinomaly_visa_tailguard_b.py \
+  --data_path ../LTN_visa/visa-pareto-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b/visa \
+  --save_name seg_pareto \
+  --gbps_auto_k \
+  --tgb_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --tgb_attachment_membership_mode rgd \
+  --tgb_rgd_split_mode segmented_bic \
+  --tgb_memory_enable \
+  --gpus 0
+
+python dinomaly_visa_tailguard_b.py \
+  --data_path ../LTN_visa/visa-step_k4-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b/visa \
+  --save_name seg_k4 \
+  --gbps_auto_k \
+  --tgb_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --tgb_attachment_membership_mode rgd \
+  --tgb_rgd_split_mode segmented_bic \
+  --tgb_memory_enable \
+  --gpus 1
+
+python dinomaly_visa_tailguard_b.py \
+  --data_path ../LTN_visa/visa-step_k1-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard_b/visa \
+  --save_name seg_k1 \
+  --gbps_auto_k \
+  --tgb_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --tgb_attachment_membership_mode rgd \
+  --tgb_rgd_split_mode segmented_bic \
+  --tgb_memory_enable \
+  --gpus 2
 ```

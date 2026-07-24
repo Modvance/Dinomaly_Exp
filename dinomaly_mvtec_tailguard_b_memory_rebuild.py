@@ -8,11 +8,19 @@ import pandas as pd
 import torch
 
 from dinomaly_train_base import (
+    _checkpoint_args_get,
     build_datasets,
     load_model_from_train_checkpoint,
+    load_train_checkpoint_metadata,
     rebuild_pruned_train_loaders,
 )
-from one_shot_memory import MVTec_ITEM_LIST
+from tailguard_b_dataset_profiles import (
+    MVTec_PROFILE,
+    dataset_profile_names,
+    get_dataset_profile,
+    profile_provenance,
+    validate_profile_contract,
+)
 from tailguard_b_artifacts import save_tailguard_b_memory_artifacts
 from tailguard_b_gbps import _build_retained_index_map
 from tailguard_b_memory import (
@@ -21,15 +29,8 @@ from tailguard_b_memory import (
 )
 
 
-def _checkpoint_value(metadata, name, default):
-    checkpoint_args = metadata.get('args') or {}
-    if isinstance(checkpoint_args, dict):
-        return checkpoint_args.get(name, default)
-    return getattr(checkpoint_args, name, default)
-
-
 def _resolve(value, metadata, name, default):
-    resolved = _checkpoint_value(metadata, name, default) if value is None else value
+    resolved = _checkpoint_args_get(metadata.get('args'), name, default) if value is None else value
     return default if resolved is None else resolved
 
 
@@ -45,6 +46,51 @@ def _ratio_value(value, name):
     if not math.isfinite(numeric) or not 0.0 < numeric <= 1.0:
         raise ValueError('{} must be in (0, 1]: {}'.format(name, value))
     return numeric
+
+
+def _resolve_dataset_profile(parsed_args, checkpoint_metadata):
+    checkpoint_profile_name = _checkpoint_args_get(checkpoint_metadata.get('args'), 'dataset_profile', None)
+    if checkpoint_profile_name is not None:
+        checkpoint_profile = get_dataset_profile(checkpoint_profile_name)
+    else:
+        checkpoint_profile = None
+
+    if parsed_args.dataset_profile is not None:
+        profile = get_dataset_profile(parsed_args.dataset_profile)
+    elif checkpoint_profile is not None:
+        profile = checkpoint_profile
+    else:
+        profile = MVTec_PROFILE
+        print('checkpoint has no dataset profile; falling back to legacy MVTec profile')
+
+    validate_profile_contract(
+        profile,
+        checkpoint_profile_name,
+        _checkpoint_args_get(checkpoint_metadata.get('args'), 'dataset_item_list', None),
+        'checkpoint',
+    )
+    return profile
+
+
+def _validate_pseudoclass_profile(pseudoclass_dir, profile):
+    registry_path = os.path.join(pseudoclass_dir, 'pseudo_class_registry.json')
+    if not os.path.isfile(registry_path):
+        print('pseudo-class registry has no provenance; allowing legacy rebuild')
+        return
+    with open(registry_path, 'r', encoding='utf-8') as file:
+        registry = json.load(file)
+    provenance = registry.get('dataset_provenance')
+    if provenance is None:
+        print('pseudo-class registry has no dataset provenance; allowing legacy rebuild')
+        return
+    if not isinstance(provenance, dict):
+        raise ValueError('pseudo-class registry dataset_provenance must be an object')
+    validate_profile_contract(
+        profile,
+        provenance.get('profile_name'),
+        provenance.get('item_list'),
+        'pseudo-class registry',
+    )
 
 
 def _retained_index_map(members_df, train_data_list):
@@ -80,22 +126,27 @@ def rebuild_memory(parsed_args):
     checkpoint_path = os.path.realpath(parsed_args.checkpoint_path)
     pseudoclass_dir = os.path.realpath(parsed_args.pseudoclass_dir)
     output_dir = os.path.realpath(parsed_args.output_dir)
-    data_path = os.path.realpath(parsed_args.data_path)
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError('final model checkpoint does not exist: {}'.format(checkpoint_path))
     if not os.path.isdir(pseudoclass_dir):
         raise FileNotFoundError('pseudo-class directory does not exist: {}'.format(pseudoclass_dir))
-    if not os.path.isdir(data_path):
-        raise FileNotFoundError('dataset directory does not exist: {}'.format(data_path))
     if os.path.exists(output_dir):
         raise FileExistsError('output_dir must not already exist: {}'.format(output_dir))
 
+    checkpoint_metadata = load_train_checkpoint_metadata(checkpoint_path)
+    profile = _resolve_dataset_profile(parsed_args, checkpoint_metadata)
+    data_path = os.path.realpath(parsed_args.data_path or profile.default_data_path)
+    if not os.path.isdir(data_path):
+        raise FileNotFoundError('dataset directory does not exist: {}'.format(data_path))
+    _validate_pseudoclass_profile(pseudoclass_dir, profile)
     members_df = pd.read_csv(os.path.join(pseudoclass_dir, 'pseudo_class_members.csv'))
     classes_df = pd.read_csv(os.path.join(pseudoclass_dir, 'pseudo_classes.csv'))
     gpu = _integer_value(parsed_args.gpu, 'gpu', 0)
     device = torch.device('cuda:{}'.format(gpu) if torch.cuda.is_available() else 'cpu')
-    model, _, checkpoint_metadata = load_model_from_train_checkpoint(checkpoint_path, device)
+    model, _, _ = load_model_from_train_checkpoint(checkpoint_path, device)
+    dataset_provenance = profile_provenance(profile, data_path)
     checkpoint_provenance = {
+        'dataset_provenance': dataset_provenance,
         'checkpoint_path': checkpoint_path,
         'iteration': checkpoint_metadata['iteration'],
         'encoder_name': checkpoint_metadata['encoder_name'],
@@ -158,7 +209,7 @@ def rebuild_memory(parsed_args):
     del checkpoint_metadata
     train_data_list, test_data_list = build_datasets(
         data_path,
-        MVTec_ITEM_LIST,
+        profile.item_list,
         image_size=checkpoint_provenance['image_size'],
         crop_size=checkpoint_provenance['crop_size'],
     )
@@ -166,7 +217,7 @@ def rebuild_memory(parsed_args):
         train_data_list,
         _retained_index_map(members_df, train_data_list),
         data_root=data_path,
-        item_list=MVTec_ITEM_LIST,
+        item_list=profile.item_list,
         batch_size=batch_size,
         num_workers=num_workers,
         diag_batch_size=diag_batch_size,
@@ -183,7 +234,7 @@ def rebuild_memory(parsed_args):
     score_df, per_class_metrics, summary, metrics_by_mode = run_pseudoclass_memory_evaluation(
         model,
         test_data_list,
-        MVTec_ITEM_LIST,
+        profile.item_list,
         memory_system,
         memory_args,
         device,
@@ -197,6 +248,7 @@ def rebuild_memory(parsed_args):
         summary,
         {
             'checkpoint_provenance': checkpoint_provenance,
+            'dataset_provenance': dataset_provenance,
             'pseudoclass_dir': pseudoclass_dir,
             'data_path': data_path,
             'device': str(device),
@@ -219,6 +271,7 @@ def rebuild_memory(parsed_args):
     )
     result = {
         'checkpoint_provenance': checkpoint_provenance,
+        'dataset_provenance': dataset_provenance,
         'pseudoclass_dir': pseudoclass_dir,
         'data_path': data_path,
         'memory_artifacts': artifacts,
@@ -234,7 +287,8 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_path', type=str, required=True)
     parser.add_argument('--pseudoclass_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
-    parser.add_argument('--data_path', type=str, default='../mvtec_anomaly_detection')
+    parser.add_argument('--dataset_profile', type=str, choices=dataset_profile_names(), default=None)
+    parser.add_argument('--data_path', type=str, default=None)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--batch_size', type=int, default=None)
     parser.add_argument('--num_workers', type=int, default=None)

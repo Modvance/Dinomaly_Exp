@@ -19,6 +19,7 @@ from dinomaly_train_base import (
     build_optimizer_and_scheduler,
     build_train_dataloader,
     build_train_eval_dataloader,
+    _checkpoint_args_get,
     evaluate_model,
     get_logger,
     load_model_from_train_checkpoint,
@@ -59,6 +60,13 @@ from tailguard_b_memory import (
     build_tailguard_b_pseudoclass_memory_system,
     run_pseudoclass_memory_evaluation,
 )
+from tailguard_b_dataset_profiles import (
+    MVTec_PROFILE,
+    dataset_profile_names,
+    get_dataset_profile,
+    profile_provenance,
+    validate_profile_contract,
+)
 from tailguard_b_prepare import prepare_tailguard_b_metadata
 from tailguard_b_pseudoclasses import build_tailguard_b_pseudoclass_registry
 from warmup_diag import load_injected_manifest
@@ -67,10 +75,7 @@ warnings = __import__('warnings')
 warnings.filterwarnings('ignore')
 
 
-MVTec_ITEM_LIST = [
-    'carpet', 'grid', 'leather', 'tile', 'wood', 'bottle', 'cable', 'capsule',
-    'hazelnut', 'metal_nut', 'pill', 'screw', 'toothbrush', 'transistor', 'zipper',
-]
+MVTec_ITEM_LIST = list(MVTec_PROFILE.item_list)
 
 
 def _build_retained_index_map(samples_df: pd.DataFrame, num_classes=None):
@@ -81,6 +86,16 @@ def _build_retained_index_map(samples_df: pd.DataFrame, num_classes=None):
     for class_id, class_df in samples_df.groupby('class_id', sort=True):
         retained_index_map[int(class_id)] = [int(value) for value in class_df['base_idx'].astype(int).tolist()]
     return retained_index_map
+
+
+def _validate_checkpoint_profile(profile, checkpoint_metadata):
+    checkpoint_args = checkpoint_metadata.get('args') or {}
+    validate_profile_contract(
+        profile,
+        _checkpoint_args_get(checkpoint_args, 'dataset_profile', None),
+        _checkpoint_args_get(checkpoint_args, 'dataset_item_list', None),
+        'checkpoint',
+    )
 
 
 def _evaluate_current_model(model, test_data_list, item_list, device, args, print_fn=None):
@@ -135,6 +150,7 @@ def train(item_list):
 
     if args.checkpoint_path:
         model, trainable, checkpoint_metadata = load_model_from_train_checkpoint(args.checkpoint_path, device)
+        _validate_checkpoint_profile(get_dataset_profile(args.dataset_profile), checkpoint_metadata)
         image_size = int(checkpoint_metadata['image_size'])
         crop_size = int(checkpoint_metadata['crop_size'])
         print_fn('loaded checkpoint: {}'.format(args.checkpoint_path))
@@ -480,6 +496,7 @@ def train(item_list):
                             pseudoclass_registry['classes_df'],
                             pseudoclass_registry['tail_edges_df'],
                             pseudoclass_registry['summary'],
+                            metadata={'dataset_provenance': args.dataset_provenance},
                         )
                         pseudoclass_report, pseudoclass_predictions, pseudoclass_summary_df, pseudoclass_contingency_df = (
                             build_tailguard_b_pseudoclass_report(
@@ -630,6 +647,7 @@ def train(item_list):
             device,
         )
         memory_metadata = {
+            'dataset_provenance': args.dataset_provenance,
             'checkpoint_path': args.checkpoint_path,
             'encoder_name': checkpoint_metadata['encoder_name'] if checkpoint_metadata is not None else args.encoder_name,
             'image_size': image_size,
@@ -671,6 +689,7 @@ def train(item_list):
     print_fn('  samples_per_sec   {:.2f}'.format(samples_per_sec))
 
     tailguard_b_summary = {
+        'dataset_provenance': args.dataset_provenance,
         'checkpoint_path': checkpoint_path,
         'input_checkpoint_path': args.checkpoint_path,
         'selected_checkpoint_path': selected_checkpoint_path if os.path.isfile(selected_checkpoint_path) else None,
@@ -720,13 +739,13 @@ def train(item_list):
     print_fn('saved tailguard-b summary to {}'.format(summary_path))
 
 
-if __name__ == '__main__':
-    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
-    parser = argparse.ArgumentParser(description='Standalone TailGuard-B runner for Dinomaly MVTec')
-    parser.add_argument('--data_path', type=str, default='../mvtec_anomaly_detection')
+def build_parser(default_dataset_profile='mvtec'):
+    default_profile = get_dataset_profile(default_dataset_profile)
+    parser = argparse.ArgumentParser(description='Standalone TailGuard-B runner for MVTec-compatible datasets')
+    parser.add_argument('--dataset_profile', type=str, choices=dataset_profile_names(), default=default_profile.name)
+    parser.add_argument('--data_path', type=str, default=None)
     parser.add_argument('--save_dir', type=str, default='./saved_results')
-    parser.add_argument('--save_name', type=str, default='vitill_mvtec_tailguard_b')
+    parser.add_argument('--save_name', type=str, default=None)
     parser.add_argument('--diag_save_dir', type=str, default='gbps')
     parser.add_argument('--checkpoint_path', type=str, default=None)
     parser.add_argument('--gpus', type=int, default=0)
@@ -787,12 +806,7 @@ if __name__ == '__main__':
 
     parser.add_argument('--tgb_tail_embedding_source', type=str, default='encoder_cls', choices=['encoder', 'encoder_cls'])
     parser.add_argument('--tgb_group_embedding_source', type=str, default='encoder', choices=['encoder', 'encoder_cls'])
-    parser.add_argument(
-        '--tgb_stage1_training_scope',
-        type=str,
-        default='h_only',
-        choices=['h_only', 'all_samples'],
-    )
+    parser.add_argument('--tgb_stage1_training_scope', type=str, default='h_only', choices=['h_only', 'all_samples'])
     parser.add_argument('--tgb_save_cls_embeddings', dest='tgb_save_cls_embeddings', action='store_true', default=True)
     parser.add_argument('--no-tgb_save_cls_embeddings', dest='tgb_save_cls_embeddings', action='store_false')
     parser.add_argument('--tgb_save_grouping_embeddings', dest='tgb_save_grouping_embeddings', action='store_true', default=True)
@@ -803,19 +817,9 @@ if __name__ == '__main__':
     parser.add_argument('--no-tgb_save_tailsampler_analysis_details', dest='tgb_save_tailsampler_analysis_details', action='store_false')
     parser.add_argument('--tgb_default_adaptive_angle', type=float, default=5.0)
     parser.add_argument('--tgb_min_clean_group_size', type=int, default=3)
-    parser.add_argument(
-        '--tgb_attachment_membership_mode',
-        type=str,
-        default='empirical_conformity',
-        choices=['empirical_conformity', 'h_calibrated', 'rgd'],
-    )
+    parser.add_argument('--tgb_attachment_membership_mode', type=str, default='empirical_conformity', choices=['empirical_conformity', 'h_calibrated', 'rgd'])
     parser.add_argument('--tgb_elbow_min_segment', type=int, default=3)
-    parser.add_argument(
-        '--tgb_rgd_split_mode',
-        type=str,
-        default='segmented_bic',
-        choices=['segmented_bic', 'largest_positive_gap'],
-    )
+    parser.add_argument('--tgb_rgd_split_mode', type=str, default='segmented_bic', choices=['segmented_bic', 'largest_positive_gap'])
     parser.add_argument('--tgb_stable_window', type=int, default=3)
     parser.add_argument('--tgb_stable_min_observations', type=int, default=1)
     parser.add_argument('--tgb_t_attached_noise_p_high_thr', type=float, default=0.5)
@@ -825,13 +829,37 @@ if __name__ == '__main__':
     parser.add_argument('--tgb_memory_topk_ratio', type=float, default=0.05)
     parser.add_argument('--tgb_mem_chunk_size', type=int, default=4096)
     parser.add_argument('--tgb_mem_max_patches_per_class', type=int, default=20000)
-    args = parser.parse_args()
+    return parser
+
+
+def resolve_dataset_profile_args(parsed_args):
+    profile = get_dataset_profile(parsed_args.dataset_profile)
+    if parsed_args.data_path is None:
+        parsed_args.data_path = profile.default_data_path
+    if parsed_args.save_name is None:
+        parsed_args.save_name = 'vitill_{}_tailguard_b'.format(profile.name)
+    parsed_args.dataset_profile = profile.name
+    parsed_args.dataset_item_list = list(profile.item_list)
+    parsed_args.dataset_layout = profile.layout
+    parsed_args.dataset_provenance = profile_provenance(profile, parsed_args.data_path)
+    return profile
+
+
+def main(default_dataset_profile='mvtec', argv=None, required_dataset_profile=None):
+    global args, device, print_fn
+
+    parser = build_parser(default_dataset_profile)
+    args = parser.parse_args(argv)
+    profile = resolve_dataset_profile_args(args)
+    if required_dataset_profile is not None and profile.name != required_dataset_profile:
+        parser.error('this launcher requires --dataset_profile {}'.format(required_dataset_profile))
+    if not os.path.isdir(args.data_path):
+        parser.error('dataset directory does not exist: {}'.format(args.data_path))
     if not args.tgb_save_cls_embeddings:
         parser.error('--tgb_save_cls_embeddings is required for TailGuard-B pseudo-class artifacts and replay')
 
     logger = get_logger(args.save_name, os.path.join(args.save_dir, args.save_name))
     print_fn = logger.info
-
     args.tgb_root_dir = os.path.join(args.save_dir, args.save_name, 'tailguard_b')
     args.tgb_prepare_dir = os.path.join(args.tgb_root_dir, 'prepare')
     args.tgb_attachment_dir = os.path.join(args.tgb_root_dir, 'attachment')
@@ -845,6 +873,7 @@ if __name__ == '__main__':
     args.tgb_attachment_replay_config_path = save_tailguard_b_attachment_replay_config(
         args.tgb_root_dir,
         {
+            'dataset_provenance': args.dataset_provenance,
             'tgb_attachment_membership_mode': args.tgb_attachment_membership_mode,
             'tgb_min_clean_group_size': args.tgb_min_clean_group_size,
             'tgb_elbow_min_segment': args.tgb_elbow_min_segment,
@@ -858,7 +887,11 @@ if __name__ == '__main__':
             'tgb_gbps_dir': args.diag_save_dir,
         },
     )
-
     device = 'cuda:{}'.format(args.gpus) if torch.cuda.is_available() else 'cpu'
     print_fn(device)
-    train(MVTec_ITEM_LIST)
+    train(profile.item_list)
+    return args
+
+
+if __name__ == '__main__':
+    main()
