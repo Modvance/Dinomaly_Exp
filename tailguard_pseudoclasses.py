@@ -1,3 +1,5 @@
+"""Pseudo-class registry construction for TailGuard."""
+
 from typing import Dict, List
 
 import numpy as np
@@ -121,7 +123,7 @@ def _member_row(row: pd.Series,
     }
 
 
-def build_tailguard_b_pseudoclass_registry(h_clean_df: pd.DataFrame,
+def build_tailguard_pseudoclass_registry(h_clean_df: pd.DataFrame,
                                             tail_head_normal_df: pd.DataFrame,
                                             tail_open_df: pd.DataFrame,
                                             retained_samples_df: pd.DataFrame,

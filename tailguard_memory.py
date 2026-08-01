@@ -1,6 +1,7 @@
-from typing import Dict, List, Tuple
+"""Pseudo-class routing and tail memory evaluation for TailGuard."""
 
-import numpy as np
+from typing import Dict, List
+
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -15,368 +16,466 @@ from utils import compute_image_level_scores, get_gaussian_kernel, infer_anomaly
 
 
 def _normalize_rows(tensor: torch.Tensor) -> torch.Tensor:
-    tensor = tensor.float()
-    return F.normalize(tensor, dim=-1)
+    return F.normalize(tensor.float(), dim=-1)
 
 
 def _extract_encoder_cls_embeddings(model, images: torch.Tensor) -> torch.Tensor:
     encoder = getattr(model, 'encoder', None)
-    if encoder is None:
-        raise ValueError('model does not expose encoder for cls routing')
-    if not hasattr(encoder, 'prepare_tokens_with_masks'):
-        raise ValueError('tail-group memory routing requires a DINOv2-style encoder')
-
-    x = encoder.prepare_tokens_with_masks(images)
-    for blk in encoder.blocks:
-        x = blk(x)
-    x = encoder.norm(x)
-    return _normalize_rows(x[:, 0])
+    if encoder is None or not hasattr(encoder, 'prepare_tokens_with_masks'):
+        raise ValueError('TailGuard pseudo-class memory requires a DINOv2-style encoder')
+    tokens = encoder.prepare_tokens_with_masks(images)
+    for block in encoder.blocks:
+        tokens = block(tokens)
+    return _normalize_rows(encoder.norm(tokens)[:, 0])
 
 
-def _angles_from_centroid(vectors: torch.Tensor, centroid: torch.Tensor) -> torch.Tensor:
-    similarity = torch.clamp(vectors @ centroid, min=-1.0, max=1.0)
-    return torch.rad2deg(torch.acos(similarity))
+def _allocate_patch_quotas(capacities: List[int], max_patches: int) -> List[int]:
+    total_patches = int(sum(capacities))
+    target = total_patches if max_patches <= 0 else min(total_patches, int(max_patches))
+    quotas = [0] * len(capacities)
+    active = [index for index, capacity in enumerate(capacities) if capacity > 0]
+    remaining = target
+    while remaining > 0 and active:
+        share = max(1, remaining // len(active))
+        next_active = []
+        for index in active:
+            added = min(share, capacities[index] - quotas[index], remaining)
+            quotas[index] += added
+            remaining -= added
+            if quotas[index] < capacities[index]:
+                next_active.append(index)
+            if remaining == 0:
+                next_active.extend(active[active.index(index) + 1:])
+                break
+        active = next_active
+    return quotas
 
 
-def _compute_adaptive_angle(support_cls: torch.Tensor, quantile: float, mad_scale: float, min_gate_angle: float) -> float:
-    centroid = _normalize_rows(support_cls.mean(dim=0, keepdim=True))[0]
-    if support_cls.shape[0] == 1:
-        return float(min_gate_angle)
-    angles = _angles_from_centroid(support_cls, centroid)
-    base = torch.quantile(angles, q=float(quantile)).item()
-    median = torch.median(angles).item()
-    mad = torch.median(torch.abs(angles - median)).item()
-    return float(max(base + float(mad_scale) * mad, float(min_gate_angle)))
+def _sample_patch_features(features: torch.Tensor, quota: int) -> torch.Tensor:
+    if quota <= 0:
+        return features[:0]
+    if quota >= features.shape[0]:
+        return features
+    indices = torch.linspace(0, features.shape[0] - 1, steps=quota).round().long()
+    return features.index_select(0, indices)
+
+
+def _registry_state(members_df: pd.DataFrame, classes_df: pd.DataFrame):
+    required_members = {'sample_idx', 'pseudo_class_id'}
+    required_classes = {'pseudo_class_id', 'pseudo_class_type', 'num_members'}
+    missing_members = required_members.difference(members_df.columns)
+    missing_classes = required_classes.difference(classes_df.columns)
+    if missing_members:
+        raise ValueError('pseudo-class members are missing: {}'.format(', '.join(sorted(missing_members))))
+    if missing_classes:
+        raise ValueError('pseudo-classes are missing: {}'.format(', '.join(sorted(missing_classes))))
+    members = members_df.copy().reset_index(drop=True)
+    classes = classes_df.copy().reset_index(drop=True)
+    members['sample_idx'] = members['sample_idx'].astype(int)
+    members['pseudo_class_id'] = members['pseudo_class_id'].astype(int)
+    classes['pseudo_class_id'] = classes['pseudo_class_id'].astype(int)
+    identity_columns = {'class_id', 'base_idx'}
+    present_identity_columns = identity_columns.intersection(members.columns)
+    if present_identity_columns and present_identity_columns != identity_columns:
+        raise ValueError('pseudo-class members must include both class_id and base_idx')
+    identity_mode = 'class_base' if present_identity_columns == identity_columns else 'legacy_sample_idx'
+    if identity_mode == 'class_base':
+        members['class_id'] = members['class_id'].astype(int)
+        members['base_idx'] = members['base_idx'].astype(int)
+        if members.duplicated(['class_id', 'base_idx']).any():
+            raise ValueError('pseudo-class members must have unique class_id/base_idx identities')
+    if members['sample_idx'].duplicated().any():
+        raise ValueError('pseudo-class members must have unique sample_idx values')
+    if classes['pseudo_class_id'].duplicated().any() or (classes['num_members'].astype(int) <= 0).any():
+        raise ValueError('pseudo-class registry has invalid classes')
+    counts = members.groupby('pseudo_class_id').size().to_dict()
+    expected_counts = classes.set_index('pseudo_class_id')['num_members'].astype(int).to_dict()
+    if counts != expected_counts:
+        raise ValueError('pseudo-class membership counts do not match class registry')
+    return members, classes, identity_mode
 
 
 @torch.no_grad()
-def build_tail_group_memory_bank(model,
-                                 train_eval_dataloader,
-                                 device,
-                                 tail_support_df: pd.DataFrame,
-                                 args) -> Dict[int, Dict]:
-    support_df = tail_support_df.copy()
-    if len(support_df) == 0:
-        return {}
-    if 'img_path' not in support_df.columns or 'group_id' not in support_df.columns:
-        raise ValueError('tail support table must contain img_path and group_id')
-
-    support_df = support_df.drop_duplicates(subset=['img_path']).reset_index(drop=True)
-    support_df['group_id'] = support_df['group_id'].astype(int)
-    support_lookup = {
-        str(row['img_path']): {
-            'group_id': int(row['group_id']),
-            'sample_idx': None if 'sample_idx' not in support_df.columns else int(row['sample_idx']),
+def build_tailguard_pseudoclass_memory_system(model,
+                                                train_eval_dataloader,
+                                                device,
+                                                members_df: pd.DataFrame,
+                                                classes_df: pd.DataFrame,
+                                                args) -> Dict:
+    members, classes, identity_mode = _registry_state(members_df, classes_df)
+    class_type_lookup = classes.set_index('pseudo_class_id')['pseudo_class_type'].to_dict()
+    if identity_mode == 'class_base':
+        member_lookup = {
+            (int(row.class_id), int(row.base_idx)): int(row.sample_idx)
+            for row in members.itertuples(index=False)
         }
-        for _, row in support_df.iterrows()
-    }
-
+    else:
+        member_lookup = {
+            int(row.sample_idx): int(row.sample_idx)
+            for row in members.itertuples(index=False)
+        }
+    members_by_sample_idx = members.set_index('sample_idx', drop=False)
+    observed = {}
+    loader_keys = set()
     was_training = model.training
     model.eval()
-    bank = {}
-
-    for images, _, meta in train_eval_dataloader:
-        images = images.to(device)
-        patch_feats, spatial_size = extract_encoder_patch_tokens(model, images)
-        cls_embeddings = _extract_encoder_cls_embeddings(model, images)
-        img_paths = meta['img_path']
-
-        for index in range(images.shape[0]):
-            img_path = str(img_paths[index])
-            support_info = support_lookup.get(img_path)
-            if support_info is None:
-                continue
-            group_id = int(support_info['group_id'])
-            if group_id not in bank:
-                bank[group_id] = {
-                    'group_id': group_id,
-                    'features': [],
-                    'support_cls': [],
-                    'num_images': 0,
-                    'spatial_size': tuple(int(v) for v in spatial_size),
-                    'img_paths': [],
-                    'sample_indices': [],
+    try:
+        for images, _, meta in train_eval_dataloader:
+            images = images.to(device)
+            patch_features, spatial_size = extract_encoder_patch_tokens(model, images)
+            cls_embeddings = _extract_encoder_cls_embeddings(model, images)
+            if identity_mode == 'class_base':
+                batch_keys = [
+                    (int(meta['class_id'][index]), int(meta['base_idx'][index]))
+                    for index in range(images.shape[0])
+                ]
+            else:
+                batch_keys = [int(meta['sample_idx'][index]) for index in range(images.shape[0])]
+            for index, member_key in enumerate(batch_keys):
+                if member_key in loader_keys:
+                    raise ValueError('train-eval loader yielded a duplicate member identity')
+                loader_keys.add(member_key)
+                sample_idx = member_lookup.get(member_key)
+                if sample_idx is None:
+                    continue
+                if member_key in observed:
+                    raise ValueError('train-eval loader yielded a pseudo-class member more than once')
+                pseudo_class_id = int(members_by_sample_idx.loc[sample_idx, 'pseudo_class_id'])
+                record = {
+                    'pseudo_class_id': pseudo_class_id,
+                    'cls': cls_embeddings[index].detach().cpu().contiguous(),
                 }
-            bank[group_id]['features'].append(patch_feats[index].detach().cpu())
-            bank[group_id]['support_cls'].append(cls_embeddings[index].detach().cpu())
-            bank[group_id]['num_images'] += 1
-            bank[group_id]['img_paths'].append(img_path)
-            if support_info['sample_idx'] is not None:
-                bank[group_id]['sample_indices'].append(int(support_info['sample_idx']))
+                if class_type_lookup[pseudo_class_id] == 'tail':
+                    record.update({
+                        'patches': patch_features[index].detach().cpu().contiguous(),
+                        'spatial_size': tuple(int(value) for value in spatial_size),
+                    })
+                observed[member_key] = record
+    finally:
+        if was_training:
+            model.train()
 
-    final_bank = {}
-    min_support_images = int(getattr(args, 'tg_mem_min_support_images', 1))
-    max_patches_per_group = int(getattr(args, 'mem_max_patches_per_class', 20000))
-    gate_quantile = float(getattr(args, 'tg_mem_gate_quantile', 0.9))
-    gate_mad_scale = float(getattr(args, 'tg_mem_gate_mad_scale', 1.0))
-    min_gate_angle = float(getattr(args, 'tg_mem_min_gate_angle', 5.0))
-
-    for group_id, entry in bank.items():
-        if int(entry['num_images']) < min_support_images:
-            continue
-        features = torch.cat(entry['features'], dim=0)
-        if max_patches_per_group > 0 and features.shape[0] > max_patches_per_group:
-            keep_indices = torch.linspace(0, features.shape[0] - 1, steps=max_patches_per_group).round().long()
-            features = features.index_select(0, keep_indices)
-        support_cls = torch.stack(entry['support_cls'], dim=0)
-        centroid = _normalize_rows(support_cls.mean(dim=0, keepdim=True))[0]
-        adaptive_angle = _compute_adaptive_angle(
-            support_cls,
-            quantile=gate_quantile,
-            mad_scale=gate_mad_scale,
-            min_gate_angle=min_gate_angle,
+    expected_keys = set(member_lookup)
+    if loader_keys != expected_keys:
+        missing_from_loader = sorted(expected_keys.difference(loader_keys))
+        unexpected_in_loader = sorted(loader_keys.difference(expected_keys))
+        if identity_mode == 'legacy_sample_idx':
+            raise ValueError(
+                'legacy pseudo-class registry cannot be aligned to the rebuilt train-eval loader: '
+                'registry sample_idx values differ from loader sample_idx values '
+                '(registry={}, loader={}, missing={}, unexpected={}). Regenerate pseudo-class '
+                'artifacts with class_id and base_idx before building final memory.'.format(
+                    len(expected_keys), len(loader_keys), missing_from_loader[:10], unexpected_in_loader[:10]
+                )
+            )
+        raise ValueError(
+            'pseudo-class registry identities do not match the rebuilt train-eval loader '
+            '(registry={}, loader={}, missing={}, unexpected={}).'.format(
+                len(expected_keys), len(loader_keys), missing_from_loader[:10], unexpected_in_loader[:10]
+            )
         )
-        final_bank[group_id] = {
-            'group_id': int(group_id),
-            'features': features.contiguous().cpu(),
-            'support_cls': support_cls.contiguous().cpu(),
-            'centroid': centroid.contiguous().cpu(),
-            'adaptive_angle': float(adaptive_angle),
-            'num_images': int(entry['num_images']),
-            'num_patches': int(features.shape[0]),
-            'feature_dim': int(features.shape[1]),
-            'spatial_size': tuple(int(v) for v in entry['spatial_size']),
-            'img_paths': list(entry['img_paths']),
-            'sample_indices': [int(value) for value in entry['sample_indices']],
+    missing_members = sorted(expected_keys.difference(observed))
+    if missing_members:
+        raise ValueError('train-eval loader is missing pseudo-class members: {}'.format(missing_members[:10]))
+
+    max_patches = int(getattr(args, 'tg_mem_max_patches_per_class', 20000))
+    class_entries = {}
+    for class_row in classes.sort_values('pseudo_class_id', kind='mergesort').itertuples(index=False):
+        pseudo_class_id = int(class_row.pseudo_class_id)
+        pseudo_class_type = str(class_row.pseudo_class_type)
+        class_members = members.loc[members['pseudo_class_id'] == pseudo_class_id].sort_values(
+            ['sample_idx'], kind='mergesort'
+        )
+        if identity_mode == 'class_base':
+            class_member_keys = list(zip(
+                class_members['class_id'].astype(int),
+                class_members['base_idx'].astype(int),
+            ))
+        else:
+            class_member_keys = class_members['sample_idx'].astype(int).tolist()
+        records = [observed[member_key] for member_key in class_member_keys]
+        cls_matrix = torch.stack([record['cls'] for record in records], dim=0)
+        prototype = _normalize_rows(cls_matrix.mean(dim=0, keepdim=True))[0].cpu().contiguous()
+        entry = {
+            'pseudo_class_id': pseudo_class_id,
+            'pseudo_class_type': pseudo_class_type,
+            'num_members': int(len(records)),
+            'member_sample_idx': class_members['sample_idx'].astype(int).tolist(),
+            'prototype_cls': prototype,
+            'has_memory_bank': pseudo_class_type == 'tail',
+            'num_patches': 0,
+            'feature_dim': 0,
+            'spatial_size': None,
+            'member_patch_quotas': [],
         }
+        if pseudo_class_type == 'tail':
+            feature_dimensions = {int(record['patches'].shape[1]) for record in records}
+            spatial_sizes = {record['spatial_size'] for record in records}
+            if len(feature_dimensions) != 1 or len(spatial_sizes) != 1:
+                raise ValueError('tail pseudo-class members have inconsistent patch shapes')
+            capacities = [int(record['patches'].shape[0]) for record in records]
+            quotas = _allocate_patch_quotas(capacities, max_patches)
+            selected = [
+                _sample_patch_features(record['patches'], quota)
+                for record, quota in zip(records, quotas)
+                if quota > 0
+            ]
+            if len(selected) == 0:
+                raise ValueError('tail pseudo-class memory bank has no patch tokens')
+            features = torch.cat(selected, dim=0).contiguous().cpu()
+            entry.update({
+                'features': features,
+                'num_patches': int(features.shape[0]),
+                'feature_dim': int(features.shape[1]),
+                'spatial_size': next(iter(spatial_sizes)),
+                'member_patch_quotas': [
+                    {
+                        'sample_idx': int(sample_idx),
+                        'num_available_patches': int(capacity),
+                        'num_selected_patches': int(quota),
+                    }
+                    for sample_idx, capacity, quota in zip(
+                        class_members['sample_idx'].astype(int), capacities, quotas
+                    )
+                ],
+            })
+        elif pseudo_class_type != 'head':
+            raise ValueError('unknown pseudo-class type: {}'.format(pseudo_class_type))
+        class_entries[pseudo_class_id] = entry
 
-    if was_training:
-        model.train()
-    return final_bank
-
-
-def route_to_tail_group(test_cls: torch.Tensor, memory_bank: Dict[int, Dict]) -> Dict:
-    if len(memory_bank) == 0:
-        return {
-            'mem_applied': 0,
-            'routed_group_id': -1,
-            'route_similarity': 0.0,
-            'route_angle': 180.0,
-        }
-
-    group_ids = sorted(memory_bank.keys())
-    centroids = torch.stack([memory_bank[group_id]['centroid'] for group_id in group_ids], dim=0).to(test_cls.device)
-    similarity = centroids @ test_cls
-    best_index = int(torch.argmax(similarity).item())
-    best_group_id = int(group_ids[best_index])
-    best_similarity = float(similarity[best_index].item())
-    best_angle = float(torch.rad2deg(torch.acos(torch.clamp(similarity[best_index], min=-1.0, max=1.0))).item())
-    adaptive_angle = float(memory_bank[best_group_id]['adaptive_angle'])
-    mem_applied = int(best_angle <= adaptive_angle)
     return {
-        'mem_applied': mem_applied,
-        'routed_group_id': best_group_id,
-        'route_similarity': best_similarity,
-        'route_angle': best_angle,
+        'schema_version': 1,
+        'class_entries': class_entries,
+        'num_pseudo_classes': int(len(class_entries)),
+        'num_head_pseudo_classes': int(sum(entry['pseudo_class_type'] == 'head' for entry in class_entries.values())),
+        'num_tail_pseudo_classes': int(sum(entry['pseudo_class_type'] == 'tail' for entry in class_entries.values())),
+        'num_tail_memory_banks': int(sum(entry['has_memory_bank'] for entry in class_entries.values())),
+        'max_patches_per_class': max_patches,
+    }
+
+
+def _routing_cache(memory_system: Dict, device):
+    entries = memory_system.get('class_entries', {})
+    if len(entries) == 0:
+        raise ValueError('pseudo-class memory system has no classes')
+    class_ids = sorted(int(class_id) for class_id in entries)
+    prototypes = torch.stack([entries[class_id]['prototype_cls'] for class_id in class_ids], dim=0).to(device)
+    return {
+        'class_ids': class_ids,
+        'prototypes': _normalize_rows(prototypes),
+        'class_types': [str(entries[class_id]['pseudo_class_type']) for class_id in class_ids],
     }
 
 
 @torch.no_grad()
-def compute_tail_group_memory_scores_for_batch(model,
-                                               images: torch.Tensor,
-                                               memory_bank: Dict[int, Dict],
-                                               args,
-                                               device):
-    patch_feats, spatial_size = extract_encoder_patch_tokens(model, images.to(device))
-    cls_embeddings = _extract_encoder_cls_embeddings(model, images.to(device))
-
+def compute_pseudoclass_memory_scores_for_batch(model,
+                                                images: torch.Tensor,
+                                                memory_system: Dict,
+                                                args,
+                                                device,
+                                                routing_cache=None,
+                                                device_memory_cache=None):
+    images = images.to(device)
+    patch_features, spatial_size = extract_encoder_patch_tokens(model, images)
+    cls_embeddings = _extract_encoder_cls_embeddings(model, images)
+    cache = _routing_cache(memory_system, device) if routing_cache is None else routing_cache
+    similarities = cls_embeddings @ cache['prototypes'].T
+    best_positions = similarities.argmax(dim=1)
+    best_similarity = similarities.gather(1, best_positions[:, None])[:, 0]
+    if similarities.shape[1] > 1:
+        second_similarity = torch.topk(similarities, k=2, dim=1).values[:, 1]
+    else:
+        second_similarity = torch.full_like(best_similarity, float('nan'))
     chunk_size = int(getattr(args, 'tg_mem_chunk_size', getattr(args, 'mem_chunk_size', 4096)))
-    topk_ratio = float(getattr(args, 'tg_mem_topk_ratio', getattr(args, 'mem_topk_ratio', 0.05)))
-
+    topk_ratio = float(getattr(args, 'tg_memory_topk_ratio', getattr(args, 'mem_topk_ratio', 0.05)))
+    entries = memory_system['class_entries']
     scores = []
     maps = []
-    applied_flags = []
-    routed_group_ids = []
-    route_similarities = []
-    route_angles = []
-
-    for index in range(images.shape[0]):
-        route = route_to_tail_group(cls_embeddings[index], memory_bank)
-        applied_flags.append(int(route['mem_applied']))
-        routed_group_ids.append(int(route['routed_group_id']))
-        route_similarities.append(float(route['route_similarity']))
-        route_angles.append(float(route['route_angle']))
-
-        if route['mem_applied'] == 0:
+    mem_applied = []
+    predicted_ids = []
+    predicted_types = []
+    for index, best_position in enumerate(best_positions.tolist()):
+        pseudo_class_id = int(cache['class_ids'][best_position])
+        pseudo_class_type = cache['class_types'][best_position]
+        predicted_ids.append(pseudo_class_id)
+        predicted_types.append(pseudo_class_type)
+        if pseudo_class_type == 'head':
             scores.append(torch.tensor(0.0, device=device))
             maps.append(torch.zeros(spatial_size, device=device))
+            mem_applied.append(0)
             continue
-
-        entry = memory_bank[int(route['routed_group_id'])]
+        entry = entries[pseudo_class_id]
+        if not entry.get('has_memory_bank') or 'features' not in entry:
+            raise ValueError('predicted tail pseudo-class has no memory bank: {}'.format(pseudo_class_id))
+        memory_features = entry['features']
+        if device_memory_cache is not None:
+            memory_features = device_memory_cache.setdefault(
+                pseudo_class_id,
+                entry['features'].to(device),
+            )
         patch_scores = compute_memory_patch_scores(
-            patch_feats[index],
-            entry['features'],
+            patch_features[index],
+            memory_features,
             chunk_size=chunk_size,
         )
         scores.append(pool_patch_scores(patch_scores, topk_ratio=topk_ratio))
         maps.append(patch_scores.reshape(spatial_size))
-
+        mem_applied.append(1)
     return {
         'memory_scores': torch.stack(scores),
         'memory_patch_maps': torch.stack(maps),
-        'mem_applied': torch.tensor(applied_flags, dtype=torch.int64),
-        'routed_group_id': torch.tensor(routed_group_ids, dtype=torch.int64),
-        'route_similarity': torch.tensor(route_similarities, dtype=torch.float32),
-        'route_angle': torch.tensor(route_angles, dtype=torch.float32),
+        'mem_applied': torch.tensor(mem_applied, dtype=torch.int64),
+        'predicted_pseudo_class_id': torch.tensor(predicted_ids, dtype=torch.int64),
+        'predicted_pseudo_class_type': predicted_types,
+        'top1_similarity': best_similarity.detach().cpu(),
+        'second_similarity': second_similarity.detach().cpu(),
+        'similarity_margin': (best_similarity - second_similarity).detach().cpu(),
     }
 
 
 @torch.no_grad()
-def run_tail_group_memory_evaluation(model,
-                                     test_data_list,
-                                     item_list,
-                                     memory_bank: Dict[int, Dict],
-                                     args,
-                                     device):
+def run_pseudoclass_memory_evaluation(model,
+                                      test_data_list,
+                                      item_list,
+                                      memory_system: Dict,
+                                      args,
+                                      device):
     was_training = model.training
     model.eval()
-    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
-    rows: List[dict] = []
-    lambda_value = float(getattr(args, 'tg_mem_fusion_lambda', 1.0))
-    batch_size = int(getattr(args, 'batch_size'))
-    num_workers = int(getattr(args, 'num_workers'))
-    max_ratio = float(getattr(args, 'diag_max_ratio', getattr(args, 'max_ratio', 0.01)))
-    resize_mask = int(getattr(args, 'diag_resize_mask', getattr(args, 'resize_mask', 256)))
-    metric_modes = ('recon', 'memory', 'fused')
-    per_class_metrics_by_mode = {mode: [] for mode in metric_modes}
+    try:
+        gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+        rows: List[dict] = []
+        lambda_value = float(getattr(args, 'tg_memory_fusion_lambda', 1.0))
+        batch_size = int(args.batch_size)
+        num_workers = int(args.num_workers)
+        max_ratio = float(getattr(args, 'diag_max_ratio', getattr(args, 'max_ratio', 0.01)))
+        resize_mask = int(getattr(args, 'diag_resize_mask', getattr(args, 'resize_mask', 256)))
+        metric_modes = ('recon', 'memory', 'fused')
+        per_class_metrics_by_mode = {mode: [] for mode in metric_modes}
+        routing_cache = _routing_cache(memory_system, device)
+        device_memory_cache = {}
 
-    for class_id, (class_name, test_data) in enumerate(zip(item_list, test_data_list)):
-        loader = torch.utils.data.DataLoader(
-            test_data,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-        )
-        class_predictions = {
-            mode: {'gt_sp': [], 'pred_sp': [], 'gt_px': [], 'pred_px': []}
-            for mode in metric_modes
-        }
-        class_row_count = 0
-
-        for images, gt, label, img_path in loader:
-            images = images.to(device)
-            gt = gt.to(device)
-            recon_map, gt = infer_anomaly_map_batch(
-                model,
-                images,
-                gaussian_kernel,
-                resize_mask=resize_mask,
-                gt=gt,
+        for class_id, (class_name, test_data) in enumerate(zip(item_list, test_data_list)):
+            loader = torch.utils.data.DataLoader(
+                test_data,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
             )
-            recon_scores = compute_image_level_scores(recon_map, max_ratio=max_ratio)
-
-            memory_result = compute_tail_group_memory_scores_for_batch(
-                model,
-                images,
-                memory_bank,
-                args,
-                device,
-            )
-            memory_scores = memory_result['memory_scores']
-            memory_patch_maps = memory_result['memory_patch_maps']
-            memory_map = resize_memory_map(memory_patch_maps.to(device), recon_map.shape[-2:]).unsqueeze(1)
-            mem_applied_mask = memory_result['mem_applied'].to(device=device, dtype=torch.bool)
-
-            fused_scores = torch.where(
-                mem_applied_mask,
-                recon_scores + lambda_value * memory_scores,
-                recon_scores,
-            )
-            fused_maps = torch.where(
-                mem_applied_mask[:, None, None, None],
-                recon_map + lambda_value * memory_map,
-                recon_map,
-            )
-            memory_mode_scores = torch.where(mem_applied_mask, memory_scores, recon_scores)
-            memory_mode_maps = torch.where(mem_applied_mask[:, None, None, None], memory_map, recon_map)
-
-            scores_by_mode = {
-                'recon': recon_scores,
-                'memory': memory_mode_scores,
-                'fused': fused_scores,
+            predictions = {
+                mode: {'gt_sp': [], 'pred_sp': [], 'gt_px': [], 'pred_px': []}
+                for mode in metric_modes
             }
-            maps_by_mode = {
-                'recon': recon_map,
-                'memory': memory_mode_maps,
-                'fused': fused_maps,
-            }
+            class_row_count = 0
+            for images, gt, label, img_path in loader:
+                images = images.to(device)
+                gt = gt.to(device)
+                recon_map, gt = infer_anomaly_map_batch(
+                    model,
+                    images,
+                    gaussian_kernel,
+                    resize_mask=resize_mask,
+                    gt=gt,
+                )
+                recon_scores = compute_image_level_scores(recon_map, max_ratio=max_ratio)
+                memory_result = compute_pseudoclass_memory_scores_for_batch(
+                    model,
+                    images,
+                    memory_system,
+                    args,
+                    device,
+                    routing_cache=routing_cache,
+                    device_memory_cache=device_memory_cache,
+                )
+                memory_scores = memory_result['memory_scores']
+                memory_maps = resize_memory_map(
+                    memory_result['memory_patch_maps'].to(device), recon_map.shape[-2:]
+                ).unsqueeze(1)
+                tail_mask = memory_result['mem_applied'].to(device=device, dtype=torch.bool)
+                fused_scores = torch.where(tail_mask, recon_scores + lambda_value * memory_scores, recon_scores)
+                fused_maps = torch.where(
+                    tail_mask[:, None, None, None],
+                    recon_map + lambda_value * memory_maps,
+                    recon_map,
+                )
+                memory_mode_scores = torch.where(tail_mask, memory_scores, recon_scores)
+                memory_mode_maps = torch.where(
+                    tail_mask[:, None, None, None], memory_maps, recon_map
+                )
+                scores_by_mode = {'recon': recon_scores, 'memory': memory_mode_scores, 'fused': fused_scores}
+                maps_by_mode = {'recon': recon_map, 'memory': memory_mode_maps, 'fused': fused_maps}
 
-            gt_bool = gt.bool()
-            if gt_bool.shape[1] > 1:
-                gt_bool = torch.max(gt_bool, dim=1, keepdim=True)[0]
+                gt_bool = gt.bool()
+                if gt_bool.shape[1] > 1:
+                    gt_bool = torch.max(gt_bool, dim=1, keepdim=True)[0]
+                for mode in metric_modes:
+                    predictions[mode]['gt_sp'].append(label.cpu())
+                    predictions[mode]['pred_sp'].append(scores_by_mode[mode].detach().cpu())
+                    predictions[mode]['gt_px'].append(gt_bool[:, 0].detach().cpu())
+                    predictions[mode]['pred_px'].append(maps_by_mode[mode][:, 0].detach().cpu())
+                for index in range(images.shape[0]):
+                    rows.append({
+                        'class_id': int(class_id),
+                        'class_name': str(class_name),
+                        'img_path': str(img_path[index]),
+                        'label': int(label[index].item()),
+                        'recon_score': float(recon_scores[index].item()),
+                        'memory_score': float(memory_scores[index].item()),
+                        'final_score': float(fused_scores[index].item()),
+                        'mem_applied': int(memory_result['mem_applied'][index].item()),
+                        'predicted_pseudo_class_id': int(memory_result['predicted_pseudo_class_id'][index].item()),
+                        'predicted_pseudo_class_type': memory_result['predicted_pseudo_class_type'][index],
+                        'top1_similarity': float(memory_result['top1_similarity'][index].item()),
+                        'second_similarity': float(memory_result['second_similarity'][index].item()),
+                        'similarity_margin': float(memory_result['similarity_margin'][index].item()),
+                    })
+                    class_row_count += 1
 
+            from sklearn.metrics import average_precision_score, roc_auc_score
+            from utils import compute_pro, f1_score_max
             for mode in metric_modes:
-                class_predictions[mode]['gt_sp'].append(label.cpu())
-                class_predictions[mode]['pred_sp'].append(scores_by_mode[mode].detach().cpu())
-                class_predictions[mode]['gt_px'].append(gt_bool[:, 0].detach().cpu())
-                class_predictions[mode]['pred_px'].append(maps_by_mode[mode][:, 0].detach().cpu())
-
-            for index in range(images.shape[0]):
-                rows.append({
+                gt_sp_np = torch.cat(predictions[mode]['gt_sp']).flatten().numpy()
+                pred_sp_np = torch.cat(predictions[mode]['pred_sp']).flatten().numpy()
+                gt_px_np = torch.cat(predictions[mode]['gt_px']).numpy()
+                pred_px_np = torch.cat(predictions[mode]['pred_px']).numpy()
+                per_class_metrics_by_mode[mode].append({
                     'class_id': int(class_id),
                     'class_name': str(class_name),
-                    'img_path': str(img_path[index]),
-                    'label': int(label[index].item()),
-                    'recon_score': float(recon_scores[index].item()),
-                    'memory_score': float(memory_scores[index].item()),
-                    'final_score': float(fused_scores[index].item()),
-                    'mem_applied': int(memory_result['mem_applied'][index].item()),
-                    'routed_group_id': int(memory_result['routed_group_id'][index].item()),
-                    'route_similarity': float(memory_result['route_similarity'][index].item()),
-                    'route_angle': float(memory_result['route_angle'][index].item()),
+                    'I-AUROC': float(roc_auc_score(gt_sp_np, pred_sp_np)),
+                    'I-AP': float(average_precision_score(gt_sp_np, pred_sp_np)),
+                    'I-F1': float(f1_score_max(gt_sp_np, pred_sp_np)),
+                    'P-AUROC': float(roc_auc_score(gt_px_np.ravel(), pred_px_np.ravel())),
+                    'P-AP': float(average_precision_score(gt_px_np.ravel(), pred_px_np.ravel())),
+                    'P-F1': float(f1_score_max(gt_px_np.ravel(), pred_px_np.ravel())),
+                    'P-AUPRO': float(compute_pro(gt_px_np, pred_px_np)),
+                    'num_samples': int(class_row_count),
                 })
-                class_row_count += 1
 
-        from sklearn.metrics import average_precision_score, roc_auc_score
-        from utils import compute_pro, f1_score_max
-
+        metrics_by_mode = {}
         for mode in metric_modes:
-            gt_sp_np = torch.cat(class_predictions[mode]['gt_sp']).flatten().numpy()
-            pred_sp_np = torch.cat(class_predictions[mode]['pred_sp']).flatten().numpy()
-            gt_px_np = torch.cat(class_predictions[mode]['gt_px']).numpy()
-            pred_px_np = torch.cat(class_predictions[mode]['pred_px']).numpy()
-            per_class_metrics_by_mode[mode].append({
-                'class_id': int(class_id),
-                'class_name': str(class_name),
-                'I-AUROC': float(roc_auc_score(gt_sp_np, pred_sp_np)),
-                'I-AP': float(average_precision_score(gt_sp_np, pred_sp_np)),
-                'I-F1': float(f1_score_max(gt_sp_np, pred_sp_np)),
-                'P-AUROC': float(roc_auc_score(gt_px_np.ravel(), pred_px_np.ravel())),
-                'P-AP': float(average_precision_score(gt_px_np.ravel(), pred_px_np.ravel())),
-                'P-F1': float(f1_score_max(gt_px_np.ravel(), pred_px_np.ravel())),
-                'P-AUPRO': float(compute_pro(gt_px_np, pred_px_np)),
-                'num_samples': int(class_row_count),
-            })
-
-    metrics_by_mode = {}
-    for mode in metric_modes:
-        metrics_df = pd.DataFrame(per_class_metrics_by_mode[mode])
-        metrics_by_mode[mode] = {
-            'summary': {
-                'I-AUROC': float(metrics_df['I-AUROC'].mean()),
-                'I-AP': float(metrics_df['I-AP'].mean()),
-                'I-F1': float(metrics_df['I-F1'].mean()),
-                'P-AUROC': float(metrics_df['P-AUROC'].mean()),
-                'P-AP': float(metrics_df['P-AP'].mean()),
-                'P-F1': float(metrics_df['P-F1'].mean()),
-                'P-AUPRO': float(metrics_df['P-AUPRO'].mean()),
-            },
-            'per_class_metrics': per_class_metrics_by_mode[mode],
-        }
-
-    score_df = pd.DataFrame(rows)
-    summary = dict(metrics_by_mode['fused']['summary'])
-    summary.update({
-        'num_memory_groups': int(len(memory_bank)),
-        'memory_applied_ratio': float(score_df['mem_applied'].mean()) if len(score_df) > 0 else 0.0,
-    })
-
-    if was_training:
-        model.train()
-
-    return (
-        score_df,
-        metrics_by_mode['fused']['per_class_metrics'],
-        summary,
-        metrics_by_mode,
-    )
+            metrics_df = pd.DataFrame(per_class_metrics_by_mode[mode])
+            metrics_by_mode[mode] = {
+                'summary': {
+                    'I-AUROC': float(metrics_df['I-AUROC'].mean()),
+                    'I-AP': float(metrics_df['I-AP'].mean()),
+                    'I-F1': float(metrics_df['I-F1'].mean()),
+                    'P-AUROC': float(metrics_df['P-AUROC'].mean()),
+                    'P-AP': float(metrics_df['P-AP'].mean()),
+                    'P-F1': float(metrics_df['P-F1'].mean()),
+                    'P-AUPRO': float(metrics_df['P-AUPRO'].mean()),
+                },
+                'per_class_metrics': per_class_metrics_by_mode[mode],
+            }
+        score_df = pd.DataFrame(rows)
+        summary = dict(metrics_by_mode['fused']['summary'])
+        summary.update({
+            'num_pseudo_classes': int(memory_system['num_pseudo_classes']),
+            'num_head_pseudo_classes': int(memory_system['num_head_pseudo_classes']),
+            'num_tail_pseudo_classes': int(memory_system['num_tail_pseudo_classes']),
+            'num_tail_memory_banks': int(memory_system['num_tail_memory_banks']),
+            'memory_applied_ratio': float(score_df['mem_applied'].mean()) if len(score_df) > 0 else 0.0,
+        })
+    finally:
+        if was_training:
+            model.train()
+    return score_df, metrics_by_mode['fused']['per_class_metrics'], summary, metrics_by_mode

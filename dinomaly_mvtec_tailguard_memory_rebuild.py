@@ -1,3 +1,5 @@
+"""Rebuild TailGuard pseudo-class memory from a saved final checkpoint."""
+
 import argparse
 import json
 import math
@@ -14,23 +16,33 @@ from dinomaly_train_base import (
     load_train_checkpoint_metadata,
     rebuild_pruned_train_loaders,
 )
-from tailguard_b_dataset_profiles import (
+from tailguard_dataset_profiles import (
     MVTec_PROFILE,
     dataset_profile_names,
     get_dataset_profile,
     profile_provenance,
     validate_profile_contract,
 )
-from tailguard_b_artifacts import save_tailguard_b_memory_artifacts
-from tailguard_b_gbps import _build_retained_index_map
-from tailguard_b_memory import (
-    build_tailguard_b_pseudoclass_memory_system,
+from tailguard_artifacts import save_tailguard_memory_artifacts
+from tailguard_gbps import _build_retained_index_map
+from tailguard_memory import (
+    build_tailguard_pseudoclass_memory_system,
     run_pseudoclass_memory_evaluation,
 )
+from tailguard_defaults import TAILGUARD_FINAL_DEFAULTS
 
 
 def _resolve(value, metadata, name, default):
-    resolved = _checkpoint_args_get(metadata.get('args'), name, default) if value is None else value
+    if value is not None:
+        return value
+    checkpoint_args = metadata.get('args')
+    missing = object()
+    resolved = _checkpoint_args_get(checkpoint_args, name, missing)
+    if resolved is missing and name.startswith('tg_'):
+        legacy_name = 'tgb_' + name[len('tg_'):]
+        resolved = _checkpoint_args_get(checkpoint_args, legacy_name, missing)
+    if resolved is missing:
+        resolved = default
     return default if resolved is None else resolved
 
 
@@ -99,7 +111,7 @@ def _retained_index_map(members_df, train_data_list):
     if missing_columns:
         raise ValueError(
             'pseudo-class members are missing stable identities: {}. Regenerate them with '
-            'dinomaly_mvtec_tailguard_b_attachment_replay.py before rebuilding memory.'.format(
+            'dinomaly_mvtec_tailguard_attachment_replay.py before rebuilding memory.'.format(
                 ', '.join(sorted(missing_columns))
             )
         )
@@ -178,34 +190,44 @@ def rebuild_memory(parsed_args):
             'diag_resize_mask',
             1,
         ),
-        tgb_memory_fusion_lambda=float(_resolve(
-            parsed_args.tgb_memory_fusion_lambda,
+        tg_memory_fusion_lambda=float(_resolve(
+            parsed_args.tg_memory_fusion_lambda,
             checkpoint_metadata,
-            'tgb_memory_fusion_lambda',
-            1.0,
+            'tg_memory_fusion_lambda',
+            TAILGUARD_FINAL_DEFAULTS['tg_memory_fusion_lambda'],
         )),
-        tgb_memory_topk_ratio=_ratio_value(
-            _resolve(parsed_args.tgb_memory_topk_ratio, checkpoint_metadata, 'tgb_memory_topk_ratio', 0.05),
-            'tgb_memory_topk_ratio',
+        tg_memory_topk_ratio=_ratio_value(
+            _resolve(
+                parsed_args.tg_memory_topk_ratio,
+                checkpoint_metadata,
+                'tg_memory_topk_ratio',
+                TAILGUARD_FINAL_DEFAULTS['tg_memory_topk_ratio'],
+            ),
+            'tg_memory_topk_ratio',
         ),
-        tgb_mem_chunk_size=_integer_value(
-            _resolve(parsed_args.tgb_mem_chunk_size, checkpoint_metadata, 'tgb_mem_chunk_size', 4096),
-            'tgb_mem_chunk_size',
+        tg_mem_chunk_size=_integer_value(
+            _resolve(
+                parsed_args.tg_mem_chunk_size,
+                checkpoint_metadata,
+                'tg_mem_chunk_size',
+                TAILGUARD_FINAL_DEFAULTS['tg_mem_chunk_size'],
+            ),
+            'tg_mem_chunk_size',
             1,
         ),
-        tgb_mem_max_patches_per_class=_integer_value(
+        tg_mem_max_patches_per_class=_integer_value(
             _resolve(
-                parsed_args.tgb_mem_max_patches_per_class,
+                parsed_args.tg_mem_max_patches_per_class,
                 checkpoint_metadata,
-                'tgb_mem_max_patches_per_class',
-                20000,
+                'tg_mem_max_patches_per_class',
+                TAILGUARD_FINAL_DEFAULTS['tg_mem_max_patches_per_class'],
             ),
-            'tgb_mem_max_patches_per_class',
+            'tg_mem_max_patches_per_class',
             0,
         ),
     )
-    if not math.isfinite(memory_args.tgb_memory_fusion_lambda) or memory_args.tgb_memory_fusion_lambda < 0.0:
-        raise ValueError('tgb_memory_fusion_lambda must be finite and non-negative')
+    if not math.isfinite(memory_args.tg_memory_fusion_lambda) or memory_args.tg_memory_fusion_lambda < 0.0:
+        raise ValueError('tg_memory_fusion_lambda must be finite and non-negative')
     del checkpoint_metadata
     train_data_list, test_data_list = build_datasets(
         data_path,
@@ -223,7 +245,7 @@ def rebuild_memory(parsed_args):
         diag_batch_size=diag_batch_size,
         diag_num_workers=diag_num_workers,
     )
-    memory_system = build_tailguard_b_pseudoclass_memory_system(
+    memory_system = build_tailguard_pseudoclass_memory_system(
         model,
         loaders['train_eval_dataloader'],
         device,
@@ -240,7 +262,7 @@ def rebuild_memory(parsed_args):
         device,
     )
     os.makedirs(output_dir, exist_ok=True)
-    artifacts = save_tailguard_b_memory_artifacts(
+    artifacts = save_tailguard_memory_artifacts(
         output_dir,
         memory_system,
         score_df,
@@ -262,10 +284,10 @@ def rebuild_memory(parsed_args):
             'num_head_pseudo_classes': int(memory_system['num_head_pseudo_classes']),
             'num_tail_pseudo_classes': int(memory_system['num_tail_pseudo_classes']),
             'num_tail_memory_banks': int(memory_system['num_tail_memory_banks']),
-            'tgb_memory_fusion_lambda': memory_args.tgb_memory_fusion_lambda,
-            'tgb_memory_topk_ratio': memory_args.tgb_memory_topk_ratio,
-            'tgb_mem_chunk_size': memory_args.tgb_mem_chunk_size,
-            'tgb_mem_max_patches_per_class': memory_args.tgb_mem_max_patches_per_class,
+            'tg_memory_fusion_lambda': memory_args.tg_memory_fusion_lambda,
+            'tg_memory_topk_ratio': memory_args.tg_memory_topk_ratio,
+            'tg_mem_chunk_size': memory_args.tg_mem_chunk_size,
+            'tg_mem_max_patches_per_class': memory_args.tg_mem_max_patches_per_class,
         },
         metrics_by_mode=metrics_by_mode,
     )
@@ -283,8 +305,18 @@ def rebuild_memory(parsed_args):
     print(json.dumps({key: summary[key] for key in metric_keys}, indent=2, ensure_ascii=False))
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Build TailGuard-B final memory from a saved final model without retraining')
+def _add_hidden_legacy_alias(parser, option, dest, **kwargs):
+    parser.add_argument(
+        option,
+        dest=dest,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+        **kwargs,
+    )
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description='Build TailGuard final memory from a saved final model without retraining')
     parser.add_argument('--checkpoint_path', type=str, required=True)
     parser.add_argument('--pseudoclass_dir', type=str, required=True)
     parser.add_argument('--output_dir', type=str, required=True)
@@ -297,8 +329,21 @@ if __name__ == '__main__':
     parser.add_argument('--diag_num_workers', type=int, default=None)
     parser.add_argument('--diag_max_ratio', type=float, default=None)
     parser.add_argument('--diag_resize_mask', type=int, default=None)
-    parser.add_argument('--tgb_memory_fusion_lambda', type=float, default=None)
-    parser.add_argument('--tgb_memory_topk_ratio', type=float, default=None)
-    parser.add_argument('--tgb_mem_chunk_size', type=int, default=None)
-    parser.add_argument('--tgb_mem_max_patches_per_class', type=int, default=None)
-    rebuild_memory(parser.parse_args())
+    parser.add_argument('--tg_memory_fusion_lambda', type=float, default=None)
+    parser.add_argument('--tg_memory_topk_ratio', type=float, default=None)
+    parser.add_argument('--tg_mem_chunk_size', type=int, default=None)
+    parser.add_argument('--tg_mem_max_patches_per_class', type=int, default=None)
+    _add_hidden_legacy_alias(parser, '--tgb_memory_fusion_lambda', 'tg_memory_fusion_lambda', type=float)
+    _add_hidden_legacy_alias(parser, '--tgb_memory_topk_ratio', 'tg_memory_topk_ratio', type=float)
+    _add_hidden_legacy_alias(parser, '--tgb_mem_chunk_size', 'tg_mem_chunk_size', type=int)
+    _add_hidden_legacy_alias(
+        parser,
+        '--tgb_mem_max_patches_per_class',
+        'tg_mem_max_patches_per_class',
+        type=int,
+    )
+    return parser
+
+
+if __name__ == '__main__':
+    rebuild_memory(build_parser().parse_args())

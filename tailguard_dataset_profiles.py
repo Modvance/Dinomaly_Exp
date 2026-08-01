@@ -1,3 +1,5 @@
+"""Dataset profiles and provenance contracts for TailGuard."""
+
 from dataclasses import dataclass
 import os
 from typing import Dict, Tuple
@@ -45,7 +47,7 @@ def get_dataset_profile(name: str) -> DatasetProfile:
         return _DATASET_PROFILES[profile_name]
     except KeyError as error:
         raise ValueError(
-            'unknown TailGuard-B dataset profile {!r}; supported profiles: {}'.format(
+            'unknown TailGuard dataset profile {!r}; supported profiles: {}'.format(
                 name,
                 ', '.join(dataset_profile_names()),
             )

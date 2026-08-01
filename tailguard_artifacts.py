@@ -1,3 +1,5 @@
+"""Artifact writers for the canonical TailGuard method."""
+
 import json
 import os
 from typing import Dict, Optional
@@ -9,7 +11,7 @@ import torch
 
 def _make_json_safe(value):
     if isinstance(value, dict):
-        return {key: _make_json_safe(item) for key, item in value.items()}
+        return {str(key): _make_json_safe(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_make_json_safe(item) for item in value]
     if isinstance(value, tuple):
@@ -18,165 +20,308 @@ def _make_json_safe(value):
         if np.isnan(value) or np.isinf(value):
             return None
         return float(value)
-    if isinstance(value, (np.integer, int)):
-        return int(value)
     if isinstance(value, (np.bool_, bool)):
         return bool(value)
+    if isinstance(value, (np.integer, int)):
+        return int(value)
     return value
 
 
-def _update_summary_json(summary_path: str, extra_summary: Optional[Dict] = None):
-    payload = {}
-    if os.path.isfile(summary_path):
-        with open(summary_path, 'r', encoding='utf-8') as file:
-            payload = json.load(file)
-    if extra_summary is not None:
-        payload.update(_make_json_safe(extra_summary))
-    with open(summary_path, 'w', encoding='utf-8') as file:
+def _write_json(path: str, payload: Dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as file:
         json.dump(_make_json_safe(payload), file, indent=2, ensure_ascii=False)
-    return payload
+
 
 
 def save_tailguard_prepare_artifacts(output_dir: str,
-                                     candidates_df: pd.DataFrame,
-                                     group_assignments_df: pd.DataFrame,
-                                     train_metadata_df: pd.DataFrame,
-                                     metadata: Dict,
-                                     cls_embeddings_payload: Optional[Dict] = None,
-                                     analysis_details_df: Optional[pd.DataFrame] = None):
+                                       candidates_df: pd.DataFrame,
+                                       train_metadata_df: pd.DataFrame,
+                                       head_group_assignments_df: pd.DataFrame,
+                                       metadata: Dict,
+                                       cls_embeddings_payload: Optional[Dict] = None,
+                                       grouping_embeddings_payload: Optional[Dict] = None,
+                                       analysis_metadata_df: Optional[pd.DataFrame] = None):
     os.makedirs(output_dir, exist_ok=True)
-
-    candidates_path = os.path.join(output_dir, 'tailguard_candidates.csv')
-    group_assignments_path = os.path.join(output_dir, 'group_assignments.csv')
+    candidates_path = os.path.join(output_dir, 'tailsampler_candidates.csv')
     train_metadata_path = os.path.join(output_dir, 'tailguard_train_metadata.csv')
-    summary_path = os.path.join(output_dir, 'tailguard_prepare_summary.json')
+    analysis_metadata_path = os.path.join(output_dir, 'tailguard_train_analysis_metadata.csv')
+    head_group_assignments_path = os.path.join(output_dir, 'head_group_assignments.csv')
+    cls_embeddings_path = os.path.join(output_dir, 'cls_embeddings.pt')
+    grouping_embeddings_path = os.path.join(output_dir, 'grouping_embeddings.pt')
+    summary_path = os.path.join(output_dir, 'prepare_summary.json')
 
     candidates_df.to_csv(candidates_path, index=False)
-    group_assignments_df.to_csv(group_assignments_path, index=False)
     train_metadata_df.to_csv(train_metadata_path, index=False)
+    head_group_assignments_df.to_csv(head_group_assignments_path, index=False)
+    if analysis_metadata_df is not None:
+        analysis_metadata_df.to_csv(analysis_metadata_path, index=False)
+    else:
+        analysis_metadata_path = None
 
-    cls_embeddings_path = None
     if cls_embeddings_payload is not None:
-        cls_embeddings_path = os.path.join(output_dir, 'tailguard_cls_embeddings.pt')
         torch.save(cls_embeddings_payload, cls_embeddings_path)
+    else:
+        cls_embeddings_path = None
+    if grouping_embeddings_payload is not None:
+        torch.save(grouping_embeddings_payload, grouping_embeddings_path)
+    else:
+        grouping_embeddings_path = None
 
-    analysis_details_path = None
-    if analysis_details_df is not None:
-        analysis_details_path = os.path.join(output_dir, 'tail_sampler_analysis_details.csv')
-        analysis_details_df.to_csv(analysis_details_path, index=False)
-
-    payload = {
-        'metadata': _make_json_safe(metadata),
-        'artifacts': {
-            'tailguard_candidates_csv': candidates_path,
-            'group_assignments_csv': group_assignments_path,
-            'tailguard_train_metadata_csv': train_metadata_path,
-            'tailguard_cls_embeddings_pt': cls_embeddings_path,
-            'tail_sampler_analysis_details_csv': analysis_details_path,
-        },
-    }
-    with open(summary_path, 'w', encoding='utf-8') as file:
-        json.dump(_make_json_safe(payload), file, indent=2, ensure_ascii=False)
-
-    return {
-        'tailguard_candidates_csv': candidates_path,
-        'group_assignments_csv': group_assignments_path,
+    artifacts = {
+        'tailsampler_candidates_csv': candidates_path,
         'tailguard_train_metadata_csv': train_metadata_path,
-        'tailguard_cls_embeddings_pt': cls_embeddings_path,
-        'tail_sampler_analysis_details_csv': analysis_details_path,
-        'tailguard_prepare_summary_json': summary_path,
+        'tailguard_train_analysis_metadata_csv': analysis_metadata_path,
+        'head_group_assignments_csv': head_group_assignments_path,
+        'cls_embeddings_pt': cls_embeddings_path,
+        'grouping_embeddings_pt': grouping_embeddings_path,
     }
+    _write_json(summary_path, {'metadata': metadata, 'artifacts': artifacts})
+    artifacts['prepare_summary_json'] = summary_path
+    return artifacts
 
 
-def save_tailguard_iteration_artifacts(iter_dir: str,
-                                       global_group_metrics_df: pd.DataFrame,
-                                       sample_tailguard_scores_df: pd.DataFrame,
-                                       extra_summary: Optional[Dict] = None):
+def save_tailguard_gbps_iteration_artifacts(iter_dir: str,
+                                             train_scores_df: pd.DataFrame,
+                                             h_group_metrics_df: pd.DataFrame,
+                                             h_sample_group_scores_df: pd.DataFrame,
+                                             bootstrap_df: pd.DataFrame,
+                                             summary: Dict):
     os.makedirs(iter_dir, exist_ok=True)
-    global_metrics_path = os.path.join(iter_dir, 'global_group_metrics.csv')
-    sample_scores_path = os.path.join(iter_dir, 'sample_tailguard_scores.csv')
+    train_scores_path = os.path.join(iter_dir, 'train_scores.csv')
+    h_group_metrics_path = os.path.join(iter_dir, 'h_group_metrics.csv')
+    h_sample_group_scores_path = os.path.join(iter_dir, 'h_sample_group_scores.csv')
+    bootstrap_path = os.path.join(iter_dir, 'bootstrap_U.csv')
     summary_path = os.path.join(iter_dir, 'summary.json')
 
-    global_group_metrics_df.to_csv(global_metrics_path, index=False)
-    sample_tailguard_scores_df.to_csv(sample_scores_path, index=False)
-    _update_summary_json(summary_path, extra_summary=extra_summary)
-
+    train_scores_df.to_csv(train_scores_path, index=False)
+    h_group_metrics_df.to_csv(h_group_metrics_path, index=False)
+    h_sample_group_scores_df.to_csv(h_sample_group_scores_path, index=False)
+    bootstrap_df.to_csv(bootstrap_path, index=False)
+    _write_json(summary_path, summary)
     return {
-        'global_group_metrics_csv': global_metrics_path,
-        'sample_tailguard_scores_csv': sample_scores_path,
+        'train_scores_csv': train_scores_path,
+        'h_group_metrics_csv': h_group_metrics_path,
+        'h_sample_group_scores_csv': h_sample_group_scores_path,
+        'bootstrap_U_csv': bootstrap_path,
         'summary_json': summary_path,
     }
 
 
-def save_tailguard_prune_artifacts(iter_dir: str, delete_plan: Dict, extra_summary: Optional[Dict] = None):
-    os.makedirs(iter_dir, exist_ok=True)
+def save_tailguard_trigger_summary(output_dir: str, summary: Dict):
+    path = os.path.join(output_dir, 'gbps_trigger_summary.json')
+    _write_json(path, summary)
+    return path
 
-    tail_support_path = os.path.join(iter_dir, 'tail_support_samples.csv')
-    tail_suspicious_path = os.path.join(iter_dir, 'tail_suspicious_samples.csv')
-    risk_table_path = os.path.join(iter_dir, 'tailguard_risk_table.csv')
-    kept_path = os.path.join(iter_dir, 'tailguard_kept_samples.csv')
-    removed_path = os.path.join(iter_dir, 'tailguard_removed_samples.csv')
-    summary_path = os.path.join(iter_dir, 'tailguard_prune_summary.json')
 
-    if len(delete_plan['tail_support_samples']) > 0:
-        delete_plan['tail_support_samples'].to_csv(tail_support_path, index=False)
+def save_tailguard_attachment_replay_config(output_dir: str, config: Dict):
+    path = os.path.join(output_dir, 'attachment_replay_config.json')
+    _write_json(path, config)
+    return path
+
+
+def save_tailguard_attachment_artifacts(output_dir: str,
+                                          geometry: Dict,
+                                          conformity_df: pd.DataFrame,
+                                          attachment_scores_df: Optional[pd.DataFrame],
+                                          elbow_summary: Dict,
+                                          tail_open_df: pd.DataFrame,
+                                          tail_attached_df: pd.DataFrame,
+                                          tail_head_normal_df: pd.DataFrame,
+                                          tail_head_noise_df: pd.DataFrame,
+                                          membership_scores_df: Optional[pd.DataFrame] = None,
+                                          membership_calibration_df: Optional[pd.DataFrame] = None,
+                                          membership_summary: Optional[Dict] = None,
+                                          rgd_distances_df: Optional[pd.DataFrame] = None,
+                                          rgd_scores_df: Optional[pd.DataFrame] = None,
+                                          rgd_split_summary: Optional[Dict] = None,
+                                          rgd_bic_candidates_df: Optional[pd.DataFrame] = None):
+    os.makedirs(output_dir, exist_ok=True)
+    geometry_path = os.path.join(output_dir, 'clean_head_group_geometry.pt')
+    conformity_path = os.path.join(output_dir, 'tail_group_conformity.csv')
+    attachment_scores_path = os.path.join(output_dir, 'tail_attachment_scores.csv')
+    elbow_summary_path = os.path.join(output_dir, 'attachment_elbow_summary.json')
+    tail_open_path = os.path.join(output_dir, 'tail_open_samples.csv')
+    tail_attached_path = os.path.join(output_dir, 'tail_attached_samples.csv')
+    tail_head_normal_path = os.path.join(output_dir, 'tail_head_normal_samples.csv')
+    tail_head_noise_path = os.path.join(output_dir, 'tail_head_noise_samples.csv')
+    membership_scores_path = os.path.join(output_dir, 'tail_group_membership_scores.csv')
+    membership_calibration_path = os.path.join(output_dir, 'head_group_membership_calibration.csv')
+    membership_summary_path = os.path.join(output_dir, 'attachment_membership_summary.json')
+    rgd_distances_path = os.path.join(output_dir, 'tail_rgd_group_distances.csv')
+    rgd_scores_path = os.path.join(output_dir, 'tail_rgd_scores.csv')
+    rgd_split_summary_path = os.path.join(output_dir, 'rgd_split_summary.json')
+    rgd_bic_candidates_path = os.path.join(output_dir, 'rgd_segmented_bic_candidates.csv')
+
+    torch.save(geometry, geometry_path)
+    conformity_df.to_csv(conformity_path, index=False)
+    if attachment_scores_df is not None:
+        attachment_scores_df.to_csv(attachment_scores_path, index=False)
     else:
-        pd.DataFrame(columns=list(delete_plan['tailguard_risk_table'].columns)).to_csv(tail_support_path, index=False)
-
-    if len(delete_plan['tail_suspicious_samples']) > 0:
-        delete_plan['tail_suspicious_samples'].to_csv(tail_suspicious_path, index=False)
+        attachment_scores_path = None
+    tail_open_df.to_csv(tail_open_path, index=False)
+    tail_attached_df.to_csv(tail_attached_path, index=False)
+    tail_head_normal_df.to_csv(tail_head_normal_path, index=False)
+    tail_head_noise_df.to_csv(tail_head_noise_path, index=False)
+    _write_json(elbow_summary_path, elbow_summary)
+    if membership_scores_df is not None:
+        membership_scores_df.to_csv(membership_scores_path, index=False)
     else:
-        pd.DataFrame(columns=list(delete_plan['tailguard_risk_table'].columns)).to_csv(tail_suspicious_path, index=False)
-
-    delete_plan['tailguard_risk_table'].to_csv(risk_table_path, index=False)
-    delete_plan['kept_samples'].to_csv(kept_path, index=False)
-    delete_plan['pruned_samples'].to_csv(removed_path, index=False)
-
-    payload = dict(delete_plan['summary'])
-    if extra_summary is not None:
-        payload.update(extra_summary)
-    with open(summary_path, 'w', encoding='utf-8') as file:
-        json.dump(_make_json_safe(payload), file, indent=2, ensure_ascii=False)
-
+        membership_scores_path = None
+    if membership_calibration_df is not None:
+        membership_calibration_df.to_csv(membership_calibration_path, index=False)
+    else:
+        membership_calibration_path = None
+    if membership_summary is not None:
+        _write_json(membership_summary_path, membership_summary)
+    else:
+        membership_summary_path = None
+    if rgd_distances_df is not None:
+        rgd_distances_df.to_csv(rgd_distances_path, index=False)
+    else:
+        rgd_distances_path = None
+    if rgd_scores_df is not None:
+        rgd_scores_df.to_csv(rgd_scores_path, index=False)
+    else:
+        rgd_scores_path = None
+    if rgd_split_summary is not None:
+        _write_json(rgd_split_summary_path, rgd_split_summary)
+    else:
+        rgd_split_summary_path = None
+    if rgd_bic_candidates_df is None:
+        rgd_bic_candidates_df = pd.DataFrame(columns=[
+            'split_index', 'left_count', 'right_count', 'left_sse', 'right_sse',
+            'sse_2', 'bic_2', 'is_selected',
+        ])
+    rgd_bic_candidates_df.to_csv(rgd_bic_candidates_path, index=False)
     return {
-        'tail_support_samples_csv': tail_support_path,
-        'tail_suspicious_samples_csv': tail_suspicious_path,
-        'tailguard_risk_table_csv': risk_table_path,
-        'tailguard_kept_samples_csv': kept_path,
-        'tailguard_removed_samples_csv': removed_path,
-        'tailguard_prune_summary_json': summary_path,
+        'clean_head_group_geometry_pt': geometry_path,
+        'tail_group_conformity_csv': conformity_path,
+        'tail_attachment_scores_csv': attachment_scores_path,
+        'attachment_elbow_summary_json': elbow_summary_path,
+        'tail_open_samples_csv': tail_open_path,
+        'tail_attached_samples_csv': tail_attached_path,
+        'tail_head_normal_samples_csv': tail_head_normal_path,
+        'tail_head_noise_samples_csv': tail_head_noise_path,
+        'tail_group_membership_scores_csv': membership_scores_path,
+        'head_group_membership_calibration_csv': membership_calibration_path,
+        'attachment_membership_summary_json': membership_summary_path,
+        'tail_rgd_group_distances_csv': rgd_distances_path,
+        'tail_rgd_scores_csv': rgd_scores_path,
+        'rgd_split_summary_json': rgd_split_summary_path,
+        'rgd_segmented_bic_candidates_csv': rgd_bic_candidates_path,
+    }
+
+
+def save_tailguard_stage2_artifacts(output_dir: str,
+                                      retained_samples_df: pd.DataFrame,
+                                      removed_samples_df: pd.DataFrame,
+                                      summary: Dict):
+    os.makedirs(output_dir, exist_ok=True)
+    retained_path = os.path.join(output_dir, 'stage2_retained_samples.csv')
+    removed_path = os.path.join(output_dir, 'stage2_removed_samples.csv')
+    summary_path = os.path.join(output_dir, 'stage2_dataset_summary.json')
+    retained_samples_df.to_csv(retained_path, index=False)
+    removed_samples_df.to_csv(removed_path, index=False)
+    _write_json(summary_path, summary)
+    return {
+        'stage2_retained_samples_csv': retained_path,
+        'stage2_removed_samples_csv': removed_path,
+        'stage2_dataset_summary_json': summary_path,
+    }
+
+
+def save_tailguard_pseudoclass_artifacts(output_dir: str,
+                                           members_df: pd.DataFrame,
+                                           classes_df: pd.DataFrame,
+                                           tail_edges_df: pd.DataFrame,
+                                           summary: Dict,
+                                           metadata: Dict = None):
+    os.makedirs(output_dir, exist_ok=True)
+    members_path = os.path.join(output_dir, 'pseudo_class_members.csv')
+    classes_path = os.path.join(output_dir, 'pseudo_classes.csv')
+    tail_edges_path = os.path.join(output_dir, 'tail_adaptive_neighborhood_edges.csv')
+    summary_path = os.path.join(output_dir, 'pseudo_class_registry.json')
+    members_df.to_csv(members_path, index=False)
+    classes_df.to_csv(classes_path, index=False)
+    tail_edges_df.to_csv(tail_edges_path, index=False)
+    registry = dict(summary)
+    if metadata is not None:
+        registry.update(metadata)
+    _write_json(summary_path, registry)
+    return {
+        'pseudo_class_members_csv': members_path,
+        'pseudo_classes_csv': classes_path,
+        'tail_adaptive_neighborhood_edges_csv': tail_edges_path,
+        'pseudo_class_registry_json': summary_path,
+    }
+
+
+def save_tailguard_pseudoclass_report_artifacts(output_dir: str,
+                                                  summary: Dict,
+                                                  predictions_df: pd.DataFrame,
+                                                  class_summary_df: pd.DataFrame,
+                                                  contingency_df: pd.DataFrame):
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_report.json')
+    predictions_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_predictions.csv')
+    class_summary_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_summary.csv')
+    contingency_path = os.path.join(output_dir, 'stage1_cleanup_pseudoclass_contingency.csv')
+    _write_json(summary_path, summary)
+    predictions_df.to_csv(predictions_path, index=False)
+    class_summary_df.to_csv(class_summary_path, index=False)
+    contingency_df.to_csv(contingency_path, index=False)
+    return {
+        'stage1_cleanup_pseudoclass_report_json': summary_path,
+        'stage1_cleanup_pseudoclass_predictions_csv': predictions_path,
+        'stage1_cleanup_pseudoclass_summary_csv': class_summary_path,
+        'stage1_cleanup_pseudoclass_contingency_csv': contingency_path,
+    }
+
+
+def save_tailguard_denoising_diagnostics(output_dir: str,
+                                            summary: Dict,
+                                            class_rows_df: pd.DataFrame):
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, 'denoising_diagnostics.json')
+    class_rows_path = os.path.join(output_dir, 'denoising_diagnostics_by_class.csv')
+    _write_json(summary_path, summary)
+    class_rows_df.to_csv(class_rows_path, index=False)
+    return {
+        'denoising_diagnostics_json': summary_path,
+        'denoising_diagnostics_by_class_csv': class_rows_path,
     }
 
 
 def save_tailguard_memory_artifacts(output_dir: str,
-                                    memory_bank: Dict,
-                                    score_df: pd.DataFrame,
-                                    per_class_metrics,
-                                    summary: Dict,
-                                    metadata: Dict,
-                                    metrics_by_mode: Optional[Dict] = None):
+                                      memory_system: Dict,
+                                      score_df: pd.DataFrame,
+                                      per_class_metrics,
+                                      summary: Dict,
+                                      metadata: Dict,
+                                      metrics_by_mode: Optional[Dict] = None):
     os.makedirs(output_dir, exist_ok=True)
+    system_path = os.path.join(output_dir, 'pseudo_class_memory_system.pt')
+    class_summary_path = os.path.join(output_dir, 'pseudo_class_memory_summary.csv')
+    score_path = os.path.join(output_dir, 'memory_eval_scores.csv')
+    summary_path = os.path.join(output_dir, 'memory_eval_summary.json')
 
-    memory_bank_path = os.path.join(output_dir, 'tail_group_memory_bank.pt')
-    bank_summary_path = os.path.join(output_dir, 'tail_group_memory_bank_summary.csv')
-    score_df_path = os.path.join(output_dir, 'tail_group_memory_eval_scores.csv')
-    summary_path = os.path.join(output_dir, 'tail_group_memory_eval_summary.json')
-
-    torch.save(memory_bank, memory_bank_path)
-
-    bank_rows = []
-    for group_id, entry in sorted(memory_bank.items()):
-        bank_rows.append({
-            'group_id': int(group_id),
-            'num_images': int(entry['num_images']),
+    torch.save(memory_system, system_path)
+    rows = []
+    for pseudo_class_id, entry in sorted(memory_system['class_entries'].items(), key=lambda item: int(item[0])):
+        spatial_size = entry.get('spatial_size') or (0, 0)
+        rows.append({
+            'pseudo_class_id': int(pseudo_class_id),
+            'pseudo_class_type': str(entry['pseudo_class_type']),
+            'num_members': int(entry['num_members']),
+            'has_memory_bank': bool(entry['has_memory_bank']),
             'num_patches': int(entry['num_patches']),
             'feature_dim': int(entry['feature_dim']),
-            'spatial_h': int(entry['spatial_size'][0]),
-            'spatial_w': int(entry['spatial_size'][1]),
-            'adaptive_angle': float(entry['adaptive_angle']),
+            'spatial_h': int(spatial_size[0]),
+            'spatial_w': int(spatial_size[1]),
         })
-    pd.DataFrame(bank_rows).to_csv(bank_summary_path, index=False)
-    score_df.to_csv(score_df_path, index=False)
+    pd.DataFrame(rows).to_csv(class_summary_path, index=False)
+    score_df.to_csv(score_path, index=False)
 
     payload = {
         'summary': summary,
@@ -185,20 +330,17 @@ def save_tailguard_memory_artifacts(output_dir: str,
     }
     if metrics_by_mode is not None:
         payload['metrics_by_mode'] = metrics_by_mode
-    with open(summary_path, 'w', encoding='utf-8') as file:
-        json.dump(_make_json_safe(payload), file, indent=2, ensure_ascii=False)
-
+    _write_json(summary_path, payload)
     return {
-        'tail_group_memory_bank_pt': memory_bank_path,
-        'tail_group_memory_bank_summary_csv': bank_summary_path,
-        'tail_group_memory_eval_scores_csv': score_df_path,
-        'tail_group_memory_eval_summary_json': summary_path,
+        'pseudo_class_memory_system_pt': system_path,
+        'pseudo_class_memory_summary_csv': class_summary_path,
+        'memory_eval_scores_csv': score_path,
+        'memory_eval_summary_json': summary_path,
     }
 
 
 def save_tailguard_summary(output_dir: str, summary: Dict):
     os.makedirs(output_dir, exist_ok=True)
     summary_path = os.path.join(output_dir, 'tailguard_summary.json')
-    with open(summary_path, 'w', encoding='utf-8') as file:
-        json.dump(_make_json_safe(summary), file, indent=2, ensure_ascii=False)
+    _write_json(summary_path, summary)
     return summary_path

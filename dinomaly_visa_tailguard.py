@@ -1,4 +1,4 @@
-from dinomaly_mvtec_tailguard_b import main
+from dinomaly_mvtec_tailguard import main
 
 
 if __name__ == '__main__':

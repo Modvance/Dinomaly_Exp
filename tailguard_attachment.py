@@ -1,3 +1,5 @@
+"""TailGuard RGD attachment and historical attachment ablations."""
+
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -48,7 +50,7 @@ def build_clean_head_geometry(h_clean_df: pd.DataFrame, grouping_embeddings_payl
     clean_df['sample_idx'] = clean_df['sample_idx'].astype(int)
     clean_df['group_id'] = clean_df['group_id'].astype(int)
     embedding_map = _embedding_lookup(grouping_embeddings_payload)
-    min_group_size = int(getattr(args, 'tgb_min_clean_group_size', 3))
+    min_group_size = int(getattr(args, 'tg_min_clean_group_size', 3))
 
     groups = {}
     rows = []
@@ -167,7 +169,7 @@ def split_tail_by_attachment_elbow(attachment_scores_df: pd.DataFrame, args):
         summary = {'status': 'empty_tail', 'num_tail': 0, 'elbow_valid': False}
         return scores_df.copy(), scores_df.copy(), summary
 
-    min_segment = int(getattr(args, 'tgb_elbow_min_segment', 3))
+    min_segment = int(getattr(args, 'tg_elbow_min_segment', 3))
     scores_df['attachment_score'] = scores_df['attachment_score'].astype(float)
     sorted_df = scores_df.sort_values('attachment_score', ascending=True).reset_index(drop=True)
     m = int(len(sorted_df))
@@ -447,10 +449,10 @@ def split_tail_by_relative_group_dominance(rgd_scores_df: pd.DataFrame,
                                             num_valid_groups: int,
                                             args):
     scores_df = rgd_scores_df.copy().reset_index(drop=True)
-    split_mode = getattr(args, 'tgb_rgd_split_mode', 'segmented_bic')
+    split_mode = getattr(args, 'tg_rgd_split_mode', 'segmented_bic')
     if split_mode not in {'segmented_bic', 'largest_positive_gap'}:
-        raise ValueError('unknown TailGuard-B RGD split mode: {}'.format(split_mode))
-    configured_min_segment = int(getattr(args, 'tgb_elbow_min_segment', 3))
+        raise ValueError('unknown TailGuard RGD split mode: {}'.format(split_mode))
+    configured_min_segment = int(getattr(args, 'tg_elbow_min_segment', 3))
     min_segment = max(3, configured_min_segment) if split_mode == 'segmented_bic' else max(1, configured_min_segment)
     base_summary = {
         'mode': 'rgd',
@@ -995,7 +997,7 @@ def build_tail_attachment_plan(tail_df: pd.DataFrame,
             'rgd_bic_candidates_df': rgd_bic_candidates_df,
         }
     if membership_mode != 'empirical_conformity':
-        raise ValueError('unknown TailGuard-B attachment membership mode: {}'.format(membership_mode))
+        raise ValueError('unknown TailGuard attachment membership mode: {}'.format(membership_mode))
     conformity_df, scores_df = compute_tail_attachment(
         tail_df,
         geometry,

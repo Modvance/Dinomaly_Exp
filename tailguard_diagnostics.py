@@ -1,3 +1,5 @@
+"""Analysis-only diagnostics for TailGuard decisions and pseudo-classes."""
+
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -217,7 +219,7 @@ def _build_class_rows(initial_df: pd.DataFrame,
     return pd.DataFrame(rows)
 
 
-def build_tailguard_b_denoising_diagnostics(initial_samples_df: pd.DataFrame,
+def build_tailguard_denoising_diagnostics(initial_samples_df: pd.DataFrame,
                                              retained_samples_df: Optional[pd.DataFrame],
                                              removed_samples_df: Optional[pd.DataFrame],
                                              h_removed_samples_df: Optional[pd.DataFrame] = None,
@@ -266,7 +268,7 @@ def build_tailguard_b_denoising_diagnostics(initial_samples_df: pd.DataFrame,
     summary = {
         'schema_version': 1,
         'analysis_only': True,
-        'not_used_by_tailguard_b_decision_logic': True,
+        'not_used_by_tailguard_decision_logic': True,
         'cleanup_status': effective_cleanup_status,
         'cleanup_reason': effective_cleanup_reason,
         'label_provenance': {
@@ -339,7 +341,7 @@ def _empty_pseudoclass_contingency() -> pd.DataFrame:
     ])
 
 
-def build_tailguard_b_pseudoclass_report(members_df: pd.DataFrame,
+def build_tailguard_pseudoclass_report(members_df: pd.DataFrame,
                                           classes_df: pd.DataFrame,
                                           cls_embeddings_payload: Dict,
                                           analysis_metadata_df: Optional[pd.DataFrame] = None):
@@ -386,7 +388,7 @@ def build_tailguard_b_pseudoclass_report(members_df: pd.DataFrame,
         summary = {
             'schema_version': 1,
             'analysis_only': True,
-            'not_used_by_tailguard_b_decision_logic': True,
+            'not_used_by_tailguard_decision_logic': True,
             'status': 'empty_registry',
             'num_registry_members': 0,
             'num_pseudo_classes': 0,
@@ -621,7 +623,7 @@ def build_tailguard_b_pseudoclass_report(members_df: pd.DataFrame,
     summary = {
         'schema_version': 1,
         'analysis_only': True,
-        'not_used_by_tailguard_b_decision_logic': True,
+        'not_used_by_tailguard_decision_logic': True,
         'status': 'completed',
         'cls_embedding_source': cls_embeddings_payload.get('embedding_source'),
         'registry': {
