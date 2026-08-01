@@ -279,7 +279,8 @@ def rebuild_memory(parsed_args):
     }
     with open(os.path.join(output_dir, 'memory_rebuild_summary.json'), 'w', encoding='utf-8') as file:
         json.dump(result, file, indent=2, ensure_ascii=False)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    metric_keys = ('I-AUROC', 'I-AP', 'I-F1', 'P-AUROC', 'P-AP', 'P-F1', 'P-AUPRO')
+    print(json.dumps({key: summary[key] for key in metric_keys}, indent=2, ensure_ascii=False))
 
 
 if __name__ == '__main__':

@@ -563,7 +563,7 @@ def train(item_list):
                         print_fn('tailguard-b trigger iter {} did not run removal; continuing without Stage 2 rebuild'.format(gbps_trigger_iter))
 
             if current_iter % int(args.eval_interval) == 0:
-                final_eval_summary = _evaluate_current_model(model, test_data_list, item_list, device, args, print_fn=print_fn)
+                final_eval_summary = _evaluate_current_model(model, test_data_list, item_list, device, args)
                 last_eval_iter = int(current_iter)
                 model.train()
 
@@ -609,7 +609,7 @@ def train(item_list):
         )
 
     if last_eval_iter != int(it):
-        final_eval_summary = _evaluate_current_model(model, test_data_list, item_list, device, args, print_fn=print_fn)
+        final_eval_summary = _evaluate_current_model(model, test_data_list, item_list, device, args)
         last_eval_iter = int(it)
         model.train()
 
@@ -671,7 +671,6 @@ def train(item_list):
         )
         memory_status = 'completed'
         print_fn('saved tailguard-b memory artifacts to {}'.format(args.tgb_memory_dir))
-        print_fn(json.dumps(memory_eval_summary, indent=2, ensure_ascii=False))
 
     total_time = time.time() - train_start_time
     time_per_iter = total_time / max(1, total_iters)
@@ -679,7 +678,9 @@ def train(item_list):
     samples_per_sec = batch_size / max(time_per_iter, 1e-12)
 
     print_fn('Training finished. Total time: {:.2f}s ({:.2f} min), {:.4f} s/iter'.format(total_time, total_time / 60.0, time_per_iter))
-    _print_eval_summary(final_eval_summary, print_fn)
+    if memory_eval_summary is not None:
+        print_fn('Final TailGuard-B fused evaluation:')
+        _print_eval_summary(memory_eval_summary, print_fn)
     print_fn('Training efficiency:')
     print_fn('  total_time_s      {:.2f}'.format(total_time))
     print_fn('  total_iters       {}'.format(total_iters))
