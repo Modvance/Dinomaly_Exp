@@ -114,6 +114,24 @@ def save_tailguard_trigger_summary(output_dir: str, summary: Dict):
     return path
 
 
+def save_tailguard_head_prune_artifacts(output_dir: str,
+                                          decisions_df: pd.DataFrame,
+                                          group_summary_df: pd.DataFrame,
+                                          summary: Dict):
+    os.makedirs(output_dir, exist_ok=True)
+    decisions_path = os.path.join(output_dir, 'h_prune_decisions.csv')
+    group_summary_path = os.path.join(output_dir, 'h_prune_group_summary.csv')
+    summary_path = os.path.join(output_dir, 'h_prune_summary.json')
+    decisions_df.to_csv(decisions_path, index=False)
+    group_summary_df.to_csv(group_summary_path, index=False)
+    _write_json(summary_path, summary)
+    return {
+        'h_prune_decisions_csv': decisions_path,
+        'h_prune_group_summary_csv': group_summary_path,
+        'h_prune_summary_json': summary_path,
+    }
+
+
 def save_tailguard_attachment_replay_config(output_dir: str, config: Dict):
     path = os.path.join(output_dir, 'attachment_replay_config.json')
     _write_json(path, config)

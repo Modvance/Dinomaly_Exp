@@ -11,6 +11,7 @@ import torch
 from tailguard_artifacts import (
     save_tailguard_attachment_artifacts,
     save_tailguard_denoising_diagnostics,
+    save_tailguard_head_prune_artifacts,
     save_tailguard_pseudoclass_artifacts,
     save_tailguard_pseudoclass_report_artifacts,
     save_tailguard_stage2_artifacts,
@@ -31,6 +32,7 @@ from tailguard_defaults import (
     TAILGUARD_CONFIG_SCHEMA_VERSION,
     TAILGUARD_FINAL_DEFAULTS,
     TAILGUARD_METHOD_NAME,
+    TAILGUARD_PRUNE_MODES,
 )
 
 
@@ -57,6 +59,11 @@ LEGACY_REPLAY_DEFAULTS = {
     'tg_stable_window': 3,
     'tg_stable_min_observations': 1,
     'tg_t_attached_noise_p_high_thr': 0.5,
+    'gbps_prune_mode': 'fixed',
+    'gbps_prune_max_ratio': 0.1,
+    'gbps_prune_stable_window': 3,
+    'gbps_prune_stable_min_observations': 1,
+    'gbps_prune_min_active_ratio': 0.5,
     'gbps_prune_ratio': 0.1,
     'gbps_min_keep_per_group': 20,
 }
@@ -78,28 +85,48 @@ def _is_canonical_source_config(source_config):
     return (
         source_config.get('method_name') == TAILGUARD_METHOD_NAME
         and source_config.get('config_profile') == TAILGUARD_CONFIG_PROFILE
-        and int(source_config.get('schema_version', 0)) >= TAILGUARD_CONFIG_SCHEMA_VERSION
+        and int(source_config.get('schema_version', 0)) >= 2
     )
 
 
-def _resolve_selected_score_source(source_dir, requested_iter):
+def _resolve_selected_score_source(gbps_dir, requested_iter):
     if requested_iter is not None:
         selected_iter = int(requested_iter)
         return selected_iter, selected_iter
-    trigger_path = os.path.join(source_dir, 'gbps', 'gbps_trigger_summary.json')
+    trigger_path = os.path.join(gbps_dir, 'gbps_trigger_summary.json')
     trigger_summary = _load_json(trigger_path)
     selected_iter = trigger_summary.get('gbps_selected_iter')
     if selected_iter is None:
         raise ValueError('GBPS trigger summary has no selected iteration: {}'.format(trigger_path))
     selected_iter = int(selected_iter)
-    return selected_iter, int(trigger_summary.get('score_source_iter', selected_iter))
+    score_source_iter = int(trigger_summary.get('score_source_iter', selected_iter))
+    if score_source_iter != selected_iter:
+        raise ValueError(
+            'GBPS selected/score source iteration mismatch: selected={}, score_source={}, summary={}'.format(
+                selected_iter,
+                score_source_iter,
+                trigger_path,
+            )
+        )
+    return selected_iter, score_source_iter
 
 
 def _resolve_replay_config(source_dir, parsed_args):
     config_path = os.path.join(source_dir, 'attachment_replay_config.json')
     source_config = _load_json(config_path) if os.path.isfile(config_path) else {}
     is_canonical = _is_canonical_source_config(source_config)
-    defaults = TAILGUARD_FINAL_DEFAULTS if is_canonical else LEGACY_REPLAY_DEFAULTS
+    if is_canonical:
+        defaults = dict(TAILGUARD_FINAL_DEFAULTS)
+        if int(source_config.get('schema_version', 0)) < TAILGUARD_CONFIG_SCHEMA_VERSION:
+            defaults.update({
+                'gbps_prune_mode': 'fixed',
+                'gbps_prune_max_ratio': 0.1,
+                'gbps_prune_stable_window': 3,
+                'gbps_prune_stable_min_observations': 1,
+                'gbps_prune_min_active_ratio': 0.5,
+            })
+    else:
+        defaults = LEGACY_REPLAY_DEFAULTS
     resolved = {}
     for name in REPLAY_CONFIG_KEYS:
         cli_value = getattr(parsed_args, name, None)
@@ -108,8 +135,10 @@ def _resolve_replay_config(source_dir, parsed_args):
             if cli_value is not None
             else _source_config_value(source_config, name, defaults[name])
         )
-    if is_canonical:
-        status = 'canonical_source_config'
+    if is_canonical and int(source_config.get('schema_version', 0)) >= TAILGUARD_CONFIG_SCHEMA_VERSION:
+        status = 'canonical_current_schema'
+    elif is_canonical:
+        status = 'canonical_legacy_schema_fixed_pruning'
     elif source_config:
         status = 'legacy_source_config'
     else:
@@ -132,17 +161,26 @@ def replay(parsed_args):
     source_replay_config_path = os.path.join(source_dir, 'attachment_replay_config.json')
     source_replay_config = _load_json(source_replay_config_path) if os.path.isfile(source_replay_config_path) else {}
     configured_gbps_dir = _source_config_value(source_replay_config, 'tg_gbps_dir', None)
-    if configured_gbps_dir is not None:
-        gbps_dir = os.path.realpath(configured_gbps_dir)
+    gbps_dir_relpath = _source_config_value(source_replay_config, 'tg_gbps_dir_relpath', 'gbps')
+    source_relative_gbps_dir = os.path.realpath(os.path.join(source_dir, gbps_dir_relpath))
+    configured_gbps_dir = os.path.realpath(configured_gbps_dir) if configured_gbps_dir is not None else None
+    if os.path.isdir(source_relative_gbps_dir):
+        gbps_dir = source_relative_gbps_dir
+    elif configured_gbps_dir is not None and os.path.isdir(configured_gbps_dir):
+        gbps_dir = configured_gbps_dir
     else:
-        gbps_dir_relpath = _source_config_value(source_replay_config, 'tg_gbps_dir_relpath', 'gbps')
-        gbps_dir = os.path.realpath(os.path.join(source_dir, gbps_dir_relpath))
+        raise FileNotFoundError(
+            'TailGuard GBPS directory is unavailable; source-relative={}, configured={}'.format(
+                source_relative_gbps_dir,
+                configured_gbps_dir,
+            )
+        )
     metadata_df = pd.read_csv(os.path.join(prepare_dir, 'tailguard_train_metadata.csv'))
     head_group_assignments_df = pd.read_csv(os.path.join(prepare_dir, 'head_group_assignments.csv'))
     grouping_embeddings_payload = _load_torch(os.path.join(prepare_dir, 'grouping_embeddings.pt'))
     cls_embeddings_path = os.path.join(prepare_dir, 'cls_embeddings.pt')
     cls_embeddings_payload = _load_torch(cls_embeddings_path) if os.path.isfile(cls_embeddings_path) else None
-    selected_iter, score_source_iter = _resolve_selected_score_source(source_dir, parsed_args.gbps_selected_iter)
+    selected_iter, score_source_iter = _resolve_selected_score_source(gbps_dir, parsed_args.gbps_selected_iter)
     selected_scores_path = os.path.join(gbps_dir, 'iter_{:05d}'.format(score_source_iter), 'train_scores.csv')
     if not os.path.isfile(selected_scores_path):
         raise FileNotFoundError('selected GBPS score artifact does not exist: {}'.format(selected_scores_path))
@@ -161,10 +199,15 @@ def replay(parsed_args):
         {},
     )
     replay_args, config_status, config_path = _resolve_replay_config(source_dir, parsed_args)
-    if config_status != 'canonical_source_config':
+    if config_status.startswith('legacy_'):
         print(
             'warning: replaying a legacy TailGuard-B artifact; explicit CLI values and '
             'legacy empirical-conformity/largest-gap fallbacks are used where metadata is absent'
+        )
+    elif config_status == 'canonical_legacy_schema_fixed_pruning':
+        print(
+            'info: replaying a schema-v2 TailGuard artifact with historical fixed-ratio H pruning; '
+            'pass --gbps_prune_mode adaptive explicitly to run the new schema-v3 ablation'
         )
 
     head_delete_plan = build_tailguard_head_delete_plan(
@@ -172,6 +215,8 @@ def replay(parsed_args):
         head_group_assignments_df,
         metadata_df,
         replay_args,
+        gbps_dir=gbps_dir,
+        selected_iter=score_source_iter,
     )
     tail_df = head_delete_plan['selected_scores_df'].loc[
         head_delete_plan['selected_scores_df']['tail_candidate'].astype(int) == 1
@@ -232,6 +277,12 @@ def replay(parsed_args):
         tail_head_normal_df,
         tail_head_noise_df,
         all_samples_df=head_delete_plan['selected_scores_df'],
+    )
+    head_prune_artifacts = save_tailguard_head_prune_artifacts(
+        os.path.join(output_dir, 'stage2'),
+        head_delete_plan['h_prune_decisions_df'],
+        head_delete_plan['h_prune_group_summary_df'],
+        head_delete_plan['summary'],
     )
     stage2_artifacts = save_tailguard_stage2_artifacts(
         os.path.join(output_dir, 'stage2'),
@@ -304,6 +355,7 @@ def replay(parsed_args):
         'source_replay_config_path': config_path,
         'attachment_summary': attachment_summary,
         'head_delete_summary': head_delete_plan['summary'],
+        'head_prune_artifacts': head_prune_artifacts,
         'stage2_summary': stage2_plan['summary'],
         'attachment_artifacts': attachment_artifacts,
         'tail_attached_stable_risk_csv': stable_risk_path,
@@ -371,6 +423,11 @@ def build_parser():
     parser.add_argument('--tg_stable_window', type=int, default=None)
     parser.add_argument('--tg_stable_min_observations', type=int, default=None)
     parser.add_argument('--tg_t_attached_noise_p_high_thr', type=float, default=None)
+    parser.add_argument('--gbps_prune_mode', type=str, default=None, choices=TAILGUARD_PRUNE_MODES)
+    parser.add_argument('--gbps_prune_max_ratio', type=float, default=None)
+    parser.add_argument('--gbps_prune_stable_window', type=int, default=None)
+    parser.add_argument('--gbps_prune_stable_min_observations', type=int, default=None)
+    parser.add_argument('--gbps_prune_min_active_ratio', type=float, default=None)
     parser.add_argument('--gbps_prune_ratio', type=float, default=None)
     parser.add_argument('--gbps_min_keep_per_group', type=int, default=None)
     _add_hidden_legacy_alias(

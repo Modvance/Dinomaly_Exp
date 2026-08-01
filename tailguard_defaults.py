@@ -1,9 +1,10 @@
 """Single source of truth for the canonical TailGuard configuration."""
 
 
-TAILGUARD_CONFIG_SCHEMA_VERSION = 2
+TAILGUARD_CONFIG_SCHEMA_VERSION = 3
 TAILGUARD_METHOD_NAME = 'tailguard'
 TAILGUARD_CONFIG_PROFILE = 'final'
+TAILGUARD_PRUNE_MODES = ('adaptive', 'fixed')
 
 
 # These are the paper/mainline defaults.  Ablation flags remain available in the
@@ -35,6 +36,11 @@ TAILGUARD_FINAL_DEFAULTS = {
     'gbps_gate_mode': 'hard',
     'gbps_min_noise_evidence': 0.05,
     'gbps_postprocess_mode': 'remove',
+    'gbps_prune_mode': 'adaptive',
+    'gbps_prune_max_ratio': 0.1,
+    'gbps_prune_stable_window': 3,
+    'gbps_prune_stable_min_observations': 1,
+    'gbps_prune_min_active_ratio': 0.5,
     'gbps_prune_ratio': 0.1,
     'gbps_min_keep_per_group': 20,
     'gbps_bootstrap_B': 20,

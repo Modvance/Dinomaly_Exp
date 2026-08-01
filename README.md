@@ -229,7 +229,7 @@ python dinomaly_mvtec_tailsampler.py --data_path ../LTN_datasets/mvtecad-step_k1
 - attachment replay：`dinomaly_mvtec_tailguard_attachment_replay.py`
 - memory rebuild：`dinomaly_mvtec_tailguard_memory_rebuild.py`
 
-不提供任何方法参数时，runner 就使用论文最终配置：`adaptive_trim_mode`、H-group auto-K、`all_samples` Stage 1、H-only Safe-GBPS、`remove`、RGD + segmented-BIC，以及 pseudo-class tail memory。README 同时承担实验命令记录，因此下面仍显式写出关键方法参数，便于以后直接核对日志和复现实验。
+不提供任何方法参数时，runner 就使用论文最终配置：`adaptive_trim_mode`、H-group auto-K、`all_samples` Stage 1、H-only Safe-GBPS、稳定 active group 内的自适应删除比例（10% 安全上限）、RGD + segmented-BIC，以及 pseudo-class tail memory。README 同时承担实验命令记录，因此下面仍显式写出关键方法参数，便于以后直接核对日志和复现实验。
 
 以下命令默认在 `/home/linux/projects/Dinomaly/` 下、已激活 `dinomaly` 环境后执行。
 
@@ -248,6 +248,8 @@ python dinomaly_mvtec_tailguard.py \
   --gbps_k_candidates 6,8,10,12,15,20 \
   --tg_stage1_training_scope all_samples \
   --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
   --tg_attachment_membership_mode rgd \
   --tg_rgd_split_mode segmented_bic \
   --tg_memory_enable \
@@ -265,6 +267,8 @@ python dinomaly_mvtec_tailguard.py \
   --gbps_k_candidates 6,8,10,12,15,20 \
   --tg_stage1_training_scope all_samples \
   --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
   --tg_attachment_membership_mode rgd \
   --tg_rgd_split_mode segmented_bic \
   --tg_memory_enable \
@@ -282,6 +286,8 @@ python dinomaly_mvtec_tailguard.py \
   --gbps_k_candidates 6,8,10,12,15,20 \
   --tg_stage1_training_scope all_samples \
   --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
   --tg_attachment_membership_mode rgd \
   --tg_rgd_split_mode segmented_bic \
   --tg_memory_enable \
@@ -303,6 +309,8 @@ python dinomaly_visa_tailguard.py \
   --gbps_k_candidates 6,8,10,12,15,20 \
   --tg_stage1_training_scope all_samples \
   --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
   --tg_attachment_membership_mode rgd \
   --tg_rgd_split_mode segmented_bic \
   --tg_memory_enable \
@@ -320,6 +328,8 @@ python dinomaly_visa_tailguard.py \
   --gbps_k_candidates 6,8,10,12,15,20 \
   --tg_stage1_training_scope all_samples \
   --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
   --tg_attachment_membership_mode rgd \
   --tg_rgd_split_mode segmented_bic \
   --tg_memory_enable \
@@ -337,6 +347,8 @@ python dinomaly_visa_tailguard.py \
   --gbps_k_candidates 6,8,10,12,15,20 \
   --tg_stage1_training_scope all_samples \
   --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
   --tg_attachment_membership_mode rgd \
   --tg_rgd_split_mode segmented_bic \
   --tg_memory_enable \
@@ -344,6 +356,20 @@ python dinomaly_visa_tailguard.py \
 ```
 
 每次运行的主产物位于 `<save_dir>/<save_name>/tailguard/`，最终模型位于 `<save_dir>/<save_name>/final_model.pt`。
+
+H 清理有两条显式可选路径：
+
+- `--gbps_prune_mode adaptive`：默认主线。仅稳定激活的 H group 参与删除，请求比例为 `min(pi_high, gbps_prune_max_ratio)`；默认安全上限为 `0.10`，实际删除数还受向下取整和 `gbps_min_keep_per_group` 约束，因此组可以少删或不删。
+- `--gbps_prune_mode fixed`：固定比例对照。保持历史逻辑，在每个 H group 内请求删除最高分的 `gbps_prune_ratio`；默认是 `0.10`，实际删除数同样受向下取整和最小保留数约束。
+
+固定 10% 消融只需在任一训练命令中替换为：
+
+```bash
+--gbps_prune_mode fixed \
+--gbps_prune_ratio 0.10
+```
+
+新运行会在 `tailguard/stage2/` 保存 `h_prune_decisions.csv`、`h_prune_group_summary.csv` 和 `h_prune_summary.json`，记录每组估计比例、稳定性、请求/实际删除数与安全上限是否生效。
 
 ### MVTec 离线 replay 与 memory rebuild
 
@@ -459,3 +485,678 @@ python dinomaly_mvtec_tgm.py \
   --tgm_memory_enable \
   --gpus 3
 ```
+
+## TailGuard Adaptive 主线拉表实验（6 组）
+
+以下六条命令用于论文主表：MVTec AD 和 VisA 各运行 Pareto、Step-K4、Step-K1，统一使用 `seed01`。它们使用当前 TailGuard schema v3 最终主线配置：稳定 active H group、按 `pi_high` 自适应确定请求比例、每组 10% 安全上限、RGD + segmented-BIC，以及最终 pseudo-class memory 评估。
+
+六个实验使用独立的 `save_name`，统一写入 `../results/tailguard/main_table_adaptive/`，不会覆盖上面的历史命令。下面预分配 GPU 1–6，若不并行运行，只需按机器情况修改 `--gpus`。每条命令完整训练 `10000` iterations，并同时保存最终 reconstruction 指标和 TailGuard memory-fused 指标。
+
+### MVTec AD：Pareto / Step-K4 / Step-K1
+
+```bash
+# 1. MVTec AD / Pareto / seed01 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/main_table_adaptive \
+  --save_name mvtec_pareto_seed01 \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 0.50 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 1
+
+# 2. MVTec AD / Step-K4 / seed01 / GPU 2
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/main_table_adaptive \
+  --save_name mvtec_step_k4_seed01 \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 0.50 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 2
+
+# 3. MVTec AD / Step-K1 / seed01 / GPU 3
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/main_table_adaptive \
+  --save_name mvtec_step_k1_seed01 \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 0.50 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 3
+```
+
+### VisA：Pareto / Step-K4 / Step-K1
+
+运行 VisA 前应确认 `../LTN_visa/visa-*-seed01` 已生成或挂载；manifest 使用仓库内的 `manifest/visa-nlt/`。
+
+```bash
+# 4. VisA / Pareto / seed01 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-pareto-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/main_table_adaptive \
+  --save_name visa_pareto_seed01 \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 0.50 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 4
+
+# 5. VisA / Step-K4 / seed01 / GPU 5
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/main_table_adaptive \
+  --save_name visa_step_k4_seed01 \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 0.50 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 5
+
+# 6. VisA / Step-K1 / seed01 / GPU 6
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/main_table_adaptive \
+  --save_name visa_step_k1_seed01 \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 0.50 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 6
+```
+
+每个实验完成后，主表所需汇总可从以下位置读取：
+
+- reconstruction 最终指标：`<save_dir>/<save_name>/tailguard/tailguard_summary.json` 中的 `final_eval_summary`；
+- TailGuard 主线 memory-fused 指标：`<save_dir>/<save_name>/tailguard/memory/memory_eval_summary.json`；
+- 最终模型：`<save_dir>/<save_name>/final_model.pt`；
+- 自适应 H 清理明细：`<save_dir>/<save_name>/tailguard/stage2/h_prune_summary.json` 和对应 CSV。
+
+拉表前的完成验收以 `tailguard_summary.json` 中 `memory_status == "completed"` 为准；只生成 `final_model.pt` 说明主模型已保存，并不一定表示 memory-fused 评估成功完成。`memory_eval_summary.json` 的 `metrics_by_mode` 包含 `recon`、`memory`、`fused` 三种模式的总体及逐类别七项指标，主表应读取 `fused`。
+
+当前工作区核对结果：三组 MVTec AD 数据和六份 manifest 均存在；VisA manifest 已存在，但 `../LTN_visa/visa-*-seed01` 三个数据目录尚未生成或挂载，因此 VisA 三条命令当前会在启动检查时报错。可先根据 `make_all_visa_nlt.sh` 生成数据，再启动第 4–6 组实验。
+
+## TailGuard 核心模块消融实验
+
+核心模块消融采用累加式设计，只验证会实际改变最终异常检测分数的三个模块：
+
+| 行 | H 自适应清理 | RGD + attached-T 风险清理 | pseudo-class memory | 指标来源 |
+|---|---:|---:|---:|---|
+| A0 Base |  |  |  | 本节 A0 运行的 `metrics_by_mode.recon.summary` |
+| A1 + H Cleanup | ✓ |  |  | 本节 A1 运行的 `metrics_by_mode.recon.summary` |
+| A2 + T Refinement | ✓ | ✓ |  | 对应完整主线运行的 `metrics_by_mode.recon.summary` |
+| A3 Full TailGuard | ✓ | ✓ | ✓ | 对应完整主线运行的 `metrics_by_mode.fused.summary` |
+
+A0 和 A1 仍保持 `--gbps_postprocess_mode remove`、selected-checkpoint 恢复、Stage 2 重建以及最终 memory 评估。这样四行可以统一从 `memory_eval_summary.json` 的同一套 evaluator 读取指标；A0/A1 虽然会在训练结束后构建 memory，但论文取值只读取 `recon`，memory 不参与这两行的最终分数。
+
+下面先在两个代表性困难场景运行：MVTec AD Step-K1 seed01 和 VisA Step-K1 seed01。四条命令使用独立 `save_name`，统一写入 `../results/tailguard/module_ablation/`，不会覆盖主线结果。GPU 1–4 只是示例分配，实际运行时按机器空闲情况修改。
+
+### A0：Base（不删除任何 H/T 样本）
+
+```bash
+# 1. MVTec AD / Step-K1 / A0 Base / seed01 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name mvtec_step_k1_seed01_a0_base \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.0 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 1
+
+# 2. VisA / Step-K1 / A0 Base / seed01 / GPU 2
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name visa_step_k1_seed01_a0_base \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.0 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 2
+```
+
+A0 完成后应检查：
+
+```text
+<run>/tailguard/stage2/stage2_dataset_summary.json
+num_stage2_removed == 0
+```
+
+### A1：加入 H 自适应清理，但不删除 attached-T
+
+```bash
+# 3. MVTec AD / Step-K1 / A1 H Cleanup / seed01 / GPU 3
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name mvtec_step_k1_seed01_a1_h_cleanup \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 3
+
+# 4. VisA / Step-K1 / A1 H Cleanup / seed01 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name visa_step_k1_seed01_a1_h_cleanup \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 4
+```
+
+A1 完成后应检查：
+
+```text
+<run>/tailguard/stage2/h_prune_summary.json
+num_pruned > 0
+
+<run>/tailguard/stage2/stage2_dataset_summary.json
+num_tail_head_noise == 0
+```
+
+### A2 与 A3：直接复用完整主线运行
+
+A2 和 A3 不需要重新训练。统一从对应 Step-K1 主线结果读取：
+
+```text
+# MVTec AD Step-K1
+../results/tailguard/main_table_adaptive/mvtec_step_k1_seed01/tailguard/memory/memory_eval_summary.json
+
+# VisA Step-K1
+../results/tailguard/main_table_adaptive/visa_step_k1_seed01/tailguard/memory/memory_eval_summary.json
+```
+
+取值规则：
+
+```text
+A0 Base              -> A0 文件的 metrics_by_mode.recon.summary
+A1 + H Cleanup       -> A1 文件的 metrics_by_mode.recon.summary
+A2 + T Refinement    -> Full 文件的 metrics_by_mode.recon.summary
+A3 Full TailGuard    -> Full 文件的 metrics_by_mode.fused.summary
+```
+
+所有 A0/A1/Full 运行均以各自 `tailguard/tailguard_summary.json` 中 `memory_status == "completed"` 作为完成验收条件。若 A0 的删除数不为 0，或 A1 仍出现 `num_tail_head_noise > 0`，不要直接拉表，应先核对实际 resolved config。
+
+### 扩展到 Pareto 与 Step-K4（剩余 8 条命令）
+
+以下命令补齐 MVTec AD 和 VisA 的 Pareto、Step-K4 组件消融。加上前面的四条 Step-K1 命令后，A0/A1 将覆盖全部六个主线场景；A2/A3 仍直接复用对应完整主线运行的 `recon`/`fused` 指标。
+
+下面按两批 GPU 1–4 编排：先运行四条 A0，再运行四条 A1。若需要跨批并行，请自行改成空闲 GPU，避免同卡冲突。
+
+#### A0 Base：Pareto / Step-K4
+
+```bash
+# 5. MVTec AD / Pareto / A0 Base / seed01 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name mvtec_pareto_seed01_a0_base \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.0 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 1
+
+# 6. MVTec AD / Step-K4 / A0 Base / seed01 / GPU 2
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name mvtec_step_k4_seed01_a0_base \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.0 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 2
+
+# 7. VisA / Pareto / A0 Base / seed01 / GPU 3
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-pareto-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name visa_pareto_seed01_a0_base \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.0 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 3
+
+# 8. VisA / Step-K4 / A0 Base / seed01 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name visa_step_k4_seed01_a0_base \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.0 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 4
+```
+
+#### A1 + H Cleanup：Pareto / Step-K4
+
+```bash
+# 9. MVTec AD / Pareto / A1 H Cleanup / seed01 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name mvtec_pareto_seed01_a1_h_cleanup \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 1
+
+# 10. MVTec AD / Step-K4 / A1 H Cleanup / seed01 / GPU 2
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed01 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name mvtec_step_k4_seed01_a1_h_cleanup \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 2
+
+# 11. VisA / Pareto / A1 H Cleanup / seed01 / GPU 3
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-pareto-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name visa_pareto_seed01_a1_h_cleanup \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 3
+
+# 12. VisA / Step-K4 / A1 H Cleanup / seed01 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed01 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed01/inject_defects.txt \
+  --save_dir ../results/tailguard/module_ablation \
+  --save_name visa_step_k4_seed01_a1_h_cleanup \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --gpus 4
+```
+
+六个场景的 A2/A3 完整主线结果路径如下：
+
+```text
+../results/tailguard/main_table_adaptive/mvtec_pareto_seed01/tailguard/memory/memory_eval_summary.json
+../results/tailguard/main_table_adaptive/mvtec_step_k4_seed01/tailguard/memory/memory_eval_summary.json
+../results/tailguard/main_table_adaptive/mvtec_step_k1_seed01/tailguard/memory/memory_eval_summary.json
+../results/tailguard/main_table_adaptive/visa_pareto_seed01/tailguard/memory/memory_eval_summary.json
+../results/tailguard/main_table_adaptive/visa_step_k4_seed01/tailguard/memory/memory_eval_summary.json
+../results/tailguard/main_table_adaptive/visa_step_k1_seed01/tailguard/memory/memory_eval_summary.json
+```
+
+对每个场景均使用同一取值规则：A0/A1 读取各自 `metrics_by_mode.recon.summary`，A2 读取对应 Full 的 `metrics_by_mode.recon.summary`，A3 读取对应 Full 的 `metrics_by_mode.fused.summary`。

@@ -37,6 +37,7 @@ from tailguard_artifacts import (
     save_tailguard_attachment_replay_config,
     save_tailguard_attachment_artifacts,
     save_tailguard_denoising_diagnostics,
+    save_tailguard_head_prune_artifacts,
     save_tailguard_pseudoclass_artifacts,
     save_tailguard_pseudoclass_report_artifacts,
     save_tailguard_gbps_iteration_artifacts,
@@ -76,6 +77,7 @@ from tailguard_defaults import (
     TAILGUARD_CONFIG_SCHEMA_VERSION,
     TAILGUARD_FINAL_DEFAULTS,
     TAILGUARD_METHOD_NAME,
+    TAILGUARD_PRUNE_MODES,
 )
 from warmup_diag import load_injected_manifest
 
@@ -153,6 +155,7 @@ def train(item_list):
     memory_saved = None
     stage2_plan = None
     attachment_saved = None
+    head_prune_saved = None
     stage2_saved = None
     denoising_diagnostics_artifacts = None
     denoising_diagnostics_summary = None
@@ -398,6 +401,19 @@ def train(item_list):
                         gbps_selected_iter,
                         args.diag_save_dir,
                     )
+                    if (
+                        (selected_score_iter is None) != (gbps_selected_iter is None)
+                        or (
+                            selected_score_iter is not None
+                            and int(selected_score_iter) != int(gbps_selected_iter)
+                        )
+                    ):
+                        raise RuntimeError(
+                            'GBPS selected/score source iteration mismatch: selected={}, score_source={}'.format(
+                                gbps_selected_iter,
+                                selected_score_iter,
+                            )
+                        )
                     gbps_trigger_summary = {
                         'stage': 'tailguard_selected',
                         'gbps_trigger_iter': int(gbps_trigger_iter),
@@ -406,6 +422,9 @@ def train(item_list):
                         'score_source_path': selected_score_path,
                         'selected_checkpoint_path': selected_checkpoint_path,
                         'gbps_status': trigger_result['status'],
+                        'gbps_prune_mode': args.gbps_prune_mode,
+                        'gbps_prune_max_ratio': float(args.gbps_prune_max_ratio),
+                        'gbps_prune_ratio': float(args.gbps_prune_ratio),
                     }
                     save_tailguard_trigger_summary(args.diag_save_dir, gbps_trigger_summary)
 
@@ -415,6 +434,14 @@ def train(item_list):
                             prepare_result['head_group_assignments_df'],
                             method_metadata_df,
                             args,
+                            gbps_dir=args.diag_save_dir,
+                            selected_iter=selected_score_iter,
+                        )
+                        head_prune_saved = save_tailguard_head_prune_artifacts(
+                            args.tg_stage2_dir,
+                            head_delete_plan['h_prune_decisions_df'],
+                            head_delete_plan['h_prune_group_summary_df'],
+                            head_delete_plan['summary'],
                         )
                         selected_scores_df = head_delete_plan['selected_scores_df']
                         tail_df = selected_scores_df.loc[selected_scores_df['tail_candidate'].astype(int) == 1].copy().reset_index(drop=True)
@@ -571,9 +598,10 @@ def train(item_list):
                         memory_train_eval_dataloader = train_eval_dataloader
                         gbps_has_postprocessed = True
                         reset_loader = True
-                        print_fn('tailguard trigger iter {} selected iter {}: stage2 retained {}, removed {}'.format(
+                        print_fn('tailguard trigger iter {} selected iter {}: H prune mode {}, stage2 retained {}, removed {}'.format(
                             gbps_trigger_iter,
                             gbps_selected_iter,
+                            head_delete_plan['prune_mode'],
                             stage2_plan['summary']['num_stage2_retained'],
                             stage2_plan['summary']['num_stage2_removed'],
                         ))
@@ -720,6 +748,8 @@ def train(item_list):
         'selected_checkpoint_path': selected_checkpoint_path if os.path.isfile(selected_checkpoint_path) else None,
         'prepare_summary': prepare_result['summary'],
         'gbps_trigger_summary': gbps_trigger_summary,
+        'head_prune_summary': None if stage2_plan is None else head_delete_plan['summary'],
+        'head_prune_artifacts': head_prune_saved,
         'stage2_summary': None if stage2_plan is None else stage2_plan['summary'],
         'attachment_artifacts': attachment_saved,
         'attachment_replay_config_path': getattr(args, 'tg_attachment_replay_config_path', None),
@@ -822,6 +852,11 @@ def build_parser(default_dataset_profile='mvtec'):
     parser.add_argument('--gbps_gate_mode', type=str, default=TAILGUARD_FINAL_DEFAULTS['gbps_gate_mode'])
     parser.add_argument('--gbps_min_noise_evidence', type=float, default=TAILGUARD_FINAL_DEFAULTS['gbps_min_noise_evidence'])
     parser.add_argument('--gbps_postprocess_mode', type=str, default=TAILGUARD_FINAL_DEFAULTS['gbps_postprocess_mode'], choices=['none', 'remove'])
+    parser.add_argument('--gbps_prune_mode', type=str, default=TAILGUARD_FINAL_DEFAULTS['gbps_prune_mode'], choices=TAILGUARD_PRUNE_MODES)
+    parser.add_argument('--gbps_prune_max_ratio', type=float, default=TAILGUARD_FINAL_DEFAULTS['gbps_prune_max_ratio'])
+    parser.add_argument('--gbps_prune_stable_window', type=int, default=TAILGUARD_FINAL_DEFAULTS['gbps_prune_stable_window'])
+    parser.add_argument('--gbps_prune_stable_min_observations', type=int, default=TAILGUARD_FINAL_DEFAULTS['gbps_prune_stable_min_observations'])
+    parser.add_argument('--gbps_prune_min_active_ratio', type=float, default=TAILGUARD_FINAL_DEFAULTS['gbps_prune_min_active_ratio'])
     parser.add_argument('--gbps_prune_ratio', type=float, default=TAILGUARD_FINAL_DEFAULTS['gbps_prune_ratio'])
     parser.add_argument('--gbps_min_keep_per_group', type=int, default=TAILGUARD_FINAL_DEFAULTS['gbps_min_keep_per_group'])
     parser.add_argument('--gbps_bootstrap_B', type=int, default=TAILGUARD_FINAL_DEFAULTS['gbps_bootstrap_B'])
@@ -883,6 +918,16 @@ def main(default_dataset_profile='mvtec', argv=None, required_dataset_profile=No
         parser.error('dataset directory does not exist: {}'.format(args.data_path))
     if not args.tg_save_cls_embeddings:
         parser.error('--tg_save_cls_embeddings is required for TailGuard pseudo-class artifacts and replay')
+    if not 0.0 <= float(args.gbps_prune_max_ratio) <= 1.0:
+        parser.error('--gbps_prune_max_ratio must be in [0, 1]')
+    if not 0.0 <= float(args.gbps_prune_ratio) <= 1.0:
+        parser.error('--gbps_prune_ratio must be in [0, 1]')
+    if int(args.gbps_prune_stable_window) < 1:
+        parser.error('--gbps_prune_stable_window must be at least 1')
+    if int(args.gbps_prune_stable_min_observations) < 1:
+        parser.error('--gbps_prune_stable_min_observations must be at least 1')
+    if not 0.0 <= float(args.gbps_prune_min_active_ratio) < 1.0:
+        parser.error('--gbps_prune_min_active_ratio must be in [0, 1)')
 
     args.tailguard_config_schema_version = TAILGUARD_CONFIG_SCHEMA_VERSION
     args.tailguard_method_name = TAILGUARD_METHOD_NAME
@@ -916,6 +961,11 @@ def main(default_dataset_profile='mvtec', argv=None, required_dataset_profile=No
             'tg_stable_window': args.tg_stable_window,
             'tg_stable_min_observations': args.tg_stable_min_observations,
             'tg_t_attached_noise_p_high_thr': args.tg_t_attached_noise_p_high_thr,
+            'gbps_prune_mode': args.gbps_prune_mode,
+            'gbps_prune_max_ratio': args.gbps_prune_max_ratio,
+            'gbps_prune_stable_window': args.gbps_prune_stable_window,
+            'gbps_prune_stable_min_observations': args.gbps_prune_stable_min_observations,
+            'gbps_prune_min_active_ratio': args.gbps_prune_min_active_ratio,
             'gbps_prune_ratio': args.gbps_prune_ratio,
             'gbps_min_keep_per_group': args.gbps_min_keep_per_group,
             'tg_gbps_dir_relpath': os.path.relpath(args.diag_save_dir, args.tg_root_dir),

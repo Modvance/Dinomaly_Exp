@@ -7,12 +7,19 @@ import pandas as pd
 
 
 def summarize_contamination_labels(df, prefix=None):
-    if df is None or len(df) == 0 or 'is_contaminated' not in df.columns:
+    if df is None or len(df) == 0:
         counts = {
             'num_samples': 0,
             'num_labeled_clean': 0,
             'num_labeled_contaminated': 0,
             'num_unlabeled_samples': 0,
+        }
+    elif 'is_contaminated' not in df.columns:
+        counts = {
+            'num_samples': int(len(df)),
+            'num_labeled_clean': 0,
+            'num_labeled_contaminated': 0,
+            'num_unlabeled_samples': int(len(df)),
         }
     else:
         labels = pd.to_numeric(df['is_contaminated'], errors='coerce')
