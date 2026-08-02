@@ -823,10 +823,38 @@ def build_tailguard_stage2_plan(h_clean_df: pd.DataFrame,
                                   tail_head_normal_df: pd.DataFrame,
                                   tail_head_noise_df: pd.DataFrame,
                                   all_samples_df: Optional[pd.DataFrame] = None):
-    retained_frames = [frame for frame in [h_clean_df, tail_head_normal_df, tail_open_df] if frame is not None and len(frame) > 0]
-    removed_frames = [frame for frame in [h_removed_df, tail_head_noise_df] if frame is not None and len(frame) > 0]
-    retained_df = pd.concat(retained_frames, ignore_index=True, sort=False) if len(retained_frames) > 0 else pd.DataFrame()
-    removed_df = pd.concat(removed_frames, ignore_index=True, sort=False) if len(removed_frames) > 0 else pd.DataFrame()
+    source_frames = [
+        h_clean_df,
+        h_removed_df,
+        tail_open_df,
+        tail_head_normal_df,
+        tail_head_noise_df,
+    ]
+
+    def _empty_sample_frame():
+        """Keep the Stage-2 sample schema even when a partition is empty."""
+        candidates = [all_samples_df] + source_frames
+        for frame in candidates:
+            if frame is not None and 'sample_idx' in frame.columns:
+                return frame.iloc[0:0].copy()
+        return pd.DataFrame(columns=['sample_idx'])
+
+    retained_frames = [
+        frame for frame in [h_clean_df, tail_head_normal_df, tail_open_df]
+        if frame is not None and len(frame) > 0
+    ]
+    removed_frames = [
+        frame for frame in [h_removed_df, tail_head_noise_df]
+        if frame is not None and len(frame) > 0
+    ]
+    retained_df = (
+        pd.concat(retained_frames, ignore_index=True, sort=False)
+        if len(retained_frames) > 0 else _empty_sample_frame()
+    )
+    removed_df = (
+        pd.concat(removed_frames, ignore_index=True, sort=False)
+        if len(removed_frames) > 0 else _empty_sample_frame()
+    )
     if len(retained_df) > 0:
         retained_df = retained_df.drop_duplicates(subset=['sample_idx']).reset_index(drop=True)
     if len(removed_df) > 0:

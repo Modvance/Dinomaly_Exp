@@ -40,6 +40,10 @@ def _ensure_sample_idx(df: Optional[pd.DataFrame], sample_idx_only: bool = False
     if df is None:
         return pd.DataFrame(columns=['sample_idx'])
     if 'sample_idx' not in df.columns:
+        # Empty partitions can be schema-less after concatenation; normalize them
+        # so downstream diagnostics still receive the required key column.
+        if len(df) == 0:
+            return pd.DataFrame(columns=['sample_idx'])
         raise ValueError('denoising diagnostics require sample_idx')
     output = df[['sample_idx']].copy() if sample_idx_only else df.copy()
     output['sample_idx'] = pd.to_numeric(output['sample_idx'], errors='raise').astype(int)

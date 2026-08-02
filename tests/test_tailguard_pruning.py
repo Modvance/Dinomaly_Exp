@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 
 import pandas as pd
+import torch
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,7 +20,9 @@ from dinomaly_mvtec_tailguard_attachment_replay import (
 )
 from gbps_runner_utils import summarize_contamination_labels
 from tailguard_defaults import TAILGUARD_FINAL_DEFAULTS
-from tailguard_gbps import build_tailguard_head_delete_plan
+from tailguard_diagnostics import build_tailguard_denoising_diagnostics
+from tailguard_gbps import build_tailguard_head_delete_plan, build_tailguard_stage2_plan
+from tailguard_pseudoclasses import build_tailguard_pseudoclass_registry
 
 
 def _args(mode='adaptive', **overrides):
@@ -184,6 +187,62 @@ class TailGuardPruningTest(unittest.TestCase):
         row = plan['h_prune_group_summary_df'].iloc[0]
         self.assertEqual(float(row['stable_active_ratio']), 0.5)
         self.assertFalse(bool(row['stable_group_active']))
+
+    def test_zero_removal_stage2_preserves_schema_for_diagnostics(self):
+        """A0's no-cleanup path must still expose an empty sample-indexed set."""
+        initial = pd.DataFrame({
+            'sample_idx': [0, 1],
+            'sample_key': [0, 1],
+            'img_path': ['toy/0.png', 'toy/1.png'],
+            'base_idx': [0, 1],
+            'class_id': [0, 0],
+            'class_name': ['toy', 'toy'],
+            'is_contaminated': [0, 0],
+            'group_id': [0, 0],
+        })
+        empty_h = initial.iloc[0:0].copy()
+        empty_tail_open = initial.iloc[0:0].copy()
+        empty_tail_open['adaptive_angle'] = pd.Series(dtype=float)
+        empty_tail_attached = initial.iloc[0:0].copy()
+        empty_tail_attached['best_group_id'] = pd.Series(dtype=int)
+
+        stage2_plan = build_tailguard_stage2_plan(
+            initial,
+            empty_h,
+            empty_tail_open,
+            empty_tail_attached,
+            empty_tail_attached,
+            all_samples_df=initial,
+        )
+
+        self.assertEqual(len(stage2_plan['removed_samples']), 0)
+        self.assertIn('sample_idx', stage2_plan['removed_samples'].columns)
+        summary, by_class = build_tailguard_denoising_diagnostics(
+            initial,
+            stage2_plan['retained_samples'],
+            stage2_plan['removed_samples'],
+            h_removed_samples_df=empty_h,
+            tail_head_noise_samples_df=empty_tail_attached,
+        )
+        self.assertEqual(summary['cleanup_status'], 'completed')
+        self.assertEqual(summary['decision_counts']['num_removed'], 0)
+        self.assertEqual(summary['decision_counts']['num_retained'], 2)
+        self.assertEqual(len(by_class), 1)
+
+        registry = build_tailguard_pseudoclass_registry(
+            initial,
+            empty_tail_attached,
+            empty_tail_open,
+            stage2_plan['retained_samples'],
+            stage2_plan['removed_samples'],
+            {
+                'sample_idx': [0, 1],
+                'embeddings': torch.eye(2),
+                'embedding_source': 'test',
+            },
+        )
+        self.assertEqual(registry['summary']['status'], 'completed')
+        self.assertEqual(registry['summary']['num_removed_samples'], 0)
 
     def test_replay_schema_preserves_legacy_fixed_semantics(self):
         parsed = SimpleNamespace(**{name: None for name in REPLAY_CONFIG_KEYS})
