@@ -4,3 +4,7 @@ __pycache__/
 saved_results/
 *.md
 !README.md
+tests/
+.*/
+_tmp_precluster_smoke/
+tmp/

@@ -1,6 +1,0 @@
-sample_idx,img_path,pseudo_label,cluster_size,cluster_type,cluster_conf,is_singleton
-0,/home/linux/projects/LTN_datasets/mvtecad-pareto-seed01/bottle/train/good/081.png,0,5,multi,0.7315880236537954,False
-1,/home/linux/projects/LTN_datasets/mvtecad-pareto-seed01/bottle/train/good/103.png,0,5,multi,0.7315880236537954,False
-2,/home/linux/projects/LTN_datasets/mvtecad-pareto-seed01/bottle/train/good/157.png,0,5,multi,0.7315880236537954,False
-3,/home/linux/projects/LTN_datasets/mvtecad-pareto-seed01/bottle/train/good/160.png,0,5,multi,0.7315880236537954,False
-4,/home/linux/projects/LTN_datasets/mvtecad-pareto-seed01/bottle/train/good/198.png,0,5,multi,0.7315880236537954,False
