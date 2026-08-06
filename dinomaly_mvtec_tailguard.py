@@ -3,7 +3,9 @@
 import argparse
 import json
 import os
+import random
 import time
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import pandas as pd
@@ -50,7 +52,6 @@ from tailguard_attachment import build_tail_attachment_plan
 from tailguard_gbps import (
     build_tailguard_head_delete_plan,
     build_tailguard_stage2_plan,
-    classify_tail_attached_stable_risk,
     load_tailguard_selected_checkpoint,
     run_tailguard_gbps_iteration,
     save_tailguard_selected_checkpoint,
@@ -76,6 +77,7 @@ from tailguard_defaults import (
     TAILGUARD_CONFIG_PROFILE,
     TAILGUARD_CONFIG_SCHEMA_VERSION,
     TAILGUARD_FINAL_DEFAULTS,
+    TAILGUARD_METHOD_MODES,
     TAILGUARD_METHOD_NAME,
     TAILGUARD_PRUNE_MODES,
 )
@@ -88,22 +90,134 @@ warnings.filterwarnings('ignore')
 MVTec_ITEM_LIST = list(MVTec_PROFILE.item_list)
 
 
-def resolved_tailguard_method_config(parsed_args):
-    """Return the complete method configuration resolved for one run."""
-    return {
-        name: getattr(parsed_args, name, default)
-        for name, default in TAILGUARD_FINAL_DEFAULTS.items()
-    }
-
-
 def _build_retained_index_map(samples_df: pd.DataFrame, num_classes=None):
     retained_index_map = {}
     if num_classes is not None:
         for class_id in range(int(num_classes)):
             retained_index_map[int(class_id)] = []
     for class_id, class_df in samples_df.groupby('class_id', sort=True):
-        retained_index_map[int(class_id)] = [int(value) for value in class_df['base_idx'].astype(int).tolist()]
+        ordered = class_df.sort_values(['base_idx', 'sample_idx'], kind='mergesort')
+        retained_index_map[int(class_id)] = [int(value) for value in ordered['base_idx'].astype(int).tolist()]
     return retained_index_map
+
+
+@contextmanager
+def _preserve_rng_state():
+    """Keep analysis-only loader passes from changing the training trajectory."""
+    state = {
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        'numpy': np.random.get_state(),
+        'python': random.getstate(),
+    }
+    try:
+        yield
+    finally:
+        torch.set_rng_state(state['torch'].detach().cpu().byte())
+        if torch.cuda.is_available() and state['cuda'] is not None:
+            torch.cuda.set_rng_state_all([
+                value.detach().cpu().byte() for value in state['cuda']
+            ])
+        np.random.set_state(state['numpy'])
+        random.setstate(state['python'])
+
+
+def _mode_uses_reconciliation(method_mode):
+    return method_mode in {'full_no_e', 'full'}
+
+
+def _mode_uses_enhancement(method_mode):
+    return method_mode in {'h_raw_e', 'full'}
+
+
+def _resolve_tailguard_trigger_selection(trigger_result):
+    """Choose Stage-2 score evidence without forcing an unsupported rollback."""
+    status = str(trigger_result['status'])
+    selected_iter = trigger_result.get('selected_iter')
+    zero_removal_fallback = status == 'no_noise_forced'
+    if zero_removal_fallback:
+        selected_iter = trigger_result.get('summary', {}).get('iteration')
+    if selected_iter is None:
+        raise RuntimeError(
+            'TailGuard trigger {} did not provide a score iteration for Stage 2'.format(status)
+        )
+    return int(selected_iter), bool(zero_removal_fallback)
+
+
+def resolved_tailguard_method_config(parsed_args):
+    """Return the complete method configuration resolved for one run."""
+    config = {
+        name: getattr(parsed_args, name, default)
+        for name, default in TAILGUARD_FINAL_DEFAULTS.items()
+    }
+    config.update({
+        'reconciliation_enabled': _mode_uses_reconciliation(parsed_args.tg_method_mode),
+        'enhancement_enabled': _mode_uses_enhancement(parsed_args.tg_method_mode),
+    })
+    return config
+
+
+def _empty_tail_affiliated_frame(tail_df):
+    empty = tail_df.iloc[0:0].copy()
+    if 'best_group_id' not in empty.columns:
+        empty['best_group_id'] = pd.Series(dtype=int)
+    return empty
+
+
+def _build_h_only_stage2_plan(head_delete_plan, tail_df, all_samples_df, num_classes):
+    h_clean_df = head_delete_plan['h_clean_samples'].copy()
+    h_removed_df = head_delete_plan['h_removed_samples'].copy()
+    retained_df = pd.concat([h_clean_df, tail_df], ignore_index=True, sort=False)
+    retained_df = retained_df.drop_duplicates(subset=['sample_idx']).sort_values(
+        'sample_idx', kind='mergesort'
+    ).reset_index(drop=True)
+    removed_df = h_removed_df.drop_duplicates(subset=['sample_idx']).sort_values(
+        'sample_idx', kind='mergesort'
+    ).reset_index(drop=True)
+    all_ids = set(all_samples_df['sample_idx'].astype(int))
+    retained_ids = set(retained_df['sample_idx'].astype(int))
+    removed_ids = set(removed_df['sample_idx'].astype(int))
+    tail_ids = set(tail_df['sample_idx'].astype(int))
+    if retained_ids & removed_ids or retained_ids | removed_ids != all_ids:
+        raise ValueError('H-only Stage 2 partitions must be disjoint and cover all samples')
+    if not tail_ids.issubset(retained_ids):
+        raise ValueError('H-only must retain every TailSampler candidate')
+    summary = {
+        'method_mode': 'h_only',
+        'num_stage2_retained': int(len(retained_df)),
+        'num_stage2_removed': int(len(removed_df)),
+        'num_h_clean': int(len(h_clean_df)),
+        'num_h_removed': int(len(h_removed_df)),
+        'num_tail_candidates_retained': int(len(tail_df)),
+        'num_tail_candidates_removed': 0,
+        'reconciliation_performed': False,
+        'enhancement_performed': False,
+    }
+    return {
+        'retained_samples': retained_df,
+        'removed_samples': removed_df,
+        'retained_index_map': _build_retained_index_map(retained_df, num_classes=num_classes),
+        'summary': summary,
+    }
+
+
+def _validate_stage2_partition(stage2_plan, all_samples_df, tail_df, method_mode):
+    retained_ids = set(stage2_plan['retained_samples']['sample_idx'].astype(int))
+    removed_ids = set(stage2_plan['removed_samples']['sample_idx'].astype(int))
+    all_ids = set(all_samples_df['sample_idx'].astype(int))
+    tail_ids = set(tail_df['sample_idx'].astype(int))
+    if retained_ids & removed_ids:
+        raise ValueError('{} retained/removed Stage 2 partitions overlap'.format(method_mode))
+    if retained_ids | removed_ids != all_ids:
+        raise ValueError('{} Stage 2 partitions do not cover the input set'.format(method_mode))
+    if not tail_ids.issubset(retained_ids):
+        raise ValueError('{} must retain every TailSampler candidate'.format(method_mode))
+
+
+def _build_raw_tail_roles(tail_df):
+    tail_open_df = tail_df.copy().sort_values('sample_idx', kind='mergesort').reset_index(drop=True)
+    tail_attached_df = _empty_tail_affiliated_frame(tail_df)
+    return tail_open_df, tail_attached_df, tail_attached_df.copy()
 
 
 def _validate_checkpoint_profile(profile, checkpoint_metadata):
@@ -117,17 +231,18 @@ def _validate_checkpoint_profile(profile, checkpoint_metadata):
 
 
 def _evaluate_current_model(model, test_data_list, item_list, device, args, print_fn=None):
-    return evaluate_model(
-        model,
-        test_data_list,
-        item_list,
-        device,
-        batch_size=int(args.batch_size),
-        num_workers=int(args.num_workers),
-        max_ratio=float(args.max_ratio),
-        resize_mask=int(args.resize_mask),
-        print_fn=print_fn,
-    )
+    with _preserve_rng_state():
+        return evaluate_model(
+            model,
+            test_data_list,
+            item_list,
+            device,
+            batch_size=int(args.batch_size),
+            num_workers=int(args.num_workers),
+            max_ratio=float(args.max_ratio),
+            resize_mask=int(args.resize_mask),
+            print_fn=print_fn,
+        )
 
 
 def _print_eval_summary(summary, print_fn):
@@ -144,6 +259,7 @@ def _print_eval_summary(summary, print_fn):
 
 def train(item_list):
     setup_seed(1)
+    method_mode = str(args.tg_method_mode)
     total_iters = int(args.total_iters)
     batch_size = int(args.batch_size)
     num_workers = int(args.num_workers)
@@ -210,6 +326,14 @@ def train(item_list):
         batch_size=batch_size,
         num_workers=num_workers,
     )
+    # Metadata preparation is outside the reconstruction optimization path.
+    # Rewind to the post-model seed before the first training batch in every mode.
+    post_model_rng_state = {
+        'torch': torch.get_rng_state(),
+        'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        'numpy': np.random.get_state(),
+        'python': random.getstate(),
+    }
     full_train_eval_dataloader = build_train_eval_dataloader(
         base_train_data_list,
         data_root=args.data_path,
@@ -219,15 +343,24 @@ def train(item_list):
         contaminated_paths=contaminated_paths,
     )
 
-    prepare_result = prepare_tailguard_metadata(
-        model,
-        full_train_eval_dataloader,
-        device,
-        args.tg_prepare_dir,
-        args,
-        manifest_path=manifest_path,
-        manifest_requested_path=args.diag_manifest_path,
-    )
+    # Preserve all RNG streams so cached support metadata cannot alter training.
+    with _preserve_rng_state():
+        prepare_result = prepare_tailguard_metadata(
+            model,
+            full_train_eval_dataloader,
+            device,
+            args.tg_prepare_dir,
+            args,
+            manifest_path=manifest_path,
+            manifest_requested_path=args.diag_manifest_path,
+        )
+    torch.set_rng_state(post_model_rng_state['torch'].detach().cpu().byte())
+    if torch.cuda.is_available() and post_model_rng_state['cuda'] is not None:
+        torch.cuda.set_rng_state_all([
+            value.detach().cpu().byte() for value in post_model_rng_state['cuda']
+        ])
+    np.random.set_state(post_model_rng_state['numpy'])
+    random.setstate(post_model_rng_state['python'])
     print_fn('tailguard prepare: T={}, H={}, head_groups={}'.format(
         prepare_result['summary']['num_tail_candidates'],
         prepare_result['summary']['num_head_candidates'],
@@ -291,7 +424,7 @@ def train(item_list):
     gbps_check_count = 0
     gbps_trigger_iter = None
     gbps_selected_iter = None
-    gbps_has_postprocessed = False
+    gbps_has_postprocessed = method_mode == 'core'
     last_eval_iter = None
 
     it = 0
@@ -313,7 +446,7 @@ def train(item_list):
             loss_list.append(loss_value)
             current_iter = it + 1
 
-            if gbps_trigger_iter is None and not gbps_has_postprocessed and should_run_check(
+            if method_mode != 'core' and gbps_trigger_iter is None and not gbps_has_postprocessed and should_run_check(
                 current_iter,
                 total_iters,
                 float(args.gbps_check_start_ratio),
@@ -322,19 +455,20 @@ def train(item_list):
             ):
                 gbps_check_count += 1
                 iter_dir = os.path.join(args.diag_save_dir, 'iter_{:05d}'.format(current_iter))
-                scored_df = score_trainset(
-                    model,
-                    full_train_eval_dataloader,
-                    device,
-                    max_ratio=float(args.diag_max_ratio),
-                    resize_mask=int(args.diag_resize_mask),
-                )
-                gbps_result = run_tailguard_gbps_iteration(
-                    scored_df,
-                    prepare_result['head_group_assignments_df'],
-                    method_metadata_df,
-                    args,
-                )
+                with _preserve_rng_state():
+                    scored_df = score_trainset(
+                        model,
+                        full_train_eval_dataloader,
+                        device,
+                        max_ratio=float(args.diag_max_ratio),
+                        resize_mask=int(args.diag_resize_mask),
+                    )
+                    gbps_result = run_tailguard_gbps_iteration(
+                        scored_df,
+                        prepare_result['head_group_assignments_df'],
+                        method_metadata_df,
+                        args,
+                    )
                 t_max = max(1, int(total_iters * float(args.gbps_check_end_ratio)))
                 trigger_result = evaluate_gbps_ci_peak_trigger(
                     U_t=gbps_result['gbps_U'],
@@ -394,7 +528,9 @@ def train(item_list):
 
                 if trigger_result['triggered']:
                     gbps_trigger_iter = current_iter
-                    gbps_selected_iter = trigger_result['selected_iter']
+                    gbps_selected_iter, h_zero_removal_fallback = _resolve_tailguard_trigger_selection(
+                        trigger_result
+                    )
                     selected_scored_df, selected_score_iter, selected_score_path = resolve_gbps_best_scored_df(
                         gbps_result['train_scores_df'],
                         current_iter,
@@ -420,184 +556,227 @@ def train(item_list):
                         'gbps_selected_iter': None if gbps_selected_iter is None else int(gbps_selected_iter),
                         'score_source_iter': None if selected_score_iter is None else int(selected_score_iter),
                         'score_source_path': selected_score_path,
-                        'selected_checkpoint_path': selected_checkpoint_path,
+                        'selected_checkpoint_path': (
+                            None if h_zero_removal_fallback else selected_checkpoint_path
+                        ),
+                        'checkpoint_rollback_performed': not h_zero_removal_fallback,
                         'gbps_status': trigger_result['status'],
+                        'h_zero_removal_fallback': bool(h_zero_removal_fallback),
+                        'h_zero_removal_fallback_reason': (
+                            'insufficient_head_noise_evidence'
+                            if h_zero_removal_fallback else None
+                        ),
                         'gbps_prune_mode': args.gbps_prune_mode,
                         'gbps_prune_max_ratio': float(args.gbps_prune_max_ratio),
                         'gbps_prune_ratio': float(args.gbps_prune_ratio),
                     }
                     save_tailguard_trigger_summary(args.diag_save_dir, gbps_trigger_summary)
 
-                    if args.gbps_postprocess_mode == 'remove' and selected_scored_df is not None and os.path.isfile(selected_checkpoint_path):
-                        head_delete_plan = build_tailguard_head_delete_plan(
-                            selected_scored_df,
-                            prepare_result['head_group_assignments_df'],
-                            method_metadata_df,
-                            args,
-                            gbps_dir=args.diag_save_dir,
-                            selected_iter=selected_score_iter,
-                        )
-                        head_prune_saved = save_tailguard_head_prune_artifacts(
-                            args.tg_stage2_dir,
-                            head_delete_plan['h_prune_decisions_df'],
-                            head_delete_plan['h_prune_group_summary_df'],
-                            head_delete_plan['summary'],
-                        )
-                        selected_scores_df = head_delete_plan['selected_scores_df']
-                        tail_df = selected_scores_df.loc[selected_scores_df['tail_candidate'].astype(int) == 1].copy().reset_index(drop=True)
-                        attachment_plan = build_tail_attachment_plan(
-                            tail_df,
-                            head_delete_plan['h_clean_samples'],
-                            prepare_result['grouping_embeddings_payload'],
-                            args,
-                            getattr(
+                    selected_checkpoint_ready = (
+                        h_zero_removal_fallback or os.path.isfile(selected_checkpoint_path)
+                    )
+                    if args.gbps_postprocess_mode == 'remove' and selected_scored_df is not None and selected_checkpoint_ready:
+                        analysis_context = _preserve_rng_state() if h_zero_removal_fallback else nullcontext()
+                        with analysis_context:
+                            head_delete_plan = build_tailguard_head_delete_plan(
+                                selected_scored_df,
+                                prepare_result['head_group_assignments_df'],
+                                method_metadata_df,
                                 args,
-                                'tg_attachment_membership_mode',
-                                TAILGUARD_FINAL_DEFAULTS['tg_attachment_membership_mode'],
-                            ),
-                        )
-                        geometry = attachment_plan['geometry']
-                        conformity_df = attachment_plan['conformity_df']
-                        attachment_scores_df = attachment_plan['attachment_scores_df']
-                        tail_open_df = attachment_plan['tail_open_df']
-                        tail_attached_df = attachment_plan['tail_attached_df']
-                        elbow_summary = attachment_plan['attachment_summary']
-                        membership_scores_df = attachment_plan['membership_scores_df']
-                        membership_calibration_df = attachment_plan['membership_calibration_df']
-                        membership_summary = attachment_plan['membership_summary']
-                        rgd_distances_df = attachment_plan['rgd_distances_df']
-                        rgd_scores_df = attachment_plan['rgd_scores_df']
-                        rgd_split_summary = attachment_plan['rgd_split_summary']
-                        rgd_bic_candidates_df = attachment_plan['rgd_bic_candidates_df']
-                        tail_head_normal_df, tail_head_noise_df, stable_risk_df = classify_tail_attached_stable_risk(
-                            tail_attached_df,
-                            args.diag_save_dir,
-                            gbps_selected_iter,
-                            args,
-                        )
-                        attachment_saved = save_tailguard_attachment_artifacts(
-                            args.tg_attachment_dir,
-                            geometry,
-                            conformity_df,
-                            attachment_scores_df,
-                            elbow_summary,
-                            tail_open_df,
-                            tail_attached_df,
-                            tail_head_normal_df,
-                            tail_head_noise_df,
-                            membership_scores_df=membership_scores_df,
-                            membership_calibration_df=membership_calibration_df,
-                            membership_summary=membership_summary,
-                            rgd_distances_df=rgd_distances_df,
-                            rgd_scores_df=rgd_scores_df,
-                            rgd_split_summary=rgd_split_summary,
-                            rgd_bic_candidates_df=rgd_bic_candidates_df,
-                        )
-                        stable_risk_df.to_csv(os.path.join(args.tg_attachment_dir, 'tail_attached_stable_risk.csv'), index=False)
-
-                        stage2_plan = build_tailguard_stage2_plan(
-                            head_delete_plan['h_clean_samples'],
-                            head_delete_plan['h_removed_samples'],
-                            tail_open_df,
-                            tail_head_normal_df,
-                            tail_head_noise_df,
-                            all_samples_df=method_metadata_df,
-                        )
-                        stage2_saved = save_tailguard_stage2_artifacts(
-                            args.tg_stage2_dir,
-                            stage2_plan['retained_samples'],
-                            stage2_plan['removed_samples'],
-                            stage2_plan['summary'],
-                        )
-                        denoising_diagnostics_summary, denoising_diagnostics_by_class = build_tailguard_denoising_diagnostics(
-                            prepare_result['analysis_metadata_df'],
-                            stage2_plan['retained_samples'],
-                            stage2_plan['removed_samples'],
-                            h_removed_samples_df=head_delete_plan['h_removed_samples'],
-                            tail_head_noise_samples_df=tail_head_noise_df,
-                            manifest_path=manifest_path,
-                            manifest_requested_path=args.diag_manifest_path,
-                            label_source=prepare_result['saved'].get('tailguard_train_analysis_metadata_csv') if prepare_result['saved'] else None,
-                        )
-                        denoising_diagnostics_artifacts = save_tailguard_denoising_diagnostics(
-                            args.tg_root_dir,
-                            denoising_diagnostics_summary,
-                            denoising_diagnostics_by_class,
-                        )
-                        cls_embeddings_payload = prepare_result['cls_embeddings_payload']
-                        if cls_embeddings_payload is None:
-                            raise ValueError(
-                                'TailGuard pseudo-classification requires --tg_save_cls_embeddings'
+                                gbps_dir=args.diag_save_dir,
+                                selected_iter=selected_score_iter,
+                                force_no_delete_reason=(
+                                    'insufficient_head_noise_evidence'
+                                    if h_zero_removal_fallback else None
+                                ),
                             )
-                        pseudoclass_registry = build_tailguard_pseudoclass_registry(
-                            head_delete_plan['h_clean_samples'],
-                            tail_head_normal_df,
-                            tail_open_df,
-                            stage2_plan['retained_samples'],
-                            stage2_plan['removed_samples'],
-                            cls_embeddings_payload,
-                        )
-                        pseudoclass_artifacts = save_tailguard_pseudoclass_artifacts(
-                            os.path.join(args.tg_root_dir, 'pseudoclasses'),
-                            pseudoclass_registry['members_df'],
-                            pseudoclass_registry['classes_df'],
-                            pseudoclass_registry['tail_edges_df'],
-                            pseudoclass_registry['summary'],
-                            metadata={'dataset_provenance': args.dataset_provenance},
-                        )
-                        pseudoclass_report, pseudoclass_predictions, pseudoclass_summary_df, pseudoclass_contingency_df = (
-                            build_tailguard_pseudoclass_report(
-                                pseudoclass_registry['members_df'],
-                                pseudoclass_registry['classes_df'],
-                                cls_embeddings_payload,
+                            head_prune_saved = save_tailguard_head_prune_artifacts(
+                                args.tg_stage2_dir,
+                                head_delete_plan['h_prune_decisions_df'],
+                                head_delete_plan['h_prune_group_summary_df'],
+                                head_delete_plan['summary'],
+                            )
+                            selected_scores_df = head_delete_plan['selected_scores_df']
+                            tail_df = selected_scores_df.loc[selected_scores_df['tail_candidate'].astype(int) == 1].copy().reset_index(drop=True)
+                            if _mode_uses_reconciliation(method_mode):
+                                attachment_plan = build_tail_attachment_plan(
+                                    tail_df,
+                                    head_delete_plan['h_clean_samples'],
+                                    prepare_result['grouping_embeddings_payload'],
+                                    args,
+                                    args.tg_attachment_membership_mode,
+                                )
+                                geometry = attachment_plan['geometry']
+                                conformity_df = attachment_plan['conformity_df']
+                                attachment_scores_df = attachment_plan['attachment_scores_df']
+                                tail_open_df = attachment_plan['tail_open_df']
+                                tail_attached_df = attachment_plan['tail_attached_df']
+                                elbow_summary = attachment_plan['attachment_summary']
+                                membership_scores_df = attachment_plan['membership_scores_df']
+                                membership_calibration_df = attachment_plan['membership_calibration_df']
+                                membership_summary = attachment_plan['membership_summary']
+                                rgd_distances_df = attachment_plan['rgd_distances_df']
+                                rgd_scores_df = attachment_plan['rgd_scores_df']
+                                rgd_split_summary = attachment_plan['rgd_split_summary']
+                                rgd_bic_candidates_df = attachment_plan['rgd_bic_candidates_df']
+                                tail_head_normal_df = tail_attached_df.copy().sort_values(
+                                    'sample_idx', kind='mergesort'
+                                ).reset_index(drop=True)
+                                tail_head_noise_df = tail_attached_df.iloc[0:0].copy()
+                                attachment_saved = save_tailguard_attachment_artifacts(
+                                    args.tg_attachment_dir,
+                                    geometry,
+                                    conformity_df,
+                                    attachment_scores_df,
+                                    elbow_summary,
+                                    tail_open_df,
+                                    tail_attached_df,
+                                    tail_head_normal_df,
+                                    tail_head_noise_df,
+                                    membership_scores_df=membership_scores_df,
+                                    membership_calibration_df=membership_calibration_df,
+                                    membership_summary=membership_summary,
+                                    rgd_distances_df=rgd_distances_df,
+                                    rgd_scores_df=rgd_scores_df,
+                                    rgd_split_summary=rgd_split_summary,
+                                    rgd_bic_candidates_df=rgd_bic_candidates_df,
+                                )
+                                stage2_plan = build_tailguard_stage2_plan(
+                                    head_delete_plan['h_clean_samples'],
+                                    head_delete_plan['h_removed_samples'],
+                                    tail_open_df,
+                                    tail_head_normal_df,
+                                    tail_head_noise_df,
+                                    all_samples_df=method_metadata_df,
+                                )
+                            elif method_mode == 'h_raw_e':
+                                tail_open_df, tail_head_normal_df, tail_head_noise_df = _build_raw_tail_roles(tail_df)
+                                stage2_plan = build_tailguard_stage2_plan(
+                                    head_delete_plan['h_clean_samples'],
+                                    head_delete_plan['h_removed_samples'],
+                                    tail_open_df,
+                                    tail_head_normal_df,
+                                    tail_head_noise_df,
+                                    all_samples_df=method_metadata_df,
+                                )
+                            elif method_mode == 'h_only':
+                                tail_open_df = tail_df.copy()
+                                tail_head_normal_df = _empty_tail_affiliated_frame(tail_df)
+                                tail_head_noise_df = tail_head_normal_df.copy()
+                                stage2_plan = _build_h_only_stage2_plan(
+                                    head_delete_plan,
+                                    tail_df,
+                                    method_metadata_df,
+                                    num_classes=len(base_train_data_list),
+                                )
+                            else:
+                                raise ValueError('unexpected cleanup-capable method mode: {}'.format(method_mode))
+                            _validate_stage2_partition(stage2_plan, method_metadata_df, tail_df, method_mode)
+                            stage2_plan['summary'].update({
+                                'method_mode': method_mode,
+                                'reconciliation_performed': _mode_uses_reconciliation(method_mode),
+                                'enhancement_performed': _mode_uses_enhancement(method_mode),
+                                'num_tail_candidates_removed': int(len(tail_head_noise_df)),
+                                'tail_candidate_protection_enforced': True,
+                                'h_zero_removal_fallback': bool(h_zero_removal_fallback),
+                            })
+                            stage2_saved = save_tailguard_stage2_artifacts(
+                                args.tg_stage2_dir,
+                                stage2_plan['retained_samples'],
+                                stage2_plan['removed_samples'],
+                                stage2_plan['summary'],
+                            )
+                            denoising_diagnostics_summary, denoising_diagnostics_by_class = build_tailguard_denoising_diagnostics(
                                 prepare_result['analysis_metadata_df'],
+                                stage2_plan['retained_samples'],
+                                stage2_plan['removed_samples'],
+                                h_removed_samples_df=head_delete_plan['h_removed_samples'],
+                                tail_head_noise_samples_df=tail_head_noise_df,
+                                manifest_path=manifest_path,
+                                manifest_requested_path=args.diag_manifest_path,
+                                label_source=prepare_result['saved'].get('tailguard_train_analysis_metadata_csv') if prepare_result['saved'] else None,
                             )
-                        )
-                        pseudoclass_report_artifacts = save_tailguard_pseudoclass_report_artifacts(
-                            args.tg_root_dir,
-                            pseudoclass_report,
-                            pseudoclass_predictions,
-                            pseudoclass_summary_df,
-                            pseudoclass_contingency_df,
-                        )
-                        pseudoclass_status = 'completed'
-                        print_fn('tailguard pseudo-classes: total={}, head={}, tail={}'.format(
-                            pseudoclass_registry['summary']['num_pseudo_classes'],
-                            pseudoclass_registry['summary']['num_head_pseudo_classes'],
-                            pseudoclass_registry['summary']['num_tail_pseudo_classes'],
-                        ))
+                            denoising_diagnostics_artifacts = save_tailguard_denoising_diagnostics(
+                                args.tg_root_dir,
+                                denoising_diagnostics_summary,
+                                denoising_diagnostics_by_class,
+                            )
+                            if _mode_uses_enhancement(method_mode):
+                                cls_embeddings_payload = prepare_result['cls_embeddings_payload']
+                                if cls_embeddings_payload is None:
+                                    raise ValueError(
+                                        'TailGuard enhancement requires --tg_save_cls_embeddings'
+                                    )
+                                pseudoclass_registry = build_tailguard_pseudoclass_registry(
+                                    head_delete_plan['h_clean_samples'],
+                                    tail_head_normal_df,
+                                    tail_open_df,
+                                    stage2_plan['retained_samples'],
+                                    stage2_plan['removed_samples'],
+                                    cls_embeddings_payload,
+                                )
+                                pseudoclass_artifacts = save_tailguard_pseudoclass_artifacts(
+                                    os.path.join(args.tg_root_dir, 'pseudoclasses'),
+                                    pseudoclass_registry['members_df'],
+                                    pseudoclass_registry['classes_df'],
+                                    pseudoclass_registry['tail_edges_df'],
+                                    pseudoclass_registry['summary'],
+                                    metadata={'dataset_provenance': args.dataset_provenance},
+                                )
+                                pseudoclass_report, pseudoclass_predictions, pseudoclass_summary_df, pseudoclass_contingency_df = (
+                                    build_tailguard_pseudoclass_report(
+                                        pseudoclass_registry['members_df'],
+                                        pseudoclass_registry['classes_df'],
+                                        cls_embeddings_payload,
+                                        prepare_result['analysis_metadata_df'],
+                                    )
+                                )
+                                pseudoclass_report_artifacts = save_tailguard_pseudoclass_report_artifacts(
+                                    args.tg_root_dir,
+                                    pseudoclass_report,
+                                    pseudoclass_predictions,
+                                    pseudoclass_summary_df,
+                                    pseudoclass_contingency_df,
+                                )
+                                pseudoclass_status = 'completed'
+                                print_fn('tailguard pseudo-classes: total={}, head={}, tail={}'.format(
+                                    pseudoclass_registry['summary']['num_pseudo_classes'],
+                                    pseudoclass_registry['summary']['num_head_pseudo_classes'],
+                                    pseudoclass_registry['summary']['num_tail_pseudo_classes'],
+                                ))
 
-                        checkpoint = load_tailguard_selected_checkpoint(
-                            selected_checkpoint_path,
-                            model,
-                            optimizer=optimizer,
-                            scheduler=lr_scheduler,
-                            map_location=device,
-                            restore_rng=True,
-                        )
-                        it = int(checkpoint['iteration'])
-                        rebuild_result = rebuild_pruned_train_loaders(
-                            base_train_data_list,
-                            stage2_plan['retained_index_map'],
-                            data_root=args.data_path,
-                            item_list=item_list,
-                            batch_size=batch_size,
-                            num_workers=num_workers,
-                            diag_batch_size=args.diag_batch_size,
-                            diag_num_workers=args.diag_num_workers,
-                            contaminated_paths=contaminated_paths,
-                            sampler=None,
-                            epoch_num_samples=None,
-                            phase6_plan=None,
-                            use_phase6_meta=False,
-                        )
-                        train_data_list = rebuild_result['train_data_list']
-                        train_data = rebuild_result['train_data']
-                        train_dataloader = rebuild_result['train_dataloader']
-                        train_eval_dataloader = rebuild_result['train_eval_dataloader']
-                        memory_train_eval_dataloader = train_eval_dataloader
+                        if not h_zero_removal_fallback:
+                            checkpoint = load_tailguard_selected_checkpoint(
+                                selected_checkpoint_path,
+                                model,
+                                optimizer=optimizer,
+                                scheduler=lr_scheduler,
+                                map_location=device,
+                                restore_rng=True,
+                            )
+                            it = int(checkpoint['iteration'])
+                            rebuild_result = rebuild_pruned_train_loaders(
+                                base_train_data_list,
+                                stage2_plan['retained_index_map'],
+                                data_root=args.data_path,
+                                item_list=item_list,
+                                batch_size=batch_size,
+                                num_workers=num_workers,
+                                diag_batch_size=args.diag_batch_size,
+                                diag_num_workers=args.diag_num_workers,
+                                contaminated_paths=contaminated_paths,
+                                sampler=None,
+                                epoch_num_samples=None,
+                                phase6_plan=None,
+                                use_phase6_meta=False,
+                            )
+                            train_data_list = rebuild_result['train_data_list']
+                            train_data = rebuild_result['train_data']
+                            train_dataloader = rebuild_result['train_dataloader']
+                            train_eval_dataloader = rebuild_result['train_eval_dataloader']
+                            memory_train_eval_dataloader = train_eval_dataloader
+                            reset_loader = True
                         gbps_has_postprocessed = True
-                        reset_loader = True
                         print_fn('tailguard trigger iter {} selected iter {}: H prune mode {}, stage2 retained {}, removed {}'.format(
                             gbps_trigger_iter,
                             gbps_selected_iter,
@@ -605,7 +784,8 @@ def train(item_list):
                             stage2_plan['summary']['num_stage2_retained'],
                             stage2_plan['summary']['num_stage2_removed'],
                         ))
-                        break
+                        if reset_loader:
+                            break
                     else:
                         gbps_has_postprocessed = True
                         print_fn('tailguard trigger iter {} did not run removal; continuing without Stage 2 rebuild'.format(gbps_trigger_iter))
@@ -627,7 +807,9 @@ def train(item_list):
             break
 
     if denoising_diagnostics_artifacts is None:
-        if gbps_trigger_iter is None:
+        if method_mode == 'core':
+            cleanup_reason = 'method_mode_core'
+        elif gbps_trigger_iter is None:
             cleanup_reason = 'gbps_not_triggered'
         elif args.gbps_postprocess_mode != 'remove':
             cleanup_reason = 'gbps_postprocess_mode_{}'.format(args.gbps_postprocess_mode)
@@ -652,9 +834,12 @@ def train(item_list):
         )
 
     if pseudoclass_status != 'completed':
-        pseudoclass_reason = 'cleanup_status_{}'.format(
-            denoising_diagnostics_summary['cleanup_status']
-        )
+        if not _mode_uses_enhancement(method_mode):
+            pseudoclass_reason = 'method_mode_{}_disables_enhancement'.format(method_mode)
+        else:
+            pseudoclass_reason = 'cleanup_status_{}'.format(
+                denoising_diagnostics_summary['cleanup_status']
+            )
 
     if last_eval_iter != int(it):
         final_eval_summary = _evaluate_current_model(model, test_data_list, item_list, device, args)
@@ -672,8 +857,9 @@ def train(item_list):
     print_fn('saved final model checkpoint to {} before memory evaluation'.format(checkpoint_path))
 
     memory_system = None
-    memory_status = 'disabled' if not bool(args.tg_memory_enable) else 'skipped_pseudoclasses_unavailable'
-    if bool(args.tg_memory_enable) and pseudoclass_registry is not None:
+    memory_enabled = bool(args.tg_memory_enable) and _mode_uses_enhancement(method_mode)
+    memory_status = 'disabled' if not memory_enabled else 'skipped_pseudoclasses_unavailable'
+    if memory_enabled and pseudoclass_registry is not None:
         memory_system = build_tailguard_pseudoclass_memory_system(
             model,
             memory_train_eval_dataloader,
@@ -741,11 +927,17 @@ def train(item_list):
         'schema_version': TAILGUARD_CONFIG_SCHEMA_VERSION,
         'method_name': TAILGUARD_METHOD_NAME,
         'config_profile': TAILGUARD_CONFIG_PROFILE,
+        'method_mode': method_mode,
         'resolved_method_config': args.tailguard_resolved_method_config,
         'dataset_provenance': args.dataset_provenance,
         'checkpoint_path': checkpoint_path,
         'input_checkpoint_path': args.checkpoint_path,
-        'selected_checkpoint_path': selected_checkpoint_path if os.path.isfile(selected_checkpoint_path) else None,
+        'selected_checkpoint_path': (
+            None
+            if gbps_trigger_summary is not None
+            and bool(gbps_trigger_summary.get('h_zero_removal_fallback'))
+            else selected_checkpoint_path if os.path.isfile(selected_checkpoint_path) else None
+        ),
         'prepare_summary': prepare_result['summary'],
         'gbps_trigger_summary': gbps_trigger_summary,
         'head_prune_summary': None if stage2_plan is None else head_delete_plan['summary'],
@@ -824,6 +1016,13 @@ def build_parser(default_dataset_profile='mvtec'):
     parser.add_argument('--diag_resize_mask', type=int, default=256)
     parser.add_argument('--diag_manifest_path', type=str, default=None)
 
+    parser.add_argument(
+        '--tg_method_mode',
+        type=str,
+        default=TAILGUARD_FINAL_DEFAULTS['tg_method_mode'],
+        choices=TAILGUARD_METHOD_MODES,
+        help='Dependency-aware paper variant; full is the canonical TailGuard method.',
+    )
     parser.add_argument('--tailsampler_type', type=str, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_type'], choices=['tail', 'adaptive', 'adaptive_trim_mode'])
     parser.add_argument('--tailsampler_th_type', type=str, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_th_type'])
     parser.add_argument('--tailsampler_vote_type', type=str, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_vote_type'])
@@ -916,8 +1115,28 @@ def main(default_dataset_profile='mvtec', argv=None, required_dataset_profile=No
         parser.error('this launcher requires --dataset_profile {}'.format(required_dataset_profile))
     if not os.path.isdir(args.data_path):
         parser.error('dataset directory does not exist: {}'.format(args.data_path))
-    if not args.tg_save_cls_embeddings:
-        parser.error('--tg_save_cls_embeddings is required for TailGuard pseudo-class artifacts and replay')
+    expected_memory = _mode_uses_enhancement(args.tg_method_mode)
+    if expected_memory and not args.tg_save_cls_embeddings:
+        parser.error('--tg_save_cls_embeddings is required when enhancement is enabled')
+    if args.tg_method_mode in {'core', 'h_only', 'full_no_e'} and bool(args.tg_save_cls_embeddings):
+        parser.error('--tg_method_mode {} requires --no-tg_save_cls_embeddings'.format(args.tg_method_mode))
+    if bool(args.tg_memory_enable) != expected_memory:
+        parser.error(
+            '--tg_method_mode {} requires {}'.format(
+                args.tg_method_mode,
+                '--tg_memory_enable' if expected_memory else '--no-tg_memory_enable',
+            )
+        )
+    if args.tg_method_mode != 'core' and args.gbps_postprocess_mode != 'remove':
+        parser.error('--tg_method_mode {} requires --gbps_postprocess_mode remove'.format(args.tg_method_mode))
+    if args.tg_method_mode == 'core' and args.gbps_postprocess_mode != 'none':
+        parser.error('--tg_method_mode core requires --gbps_postprocess_mode none')
+    if args.tg_method_mode == 'core' and float(args.gbps_prune_max_ratio) != 0.0:
+        parser.error('--tg_method_mode core requires --gbps_prune_max_ratio 0.0')
+    if args.tg_method_mode in {'full_no_e', 'full'} and float(args.tg_t_attached_noise_p_high_thr) != 1.0:
+        parser.error('the non-destructive P module requires --tg_t_attached_noise_p_high_thr 1.0')
+    if args.tg_stage1_training_scope != 'all_samples':
+        parser.error('dependency-aware TailGuard modes require --tg_stage1_training_scope all_samples')
     if not 0.0 <= float(args.gbps_prune_max_ratio) <= 1.0:
         parser.error('--gbps_prune_max_ratio must be in [0, 1]')
     if not 0.0 <= float(args.gbps_prune_ratio) <= 1.0:

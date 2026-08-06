@@ -8,3 +8,6 @@ tests/
 .*/
 _tmp_precluster_smoke/
 tmp/
+scripts/
+paper/
+analysis*/

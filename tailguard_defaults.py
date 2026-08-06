@@ -1,15 +1,17 @@
 """Single source of truth for the canonical TailGuard configuration."""
 
 
-TAILGUARD_CONFIG_SCHEMA_VERSION = 3
+TAILGUARD_CONFIG_SCHEMA_VERSION = 5
 TAILGUARD_METHOD_NAME = 'tailguard'
 TAILGUARD_CONFIG_PROFILE = 'final'
 TAILGUARD_PRUNE_MODES = ('adaptive', 'fixed')
+TAILGUARD_METHOD_MODES = ('core', 'h_only', 'h_raw_e', 'full_no_e', 'full')
 
 
 # These are the paper/mainline defaults.  Ablation flags remain available in the
 # runner, but an argument-free method configuration must resolve to this profile.
 TAILGUARD_FINAL_DEFAULTS = {
+    'tg_method_mode': 'full',
     'tailsampler_type': 'adaptive_trim_mode',
     'tailsampler_th_type': None,
     'tailsampler_vote_type': None,
@@ -62,7 +64,9 @@ TAILGUARD_FINAL_DEFAULTS = {
     'tg_rgd_split_mode': 'segmented_bic',
     'tg_stable_window': 3,
     'tg_stable_min_observations': 1,
-    'tg_t_attached_noise_p_high_thr': 0.5,
+    # The final method protects TailSampler candidates; lower thresholds are
+    # retained only for attached-tail hard-pruning ablations.
+    'tg_t_attached_noise_p_high_thr': 1.0,
     'tg_memory_enable': True,
     'tg_memory_fusion_lambda': 1.0,
     'tg_memory_topk_ratio': 0.05,

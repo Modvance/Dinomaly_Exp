@@ -29,7 +29,8 @@ def _build_retained_index_map(samples_df: pd.DataFrame, all_samples_df: Optional
     if len(samples_df) == 0:
         return retained_index_map
     for class_id, class_df in samples_df.groupby('class_id', sort=True):
-        retained_index_map[int(class_id)] = [int(value) for value in class_df['base_idx'].astype(int).tolist()]
+        ordered = class_df.sort_values(['base_idx', 'sample_idx'], kind='mergesort')
+        retained_index_map[int(class_id)] = [int(value) for value in ordered['base_idx'].astype(int).tolist()]
     return retained_index_map
 
 
@@ -605,7 +606,8 @@ def build_tailguard_head_delete_plan(selected_scored_df: pd.DataFrame,
                                        metadata_df: pd.DataFrame,
                                        args,
                                        gbps_dir: Optional[str] = None,
-                                       selected_iter: Optional[int] = None):
+                                       selected_iter: Optional[int] = None,
+                                       force_no_delete_reason: Optional[str] = None):
     selected_scores = enrich_scores_with_tailguard_metadata(selected_scored_df, metadata_df)
     h_scores_df = selected_scores.loc[selected_scores['tail_candidate'] == 0].copy().reset_index(drop=True)
     prune_mode = str(getattr(
@@ -618,12 +620,17 @@ def build_tailguard_head_delete_plan(selected_scored_df: pd.DataFrame,
         'gbps_min_keep_per_group',
         TAILGUARD_FINAL_DEFAULTS['gbps_min_keep_per_group'],
     ))
+    force_no_delete = force_no_delete_reason is not None
 
     if prune_mode == 'fixed':
         delete_plan = _build_fixed_head_delete_plan(
             h_scores_df,
             head_group_assignments_df,
-            prune_ratio=float(getattr(args, 'gbps_prune_ratio', TAILGUARD_FINAL_DEFAULTS['gbps_prune_ratio'])),
+            prune_ratio=(
+                0.0
+                if force_no_delete
+                else float(getattr(args, 'gbps_prune_ratio', TAILGUARD_FINAL_DEFAULTS['gbps_prune_ratio']))
+            ),
             min_keep_per_group=min_keep_per_group,
         )
     elif prune_mode == 'adaptive':
@@ -634,11 +641,15 @@ def build_tailguard_head_delete_plan(selected_scored_df: pd.DataFrame,
             h_scores_df,
             head_group_assignments_df,
             group_context_df,
-            max_prune_ratio=float(getattr(
-                args,
-                'gbps_prune_max_ratio',
-                TAILGUARD_FINAL_DEFAULTS['gbps_prune_max_ratio'],
-            )),
+            max_prune_ratio=(
+                0.0
+                if force_no_delete
+                else float(getattr(
+                    args,
+                    'gbps_prune_max_ratio',
+                    TAILGUARD_FINAL_DEFAULTS['gbps_prune_max_ratio'],
+                ))
+            ),
             min_keep_per_group=min_keep_per_group,
         )
     else:
@@ -675,10 +686,14 @@ def build_tailguard_head_delete_plan(selected_scored_df: pd.DataFrame,
             TAILGUARD_FINAL_DEFAULTS['gbps_prune_min_active_ratio'],
         )),
         'tailguard_h_only_removal': True,
+        'h_zero_removal_fallback': bool(force_no_delete),
+        'h_zero_removal_fallback_reason': force_no_delete_reason,
         'num_h_clean': int(len(h_clean_df)),
         'num_h_removed': int(len(h_removed_df)),
         'num_t_untouched_by_h_removal': int((selected_scores['tail_candidate'] == 1).sum()),
     })
+    if force_no_delete and len(h_removed_df) != 0:
+        raise RuntimeError('H zero-removal fallback produced a non-empty removal set')
     return {
         'mode': 'h_only_remove',
         'prune_mode': prune_mode,
@@ -747,7 +762,11 @@ def classify_tail_attached_stable_risk(tail_attached_df: pd.DataFrame,
         return attached_df.copy(), attached_df.iloc[0:0].copy(), attached_df.copy()
 
     window_iters = _list_window_iters(gbps_dir, int(selected_iter), int(getattr(args, 'tg_stable_window', 3)))
-    p_high_thr = float(getattr(args, 'tg_t_attached_noise_p_high_thr', 0.5))
+    p_high_thr = float(getattr(
+        args,
+        'tg_t_attached_noise_p_high_thr',
+        TAILGUARD_FINAL_DEFAULTS['tg_t_attached_noise_p_high_thr'],
+    ))
     min_valid = int(getattr(args, 'tg_stable_min_observations', 1))
     window_data = {}
     for iter_number in window_iters:

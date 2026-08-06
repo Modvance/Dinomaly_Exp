@@ -244,25 +244,27 @@ def prepare_tailguard_metadata(model,
     candidates_df = candidates_df.sort_values('sample_idx').reset_index(drop=True)
     head_group_assignments_df = head_group_assignments_df.sort_values('sample_idx').reset_index(drop=True)
 
-    cls_embeddings, cls_metadata_df = extract_image_embeddings(
-        model,
-        train_eval_dataloader,
-        device,
-        embedding_source='encoder_cls',
-    )
-    cls_metadata_df = cls_metadata_df.copy()
-    cls_order = np.argsort(cls_metadata_df['sample_idx'].to_numpy())
-    cls_embeddings = cls_embeddings[cls_order]
-    cls_metadata_df = cls_metadata_df.iloc[cls_order].reset_index(drop=True)
-    if cls_metadata_df['sample_idx'].astype(int).tolist() != train_metadata_df['sample_idx'].astype(int).tolist():
-        raise ValueError('cls embedding metadata mismatch during TailGuard prepare')
+    cls_payload = None
+    if bool(getattr(args, 'tg_save_cls_embeddings', True)):
+        cls_embeddings, cls_metadata_df = extract_image_embeddings(
+            model,
+            train_eval_dataloader,
+            device,
+            embedding_source='encoder_cls',
+        )
+        cls_metadata_df = cls_metadata_df.copy()
+        cls_order = np.argsort(cls_metadata_df['sample_idx'].to_numpy())
+        cls_embeddings = cls_embeddings[cls_order]
+        cls_metadata_df = cls_metadata_df.iloc[cls_order].reset_index(drop=True)
+        if cls_metadata_df['sample_idx'].astype(int).tolist() != train_metadata_df['sample_idx'].astype(int).tolist():
+            raise ValueError('cls embedding metadata mismatch during TailGuard prepare')
 
-    cls_payload = {
-        'sample_idx': cls_metadata_df['sample_idx'].astype(int).tolist(),
-        'img_path': cls_metadata_df['img_path'].astype(str).tolist(),
-        'embeddings': _normalize_rows(_as_float_tensor(cls_embeddings)).cpu(),
-        'embedding_source': 'encoder_cls',
-    }
+        cls_payload = {
+            'sample_idx': cls_metadata_df['sample_idx'].astype(int).tolist(),
+            'img_path': cls_metadata_df['img_path'].astype(str).tolist(),
+            'embeddings': _normalize_rows(_as_float_tensor(cls_embeddings)).cpu(),
+            'embedding_source': 'encoder_cls',
+        }
     grouping_payload = {
         'sample_idx': metadata_df['sample_idx'].astype(int).tolist(),
         'img_path': metadata_df['img_path'].astype(str).tolist(),
@@ -342,7 +344,7 @@ def prepare_tailguard_metadata(model,
             train_metadata_df,
             head_group_assignments_df,
             metadata=metadata,
-            cls_embeddings_payload=cls_payload if bool(getattr(args, 'tg_save_cls_embeddings', True)) else None,
+            cls_embeddings_payload=cls_payload,
             grouping_embeddings_payload=grouping_payload if bool(getattr(args, 'tg_save_grouping_embeddings', True)) else None,
             analysis_metadata_df=analysis_metadata_df,
         )

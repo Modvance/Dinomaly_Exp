@@ -117,7 +117,8 @@ def _resolve_replay_config(source_dir, parsed_args):
     is_canonical = _is_canonical_source_config(source_config)
     if is_canonical:
         defaults = dict(TAILGUARD_FINAL_DEFAULTS)
-        if int(source_config.get('schema_version', 0)) < TAILGUARD_CONFIG_SCHEMA_VERSION:
+        source_schema = int(source_config.get('schema_version', 0))
+        if source_schema < 3:
             defaults.update({
                 'gbps_prune_mode': 'fixed',
                 'gbps_prune_max_ratio': 0.1,
@@ -125,6 +126,10 @@ def _resolve_replay_config(source_dir, parsed_args):
                 'gbps_prune_stable_min_observations': 1,
                 'gbps_prune_min_active_ratio': 0.5,
             })
+        if source_schema < 4:
+            # Schema-v2/v3 artifacts used attached-tail hard deletion by
+            # default; preserve that behavior when the field is absent.
+            defaults['tg_t_attached_noise_p_high_thr'] = 0.5
     else:
         defaults = LEGACY_REPLAY_DEFAULTS
     resolved = {}
@@ -138,7 +143,7 @@ def _resolve_replay_config(source_dir, parsed_args):
     if is_canonical and int(source_config.get('schema_version', 0)) >= TAILGUARD_CONFIG_SCHEMA_VERSION:
         status = 'canonical_current_schema'
     elif is_canonical:
-        status = 'canonical_legacy_schema_fixed_pruning'
+        status = 'canonical_legacy_schema'
     elif source_config:
         status = 'legacy_source_config'
     else:
@@ -204,10 +209,10 @@ def replay(parsed_args):
             'warning: replaying a legacy TailGuard-B artifact; explicit CLI values and '
             'legacy empirical-conformity/largest-gap fallbacks are used where metadata is absent'
         )
-    elif config_status == 'canonical_legacy_schema_fixed_pruning':
+    elif config_status == 'canonical_legacy_schema':
         print(
-            'info: replaying a schema-v2 TailGuard artifact with historical fixed-ratio H pruning; '
-            'pass --gbps_prune_mode adaptive explicitly to run the new schema-v3 ablation'
+            'info: replaying a legacy-schema TailGuard artifact with its historical defaults; '
+            'pass explicit replay options to override them'
         )
 
     head_delete_plan = build_tailguard_head_delete_plan(
