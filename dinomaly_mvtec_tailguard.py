@@ -892,6 +892,8 @@ def train(item_list):
             'num_tail_memory_banks': int(memory_system['num_tail_memory_banks']),
             'tg_memory_fusion_lambda': float(args.tg_memory_fusion_lambda),
             'tg_memory_topk_ratio': float(args.tg_memory_topk_ratio),
+            'tg_memory_route_margin_threshold': float(args.tg_memory_route_margin_threshold),
+            'tg_memory_min_class_members': int(args.tg_memory_min_class_members),
             'tg_mem_max_patches_per_class': int(args.tg_mem_max_patches_per_class),
         }
         memory_saved = save_tailguard_memory_artifacts(
@@ -969,6 +971,8 @@ def train(item_list):
         'memory_config': {
             'tg_memory_fusion_lambda': float(args.tg_memory_fusion_lambda),
             'tg_memory_topk_ratio': float(args.tg_memory_topk_ratio),
+            'tg_memory_route_margin_threshold': float(args.tg_memory_route_margin_threshold),
+            'tg_memory_min_class_members': int(args.tg_memory_min_class_members),
             'tg_mem_max_patches_per_class': int(args.tg_mem_max_patches_per_class),
         },
         'memory_eval_summary': memory_eval_summary,
@@ -1087,6 +1091,8 @@ def build_parser(default_dataset_profile='mvtec'):
     parser.add_argument('--no-tg_memory_enable', dest='tg_memory_enable', action='store_false')
     parser.add_argument('--tg_memory_fusion_lambda', type=float, default=TAILGUARD_FINAL_DEFAULTS['tg_memory_fusion_lambda'])
     parser.add_argument('--tg_memory_topk_ratio', type=float, default=TAILGUARD_FINAL_DEFAULTS['tg_memory_topk_ratio'])
+    parser.add_argument('--tg_memory_route_margin_threshold', type=float, default=TAILGUARD_FINAL_DEFAULTS['tg_memory_route_margin_threshold'])
+    parser.add_argument('--tg_memory_min_class_members', type=int, default=TAILGUARD_FINAL_DEFAULTS['tg_memory_min_class_members'])
     parser.add_argument('--tg_mem_chunk_size', type=int, default=TAILGUARD_FINAL_DEFAULTS['tg_mem_chunk_size'])
     parser.add_argument('--tg_mem_max_patches_per_class', type=int, default=TAILGUARD_FINAL_DEFAULTS['tg_mem_max_patches_per_class'])
     return parser

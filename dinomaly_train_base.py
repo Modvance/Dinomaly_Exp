@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.utils.data import ConcatDataset, Subset, WeightedRandomSampler
 from torchvision.datasets import ImageFolder
 
-from dataset import MVTecDataset, TrainDiagDataset, TrainPatchWeightDataset, TrainPhase5WeightDataset, TrainPhase6Dataset, get_data_transforms
+from dataset import MVTecDataset, TrainCalibrationDataset, TrainDiagDataset, TrainPatchWeightDataset, TrainPhase5WeightDataset, TrainPhase6Dataset, get_data_transforms
 from dinov1.utils import trunc_normal_
 from models import vit_encoder
 from models.uad import ViTill
@@ -140,6 +140,39 @@ def build_train_eval_dataloader(train_datasets, data_root, batch_size, num_worke
         drop_last=False,
     )
     return train_eval_dataloader
+
+
+def build_train_calibration_dataloader(train_datasets, data_root, batch_size, num_workers, item_list,
+                                       corruption_grid=8, corruption_min_ratio=0.2,
+                                       corruption_max_ratio=0.5, corruption_strength=1.0,
+                                       corruption_seed=2027, sample_idx_maps=None):
+    calibration_data_list = []
+    sample_offset = 0
+    for class_id, (item, train_data) in enumerate(zip(item_list, train_datasets)):
+        calibration_data = TrainCalibrationDataset(
+            train_data,
+            data_root=data_root,
+            class_name=item,
+            class_id=class_id,
+            sample_offset=sample_offset,
+            corruption_grid=corruption_grid,
+            corruption_min_ratio=corruption_min_ratio,
+            corruption_max_ratio=corruption_max_ratio,
+            corruption_strength=corruption_strength,
+            corruption_seed=corruption_seed,
+            sample_idx_by_base_idx=(
+                None if sample_idx_maps is None else sample_idx_maps.get(class_id, {})
+            ),
+        )
+        calibration_data_list.append(calibration_data)
+        sample_offset += len(calibration_data)
+    return torch.utils.data.DataLoader(
+        ConcatDataset(calibration_data_list),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        drop_last=False,
+    )
 
 
 def build_patch_train_dataloader(train_datasets, data_root, item_list, patch_weight_bank,
@@ -298,12 +331,13 @@ def build_datasets(data_path, item_list, image_size=DEFAULT_IMAGE_SIZE, crop_siz
 
 
 def build_model(device, encoder_name=DEFAULT_ENCODER_NAME, target_layers=None,
-                fuse_layer_encoder=None, fuse_layer_decoder=None):
+                fuse_layer_encoder=None, fuse_layer_decoder=None,
+                load_encoder_weights=True):
     target_layers = DEFAULT_TARGET_LAYERS if target_layers is None else list(target_layers)
     fuse_layer_encoder = DEFAULT_FUSE_LAYER_ENCODER if fuse_layer_encoder is None else fuse_layer_encoder
     fuse_layer_decoder = DEFAULT_FUSE_LAYER_DECODER if fuse_layer_decoder is None else fuse_layer_decoder
 
-    encoder = vit_encoder.load(encoder_name)
+    encoder = vit_encoder.load(encoder_name, pretrained=load_encoder_weights)
 
     if 'small' in encoder_name:
         embed_dim, num_heads = 384, 6
@@ -491,6 +525,7 @@ def load_model_from_train_checkpoint(checkpoint_path, device):
         target_layers=metadata['target_layers'],
         fuse_layer_encoder=metadata['fuse_layer_encoder'],
         fuse_layer_decoder=metadata['fuse_layer_decoder'],
+        load_encoder_weights=False,
     )
     model.load_state_dict(metadata['model_state_dict'])
     model.eval()

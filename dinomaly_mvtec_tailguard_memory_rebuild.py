@@ -205,6 +205,22 @@ def rebuild_memory(parsed_args):
             ),
             'tg_memory_topk_ratio',
         ),
+        tg_memory_route_margin_threshold=float(_resolve(
+            parsed_args.tg_memory_route_margin_threshold,
+            checkpoint_metadata,
+            'tg_memory_route_margin_threshold',
+            TAILGUARD_FINAL_DEFAULTS['tg_memory_route_margin_threshold'],
+        )),
+        tg_memory_min_class_members=_integer_value(
+            _resolve(
+                parsed_args.tg_memory_min_class_members,
+                checkpoint_metadata,
+                'tg_memory_min_class_members',
+                TAILGUARD_FINAL_DEFAULTS['tg_memory_min_class_members'],
+            ),
+            'tg_memory_min_class_members',
+            1,
+        ),
         tg_mem_chunk_size=_integer_value(
             _resolve(
                 parsed_args.tg_mem_chunk_size,
@@ -228,6 +244,8 @@ def rebuild_memory(parsed_args):
     )
     if not math.isfinite(memory_args.tg_memory_fusion_lambda) or memory_args.tg_memory_fusion_lambda < 0.0:
         raise ValueError('tg_memory_fusion_lambda must be finite and non-negative')
+    if math.isnan(memory_args.tg_memory_route_margin_threshold) or memory_args.tg_memory_route_margin_threshold == float('inf'):
+        raise ValueError('tg_memory_route_margin_threshold must not be NaN or +inf')
     del checkpoint_metadata
     train_data_list, test_data_list = build_datasets(
         data_path,
@@ -286,6 +304,8 @@ def rebuild_memory(parsed_args):
             'num_tail_memory_banks': int(memory_system['num_tail_memory_banks']),
             'tg_memory_fusion_lambda': memory_args.tg_memory_fusion_lambda,
             'tg_memory_topk_ratio': memory_args.tg_memory_topk_ratio,
+            'tg_memory_route_margin_threshold': memory_args.tg_memory_route_margin_threshold,
+            'tg_memory_min_class_members': memory_args.tg_memory_min_class_members,
             'tg_mem_chunk_size': memory_args.tg_mem_chunk_size,
             'tg_mem_max_patches_per_class': memory_args.tg_mem_max_patches_per_class,
         },
@@ -331,6 +351,8 @@ def build_parser():
     parser.add_argument('--diag_resize_mask', type=int, default=None)
     parser.add_argument('--tg_memory_fusion_lambda', type=float, default=None)
     parser.add_argument('--tg_memory_topk_ratio', type=float, default=None)
+    parser.add_argument('--tg_memory_route_margin_threshold', type=float, default=None)
+    parser.add_argument('--tg_memory_min_class_members', type=int, default=None)
     parser.add_argument('--tg_mem_chunk_size', type=int, default=None)
     parser.add_argument('--tg_mem_max_patches_per_class', type=int, default=None)
     _add_hidden_legacy_alias(parser, '--tgb_memory_fusion_lambda', 'tg_memory_fusion_lambda', type=float)

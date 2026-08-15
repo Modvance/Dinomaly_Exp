@@ -2515,3 +2515,975 @@ Full H + P + E        -> <full>/tailguard/memory/memory_eval_summary.json
 ```
 
 P 的性能贡献比较 `Full fused - H + Raw-E fused`；E 的性能贡献比较同一个 Full 文件中的 `fused - recon`。不要把 H+P reconstruction 与 H-only reconstruction 的差异解释为 P 的贡献，因为 P 只校正尾候选角色，不改变 reconstruction 训练集。
+
+## 论文方法与实验口径最终说明（2026-08-09）
+
+前文命令和旧命名仅用于历史复现。当前论文以 `paper/icassp2027_overleaf/PAPER_DESIGN_ZH.md` 为唯一设计记录，核心原则是 support-asymmetric purification：TailSampler 只提供共享的初始支持划分；H 只在高支持 latent groups 内净化；所有低支持候选均不具备删除资格。
+
+当前可冻结的正文消融只有以下两行：
+
+```text
+URC                  -> core / final_eval_summary
+TailGuard (+H)       -> h_only / final_eval_summary
+```
+
+`H+P without E` 与 H-only 的训练集、loss 和 reconstruction score 相同，不作为独立性能行。旧 v5 的 `h_raw_e/full` 仅是 E 校准前的开发证据，不能与 support-consistent v2 参数或最终表格混写。
+
+E 的最终判定使用六场景 inference-only 成对重测，不重新训练模型。所有场景共享冻结参数：
+
+```text
+topk_ratio = 0.10
+fusion_lambda = 0.25
+route_margin_threshold = 0.04255223274230957
+min_class_members = 2
+```
+
+每个场景的 Full/Raw-E 共用同一个 Full checkpoint、retained set、训练特征前向和测试前向。六场景配对重测现已全部完成，均满足 `no_training=true` 与 single-pass contract，且 reconstruction map/patch feature 的成对最大误差为 0。Full reconstruction 的六场景宏平均为 `93.4901/96.7537/89.8888`，Full fused 为 `92.9345/96.6091/89.6751`（I-AUROC/P-AUROC/P-AUPRO，%）。MVTec Step-K4 中 E 相对 reconstruction 下降约 3.39 I-AUROC 和 2.04 P-AUPRO points，触发预注册的单场景 1.0-point 安全阈值；宏平均 I-AUROC/P-AUPRO 也分别下降 0.56/0.21 points。因此论文最终方法已固定为 TailSampler + 低支持保护约束 + H；P/E 只作失败/结构审计，不得用于事后修改规则。
+
+最终 E 审计来源：
+
+```text
+analysis_outputs/e_calibration_v2/E_CALIBRATION_AUDIT_ZH.md
+analysis_outputs/e_calibration_v2/paired_aggregate/paired_scenario_metrics.csv
+analysis_outputs/e_calibration_v2/paired_aggregate/paired_aggregate_summary.json
+```
+
+当前 schema v6 的无额外参数入口已对齐论文最终方法：`tg_method_mode=h_only`、关闭 CLS cache 和 memory。历史 `core/h_raw_e/full` 模式仍可用显式参数复现实验。
+
+## 更正：恢复原始 v5 Full 主线配置（2026-08-09）
+
+上一节将一次 E 参数校准失败误解为论文方法固定为 H-only，该结论已作废。当前主线恢复为已确认的完整 `full` 模式，并继续使用原始 v5 推理参数：
+
+```text
+tg_method_mode = full
+tg_memory_enable = true
+tg_memory_fusion_lambda = 1.0
+tg_memory_topk_ratio = 0.05
+tg_memory_route_margin_threshold = -inf
+tg_memory_min_class_members = 1
+```
+
+`e_calibration_v1` 和 `e_calibration_v2` 只作失败实验审计，不作为当前方法参数，也不进入消融表。原始 v5 的 Full 与 H+Raw-E 图像级 AUROC 差异调查见：
+
+```text
+analysis_outputs/v5_full_vs_raw_e_audit_zh.md
+```
+
+## 最终方法的五套数据构造补跑：seed02–seed05（新增 24 次）
+
+seed01 的六个 `full` 结果已经位于 `../results/tailguard/dependency_ablation_v5`，因此本节只运行 seed02–seed05。四批均复用 GPU 1–6：每批六条可并行，但下一批应在上一批全部结束后再启动；若服务器空闲 GPU 不同，只修改每条命令末尾的 `--gpus`。
+
+这 24 条命令显式固定当前论文采用的原始 Full 参数：`lambda=1.0`、`top-k=0.05`、路由阈值为负无穷、伪类最小成员数为 1。输出继续写入 `dependency_ablation_v5`，与 seed01 Full 同根且不会覆盖已有运行。
+
+启动前必须确认服务器上以下路径已经生成或挂载：
+
+```text
+../LTN_datasets/mvtecad-{pareto,step_k4,step_k1}-seed{02,03,04,05}
+../LTN_visa/visa-{pareto,step_k4,step_k1}-seed{02,03,04,05}
+```
+
+仓库内对应的 24 份 `inject_defects.txt` 已经齐全。本地 MVTec 路径已经核验；当前本地没有 `../LTN_visa`，因此 VisA 必须以服务器实际挂载结果为准。
+
+### 第 1 批：seed02（6 次）
+
+```bash
+# 1. Full / MVTec AD / Pareto / seed02 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed02 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed02/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_pareto_seed02_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 1
+
+# 2. Full / MVTec AD / Step-K4 / seed02 / GPU 2
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed02 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed02/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k4_seed02_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 2
+
+# 3. Full / MVTec AD / Step-K1 / seed02 / GPU 3
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed02 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed02/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k1_seed02_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 3
+
+# 4. Full / VisA / Pareto / seed02 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-pareto-seed02 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed02/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_pareto_seed02_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 4
+
+# 5. Full / VisA / Step-K4 / seed02 / GPU 5
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed02 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed02/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k4_seed02_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 5
+
+# 6. Full / VisA / Step-K1 / seed02 / GPU 6
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed02 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed02/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k1_seed02_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 6
+```
+
+### 第 2 批：seed03（6 次）
+
+```bash
+# 7. Full / MVTec AD / Pareto / seed03 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed03 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed03/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_pareto_seed03_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 1
+
+# 8. Full / MVTec AD / Step-K4 / seed03 / GPU 2
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed03 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed03/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k4_seed03_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 2
+
+# 9. Full / MVTec AD / Step-K1 / seed03 / GPU 3
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed03 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed03/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k1_seed03_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 3
+
+# 10. Full / VisA / Pareto / seed03 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-pareto-seed03 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed03/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_pareto_seed03_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 4
+
+# 11. Full / VisA / Step-K4 / seed03 / GPU 5
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed03 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed03/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k4_seed03_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 5
+
+# 12. Full / VisA / Step-K1 / seed03 / GPU 6
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed03 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed03/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k1_seed03_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 6
+```
+
+### 第 3 批：seed04（6 次）
+
+```bash
+# 13. Full / MVTec AD / Pareto / seed04 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed04 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed04/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_pareto_seed04_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 1
+
+# 14. Full / MVTec AD / Step-K4 / seed04 / GPU 2
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed04 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed04/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k4_seed04_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 2
+
+# 15. Full / MVTec AD / Step-K1 / seed04 / GPU 3
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed04 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed04/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k1_seed04_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 3
+
+# 16. Full / VisA / Pareto / seed04 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-pareto-seed04 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed04/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_pareto_seed04_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 4
+
+# 17. Full / VisA / Step-K4 / seed04 / GPU 5
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed04 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed04/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k4_seed04_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 5
+
+# 18. Full / VisA / Step-K1 / seed04 / GPU 6
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed04 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed04/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k1_seed04_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 6
+```
+
+### 第 4 批：seed05（6 次）
+
+```bash
+# 19. Full / MVTec AD / Pareto / seed05 / GPU 1
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-pareto-seed05 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/pareto/seed05/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_pareto_seed05_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 1
+
+# 20. Full / MVTec AD / Step-K4 / seed05 / GPU 2
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k4-seed05 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k4/seed05/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k4_seed05_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 2
+
+# 21. Full / MVTec AD / Step-K1 / seed05 / GPU 3
+python dinomaly_mvtec_tailguard.py \
+  --data_path ../LTN_datasets/mvtecad-step_k1-seed05 \
+  --diag_manifest_path ./manifest/mvtecad-nlt/step_k1/seed05/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name mvtec_step_k1_seed05_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 3
+
+# 22. Full / VisA / Pareto / seed05 / GPU 4
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-pareto-seed05 \
+  --diag_manifest_path ./manifest/visa-nlt/pareto/seed05/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_pareto_seed05_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 4
+
+# 23. Full / VisA / Step-K4 / seed05 / GPU 5
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed05 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed05/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k4_seed05_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 5
+
+# 24. Full / VisA / Step-K1 / seed05 / GPU 6
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed05 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed05/inject_defects.txt \
+  --save_dir ../results/tailguard/dependency_ablation_v5 \
+  --save_name visa_step_k1_seed05_full \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 6
+```
+
+### 训练完成后的验收
+
+每个运行至少检查以下训练层产物：
+
+```text
+<run>/final_model.pt
+<run>/tailguard/tailguard_summary.json
+<run>/tailguard/prepare/grouping_embeddings.pt
+<run>/tailguard/prepare/cls_embeddings.pt
+<run>/tailguard/prepare/tailsampler_candidates.csv
+<run>/tailguard/pseudoclasses/pseudo_class_registry.json
+<run>/tailguard/pseudoclasses/pseudo_class_members.csv
+<run>/tailguard/memory/memory_eval_scores.csv
+```
+
+并核验：
+
+- `final_model.pt` 的迭代数为 10000；
+- `tailguard_summary.json` 的 `schema_version == 6`、`method_mode == "full"`；
+- `memory_status == "completed"`；
+- P 未删除尾候选，即 `stage2_summary.num_tail_candidates_removed == 0`。
+
+这里的 `memory_status == "completed"` 只表示当前 P 校正后的精细 memory 分支已经完成。这 24 次训练同时保存了后续构建原始候选分支所需的 CLS/T0/H/P 产物；正式双粒度 Raw-only、Refined-only 与 Dual 分数将在统一 evaluator 完成后基于同一个 Full checkpoint 无训练重测，不需要额外运行 `h_raw_e`。

@@ -1,7 +1,7 @@
 """Single source of truth for the canonical TailGuard configuration."""
 
 
-TAILGUARD_CONFIG_SCHEMA_VERSION = 5
+TAILGUARD_CONFIG_SCHEMA_VERSION = 6
 TAILGUARD_METHOD_NAME = 'tailguard'
 TAILGUARD_CONFIG_PROFILE = 'final'
 TAILGUARD_PRUNE_MODES = ('adaptive', 'fixed')
@@ -70,6 +70,11 @@ TAILGUARD_FINAL_DEFAULTS = {
     'tg_memory_enable': True,
     'tg_memory_fusion_lambda': 1.0,
     'tg_memory_topk_ratio': 0.05,
+    # Legacy enhancement modes preserve the v5 hard-route behavior unless an
+    # analysis command supplies a calibrated finite threshold.
+    'tg_memory_route_margin_threshold': float('-inf'),
+    # Legacy enhancement modes preserve v5 singleton handling by default.
+    'tg_memory_min_class_members': 1,
     'tg_mem_chunk_size': 4096,
     'tg_mem_max_patches_per_class': 20000,
 }

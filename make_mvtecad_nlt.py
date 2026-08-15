@@ -69,16 +69,30 @@ def ensure_tree_writable(path: Path):
             ensure_writable(root_path / name)
 
 
-def copy_or_link(src: Path, dst: Path, symlink: bool):
+def copy_or_link(src: Path, dst: Path, symlink: bool, relative_symlink: bool = False):
     dst.parent.mkdir(parents=True, exist_ok=True)
     ensure_writable(dst.parent)
     if dst.exists():
         return
     if symlink:
-        os.symlink(src.resolve(), dst)
+        link_target = os.path.relpath(src.resolve(), dst.parent.resolve()) if relative_symlink else src.resolve()
+        os.symlink(link_target, dst)
     else:
         shutil.copy2(src, dst)
         ensure_writable(dst)
+
+
+def replicate_split_as_links(src_root: Path, dst_root: Path, split: str):
+    """Mirror one split with links, keeping calibration datasets lightweight."""
+    for obj_path in sorted(path for path in src_root.iterdir() if path.is_dir()):
+        src_split = obj_path / split
+        if not src_split.is_dir():
+            continue
+        for src_file in src_split.rglob('*'):
+            if not src_file.is_file():
+                continue
+            dst_file = dst_root / obj_path.name / split / src_file.relative_to(src_split)
+            copy_or_link(src_file, dst_file, symlink=True, relative_symlink=True)
 
 
 def replicate_split(src_root: Path, dst_root: Path, split: str):
@@ -120,7 +134,8 @@ def prune_good_samples(dest: Path, prune_manifest: Path):
             target = dest / rel
             if target.is_file():
                 ensure_writable(target.parent)
-                ensure_writable(target)
+                if not target.is_symlink():
+                    ensure_writable(target)
                 target.unlink()
                 removed += 1
             else:
@@ -176,25 +191,40 @@ def main():
     p.add_argument("--noisy-manifest", required=True, type=Path, help="Manifest of defect images to inject")
     p.add_argument("--prune-manifest", required=True, type=Path, help="Manifest of original good images to delete")
     p.add_argument("--symlink", action="store_true", help="Use symbolic links instead of copying when injecting defects")
+    p.add_argument(
+        "--symlink-all",
+        action="store_true",
+        help="Build all dataset splits with symbolic links (useful for local calibration)",
+    )
     args = p.parse_args()
 
     # 1. Ensure pristine structure in dest
-    for obj_path in sorted(
-        [d for d in args.source_dir.iterdir() if (d / "train").is_dir()]):
-        obj_name = obj_path.name
-        src_good = obj_path / "train" / "good"
-        dst_good = args.dest_dir / obj_name / "train" / "good"
-        ensure_tree_writable(dst_good)
-        shutil.copytree(src_good, dst_good, dirs_exist_ok=True)
-        ensure_tree_writable(dst_good)
-    replicate_split(args.source_dir, args.dest_dir, "test")
-    replicate_split(args.source_dir, args.dest_dir, "ground_truth")
+    if args.symlink_all:
+        replicate_split_as_links(args.source_dir, args.dest_dir, "train")
+        replicate_split_as_links(args.source_dir, args.dest_dir, "test")
+        replicate_split_as_links(args.source_dir, args.dest_dir, "ground_truth")
+    else:
+        for obj_path in sorted(
+            [d for d in args.source_dir.iterdir() if (d / "train").is_dir()]):
+            obj_name = obj_path.name
+            src_good = obj_path / "train" / "good"
+            dst_good = args.dest_dir / obj_name / "train" / "good"
+            ensure_tree_writable(dst_good)
+            shutil.copytree(src_good, dst_good, dirs_exist_ok=True)
+            ensure_tree_writable(dst_good)
+        replicate_split(args.source_dir, args.dest_dir, "test")
+        replicate_split(args.source_dir, args.dest_dir, "ground_truth")
 
     # 2. Prune specified good samples
     prune_good_samples(args.dest_dir, args.prune_manifest)
 
     # 3. Inject defect samples
-    inject_defect_samples(args.source_dir, args.dest_dir, args.noisy_manifest, args.symlink)
+    inject_defect_samples(
+        args.source_dir,
+        args.dest_dir,
+        args.noisy_manifest,
+        args.symlink or args.symlink_all,
+    )
 
     print(f"✔ Long‑tail noisy dataset ready at {args.dest_dir}")
 

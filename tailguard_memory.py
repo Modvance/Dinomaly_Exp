@@ -2,6 +2,7 @@
 
 from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
@@ -12,7 +13,14 @@ from one_shot_memory import (
     pool_patch_scores,
     resize_memory_map,
 )
-from utils import compute_image_level_scores, get_gaussian_kernel, infer_anomaly_map_batch
+from utils import compute_image_level_scores, compute_pro, f1_score_max, get_gaussian_kernel, infer_anomaly_map_batch
+
+
+def _replace_memory_entry(memory_system: Dict, pseudo_class_id: int, entry: Dict) -> Dict:
+    replacement = dict(memory_system)
+    replacement['class_entries'] = dict(memory_system['class_entries'])
+    replacement['class_entries'][int(pseudo_class_id)] = entry
+    return replacement
 
 
 def _normalize_rows(tensor: torch.Tensor) -> torch.Tensor:
@@ -202,6 +210,7 @@ def build_tailguard_pseudoclass_memory_system(model,
             'num_members': int(len(records)),
             'member_sample_idx': class_members['sample_idx'].astype(int).tolist(),
             'prototype_cls': prototype,
+            'member_cls': cls_matrix.cpu().contiguous(),
             'has_memory_bank': pseudo_class_type == 'tail',
             'num_patches': 0,
             'feature_dim': 0,
@@ -267,6 +276,338 @@ def _routing_cache(memory_system: Dict, device):
     }
 
 
+def route_evidence_mask(mem_applied: torch.Tensor,
+                        similarity_margin: torch.Tensor,
+                        threshold: float) -> torch.Tensor:
+    """Gate tail memory with a globally calibrated cosine-margin threshold."""
+    threshold = float(threshold)
+    if torch.isnan(torch.tensor(threshold)) or threshold == float('inf'):
+        raise ValueError('tg_memory_route_margin_threshold must not be NaN or +inf')
+    applied = mem_applied.to(dtype=torch.bool)
+    if threshold == float('-inf'):
+        return applied
+    margins = similarity_margin.to(device=mem_applied.device)
+    return applied & torch.isfinite(margins) & (margins >= threshold)
+
+
+def leave_one_out_memory_system(memory_system: Dict, pseudo_class_id: int, sample_idx: int) -> Dict:
+    """Remove one query's patches and CLS contribution from its own tail class."""
+    pseudo_class_id = int(pseudo_class_id)
+    sample_idx = int(sample_idx)
+    entry = memory_system['class_entries'][pseudo_class_id]
+    if entry['pseudo_class_type'] != 'tail':
+        return memory_system
+    member_ids = [int(value) for value in entry['member_sample_idx']]
+    if sample_idx not in member_ids:
+        return memory_system
+    quotas = entry.get('member_patch_quotas', [])
+    if len(member_ids) <= 1:
+        return _replace_memory_entry(memory_system, pseudo_class_id, {
+            **entry,
+            'member_sample_idx': [],
+            'member_cls': entry.get('member_cls', torch.empty((0, 0)))[:0],
+            'member_patch_quotas': [],
+            'num_members': 0,
+            'features': entry['features'][:0],
+            'num_patches': 0,
+            'has_memory_bank': False,
+        })
+    if not quotas:
+        raise ValueError('tail memory entry is missing member patch quotas')
+    start = 0
+    slices = []
+    retained_ids = []
+    retained_quotas = []
+    for quota in quotas:
+        count = int(quota['num_selected_patches'])
+        end = start + count
+        member_id = int(quota['sample_idx'])
+        if member_id != sample_idx and count > 0:
+            slices.append(entry['features'][start:end])
+            retained_ids.append(member_id)
+            retained_quotas.append(dict(quota))
+        start = end
+    if start != int(entry['features'].shape[0]):
+        raise ValueError('tail memory quotas do not align with stored patch features')
+    if not slices:
+        raise ValueError('leave-one-out unexpectedly removed the complete multi-member memory bank')
+    replacement_entry = dict(entry)
+    replacement_entry.update({
+        'member_sample_idx': retained_ids,
+        'member_cls': entry['member_cls'][[
+            position for position, value in enumerate(member_ids) if value != sample_idx
+        ]].contiguous() if 'member_cls' in entry else None,
+        'member_patch_quotas': retained_quotas,
+        'num_members': len(retained_ids),
+        'features': torch.cat(slices, dim=0).contiguous(),
+        'num_patches': int(sum(int(row['num_selected_patches']) for row in retained_quotas)),
+    })
+    return _replace_memory_entry(memory_system, pseudo_class_id, replacement_entry)
+
+
+def _binary_auroc(labels, scores):
+    labels = np.asarray(labels, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float64)
+    positive = labels == 1
+    num_positive = int(positive.sum())
+    num_negative = int(len(labels) - num_positive)
+    if num_positive == 0 or num_negative == 0:
+        raise ValueError('AUROC requires both positive and negative calibration samples')
+    ranks = pd.Series(scores).rank(method='average').to_numpy(dtype=float)
+    rank_sum = float(ranks[positive].sum())
+    return (rank_sum - num_positive * (num_positive + 1) / 2.0) / (num_positive * num_negative)
+
+
+def _calibration_thresholds(records, quantiles):
+    margins_by_source = {}
+    for row in records:
+        source = str(row.get('calibration_source', 'all'))
+        margins_by_source.setdefault(source, [])
+        for prefix in ('clean', 'corrupted'):
+            margin = float(row['{}_similarity_margin'.format(prefix)])
+            if int(row['{}_route_eligible'.format(prefix)]) and np.isfinite(margin):
+                margins_by_source[source].append(margin)
+    margins_by_source = {
+        source: np.asarray(values)
+        for source, values in margins_by_source.items()
+        if values
+    }
+    if not margins_by_source:
+        return [float('-inf')]
+    values = [float('-inf')]
+    for margins in margins_by_source.values():
+        values.extend(float(np.quantile(margins, quantile)) for quantile in quantiles)
+    return sorted(set(values))
+
+
+def select_tailguard_memory_calibration(records,
+                                        lambda_candidates=(0.25, 0.5, 0.75, 1.0),
+                                        route_margin_quantiles=(0.0, 0.1, 0.25, 0.5),
+                                        max_clean_fusion_penalty=None):
+    """Choose one global lambda/route gate from label-free train-side pairs."""
+    if not records:
+        raise ValueError('memory calibration requires at least one record')
+    lambdas = sorted(set(float(value) for value in lambda_candidates))
+    if not lambdas or any(not np.isfinite(value) or value < 0.0 for value in lambdas):
+        raise ValueError('lambda candidates must be finite and non-negative')
+    thresholds = _calibration_thresholds(records, route_margin_quantiles)
+    topk_values = {float(row.get('topk_ratio', 0.05)) for row in records}
+    if len(topk_values) != 1:
+        raise ValueError('one selector call must contain exactly one top-k ratio')
+    topk_ratio = next(iter(topk_values))
+    clean_recon = np.asarray([float(row['clean_recon_score']) for row in records])
+    corrupted_recon = np.asarray([float(row['corrupted_recon_score']) for row in records])
+    clean_memory = np.asarray([float(row['clean_memory_score']) for row in records])
+    corrupted_memory = np.asarray([float(row['corrupted_memory_score']) for row in records])
+    clean_margins = np.asarray([float(row['clean_similarity_margin']) for row in records])
+    corrupted_margins = np.asarray([float(row['corrupted_similarity_margin']) for row in records])
+    clean_eligible = np.asarray([bool(int(row['clean_route_eligible'])) for row in records])
+    corrupted_eligible = np.asarray([bool(int(row['corrupted_route_eligible'])) for row in records])
+    recon_localization = np.asarray([float(row['corrupted_recon_localization']) for row in records])
+    memory_localization = np.asarray([float(row['corrupted_memory_localization']) for row in records])
+    sources = np.asarray([str(row.get('calibration_source', 'all')) for row in records])
+    source_names = sorted(set(sources.tolist()))
+    source_masks = {source: sources == source for source in source_names}
+    source_recon_auc = {
+        source: _binary_auroc(
+            np.r_[np.zeros(mask.sum(), dtype=int), np.ones(mask.sum(), dtype=int)],
+            np.r_[clean_recon[mask], corrupted_recon[mask]],
+        )
+        for source, mask in source_masks.items()
+    }
+    recon_auc = float(np.mean(list(source_recon_auc.values())))
+    rows = []
+    for threshold in thresholds:
+        if threshold == float('-inf'):
+            clean_gate = clean_eligible
+            corrupted_gate = corrupted_eligible
+        else:
+            clean_gate = clean_eligible & np.isfinite(clean_margins) & (clean_margins >= threshold)
+            corrupted_gate = (
+                corrupted_eligible
+                & np.isfinite(corrupted_margins)
+                & (corrupted_margins >= threshold)
+            )
+        for lambda_value in lambdas:
+            clean_fused = clean_recon + clean_gate * lambda_value * clean_memory
+            corrupted_fused = corrupted_recon + corrupted_gate * lambda_value * corrupted_memory
+            fused_localization = (
+                recon_localization + corrupted_gate * lambda_value * memory_localization
+            )
+            source_fused_auc = {}
+            source_localization = {}
+            source_recon_localization = {}
+            source_clean_penalty = {}
+            source_clean_coverage = {}
+            source_corrupted_coverage = {}
+            for source, mask in source_masks.items():
+                labels = np.r_[
+                    np.zeros(mask.sum(), dtype=int),
+                    np.ones(mask.sum(), dtype=int),
+                ]
+                source_fused_auc[source] = _binary_auroc(
+                    labels,
+                    np.r_[clean_fused[mask], corrupted_fused[mask]],
+                )
+                source_localization[source] = float(np.mean(fused_localization[mask]))
+                source_recon_localization[source] = float(np.mean(recon_localization[mask]))
+                source_clean_penalty[source] = float(np.mean(clean_fused[mask] - clean_recon[mask]))
+                source_clean_coverage[source] = float(clean_gate[mask].mean())
+                source_corrupted_coverage[source] = float(corrupted_gate[mask].mean())
+            fused_auc = float(np.mean(list(source_fused_auc.values())))
+            clean_penalty = float(np.mean(list(source_clean_penalty.values())))
+            localization = float(np.mean(list(source_localization.values())))
+            recon_localization_mean = float(np.mean(list(source_recon_localization.values())))
+            penalty_ok = (
+                max_clean_fusion_penalty is None
+                or clean_penalty <= float(max_clean_fusion_penalty) + 1e-12
+            )
+            rows.append({
+                'topk_ratio': topk_ratio,
+                'lambda': lambda_value,
+                'route_margin_threshold': threshold,
+                'synthetic_auroc': fused_auc,
+                'recon_synthetic_auroc': recon_auc,
+                'synthetic_auroc_gain': fused_auc - recon_auc,
+                'synthetic_localization': localization,
+                'recon_synthetic_localization': recon_localization_mean,
+                'synthetic_localization_gain': localization - recon_localization_mean,
+                'mean_clean_fusion_penalty': clean_penalty,
+                'clean_memory_applied_ratio': float(np.mean(list(source_clean_coverage.values()))),
+                'corrupted_memory_applied_ratio': float(np.mean(list(source_corrupted_coverage.values()))),
+                'min_source_synthetic_auroc_gain': float(min(
+                    source_fused_auc[source] - source_recon_auc[source]
+                    for source in source_names
+                )),
+                'num_calibration_sources': len(source_names),
+                'eligible': penalty_ok and localization >= recon_localization_mean - 1e-12,
+            })
+    eligible_rows = [row for row in rows if row['eligible']]
+    if not eligible_rows:
+        eligible_rows = rows
+    selected = max(
+        eligible_rows,
+        key=lambda row: (
+            row['synthetic_auroc'],
+            row['synthetic_localization'],
+            -row['mean_clean_fusion_penalty'],
+            row['corrupted_memory_applied_ratio'],
+            -row['lambda'],
+        ),
+    )
+    return {'selected': dict(selected), 'candidates': rows}
+
+
+@torch.no_grad()
+def collect_tailguard_memory_calibration_records(model,
+                                                 calibration_dataloader,
+                                                 memory_system: Dict,
+                                                 args,
+                                                 device,
+                                                 topk_ratios=None,
+                                                 leave_one_out=True):
+    """Collect train-only normal/synthetic pairs without using evaluation labels."""
+    was_training = model.training
+    model.eval()
+    records = []
+    gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
+    max_ratio = float(getattr(args, 'diag_max_ratio', getattr(args, 'max_ratio', 0.01)))
+    resize_mask = int(getattr(args, 'diag_resize_mask', getattr(args, 'resize_mask', 256)))
+    routing_cache = _routing_cache(memory_system, device)
+    if topk_ratios is None:
+        topk_ratios = [float(getattr(args, 'tg_memory_topk_ratio', 0.05))]
+    topk_ratios = sorted(set(float(value) for value in topk_ratios))
+    if not topk_ratios or any(not 0.0 < value <= 1.0 for value in topk_ratios):
+        raise ValueError('calibration top-k ratios must be in (0, 1]')
+    try:
+        for clean_images, corrupted_images, corruption_mask, meta in calibration_dataloader:
+            clean_images = clean_images.to(device)
+            corrupted_images = corrupted_images.to(device)
+            clean_map, _ = infer_anomaly_map_batch(
+                model, clean_images, gaussian_kernel, resize_mask=resize_mask
+            )
+            corrupted_map, _ = infer_anomaly_map_batch(
+                model, corrupted_images, gaussian_kernel, resize_mask=resize_mask
+            )
+            clean_recon = compute_image_level_scores(clean_map, max_ratio=max_ratio)
+            corrupted_recon = compute_image_level_scores(corrupted_map, max_ratio=max_ratio)
+            corruption_mask = F.interpolate(
+                corruption_mask.to(device),
+                size=corrupted_map.shape[-2:],
+                mode='nearest',
+            )
+            sample_idx = [int(value) for value in meta['sample_idx']]
+            clean_memory = compute_pseudoclass_memory_scores_for_batch(
+                model,
+                clean_images,
+                memory_system,
+                args,
+                device,
+                routing_cache=routing_cache,
+                query_sample_idx=sample_idx,
+                leave_one_out=leave_one_out,
+            )
+            corrupted_memory = compute_pseudoclass_memory_scores_for_batch(
+                model,
+                corrupted_images,
+                memory_system,
+                args,
+                device,
+                routing_cache=routing_cache,
+                query_sample_idx=sample_idx,
+                leave_one_out=leave_one_out,
+            )
+            for index, value in enumerate(sample_idx):
+                mask = corruption_mask[index, 0].bool()
+                outside = ~mask
+                recon_localization = (
+                    corrupted_map[index, 0][mask].mean()
+                    - corrupted_map[index, 0][outside].mean()
+                )
+                corrupted_memory_map = resize_memory_map(
+                    corrupted_memory['memory_patch_maps'][index:index + 1].to(device),
+                    corrupted_map.shape[-2:],
+                )[0]
+                memory_localization = (
+                    corrupted_memory_map[mask].mean()
+                    - corrupted_memory_map[outside].mean()
+                )
+                common_record = {
+                    'sample_idx': value,
+                    'class_id': int(meta['class_id'][index]),
+                    'base_idx': int(meta['base_idx'][index]),
+                    'img_path': str(meta['img_path'][index]),
+                    'clean_route_eligible': int(clean_memory['mem_applied'][index].item()),
+                    'corrupted_route_eligible': int(corrupted_memory['mem_applied'][index].item()),
+                    'clean_predicted_pseudo_class_id': int(clean_memory['predicted_pseudo_class_id'][index].item()),
+                    'corrupted_predicted_pseudo_class_id': int(corrupted_memory['predicted_pseudo_class_id'][index].item()),
+                    'clean_similarity_margin': float(clean_memory['similarity_margin'][index].item()),
+                    'corrupted_similarity_margin': float(corrupted_memory['similarity_margin'][index].item()),
+                    'clean_recon_score': float(clean_recon[index].item()),
+                    'corrupted_recon_score': float(corrupted_recon[index].item()),
+                    'corrupted_recon_localization': float(recon_localization.item()),
+                    'corrupted_memory_localization': float(memory_localization.item()),
+                }
+                for topk_ratio in topk_ratios:
+                    record = dict(common_record)
+                    record.update({
+                        'topk_ratio': topk_ratio,
+                        'clean_memory_score': float(pool_patch_scores(
+                            clean_memory['memory_patch_maps'][index].flatten(),
+                            topk_ratio=topk_ratio,
+                        ).item()),
+                        'corrupted_memory_score': float(pool_patch_scores(
+                            corrupted_memory['memory_patch_maps'][index].flatten(),
+                            topk_ratio=topk_ratio,
+                        ).item()),
+                    })
+                    records.append(record)
+    finally:
+        if was_training:
+            model.train()
+    return records
+
+
 @torch.no_grad()
 def compute_pseudoclass_memory_scores_for_batch(model,
                                                 images: torch.Tensor,
@@ -274,12 +615,40 @@ def compute_pseudoclass_memory_scores_for_batch(model,
                                                 args,
                                                 device,
                                                 routing_cache=None,
-                                                device_memory_cache=None):
+                                                device_memory_cache=None,
+                                                query_sample_idx=None,
+                                                leave_one_out=False):
     images = images.to(device)
     patch_features, spatial_size = extract_encoder_patch_tokens(model, images)
     cls_embeddings = _extract_encoder_cls_embeddings(model, images)
     cache = _routing_cache(memory_system, device) if routing_cache is None else routing_cache
     similarities = cls_embeddings @ cache['prototypes'].T
+    unavailable_positions = torch.zeros_like(similarities, dtype=torch.bool)
+    if leave_one_out and query_sample_idx is not None:
+        class_position = {int(class_id): position for position, class_id in enumerate(cache['class_ids'])}
+        member_owner = {
+            int(sample_idx): int(pseudo_class_id)
+            for pseudo_class_id, entry in memory_system['class_entries'].items()
+            for sample_idx in entry.get('member_sample_idx', [])
+        }
+        for index, sample_idx in enumerate(query_sample_idx):
+            owner_id = member_owner.get(int(sample_idx))
+            if owner_id is None:
+                continue
+            owner = memory_system['class_entries'][owner_id]
+            member_ids = [int(value) for value in owner.get('member_sample_idx', [])]
+            member_cls = owner.get('member_cls')
+            if int(sample_idx) not in member_ids:
+                continue
+            if member_cls is None:
+                raise ValueError('leave-one-out routing requires member CLS embeddings')
+            if len(member_ids) <= 1:
+                similarities[index, class_position[owner_id]] = float('-inf')
+                unavailable_positions[index, class_position[owner_id]] = True
+                continue
+            retained = [position for position, value in enumerate(member_ids) if value != int(sample_idx)]
+            loo_prototype = _normalize_rows(member_cls[retained].mean(dim=0, keepdim=True))[0].to(device)
+            similarities[index, class_position[owner_id]] = cls_embeddings[index] @ loo_prototype
     best_positions = similarities.argmax(dim=1)
     best_similarity = similarities.gather(1, best_positions[:, None])[:, 0]
     if similarities.shape[1] > 1:
@@ -289,12 +658,22 @@ def compute_pseudoclass_memory_scores_for_batch(model,
     chunk_size = int(getattr(args, 'tg_mem_chunk_size', getattr(args, 'mem_chunk_size', 4096)))
     topk_ratio = float(getattr(args, 'tg_memory_topk_ratio', getattr(args, 'mem_topk_ratio', 0.05)))
     entries = memory_system['class_entries']
+    min_class_members = int(getattr(args, 'tg_memory_min_class_members', 1))
+    if min_class_members < 1:
+        raise ValueError('tg_memory_min_class_members must be >= 1')
     scores = []
     maps = []
     mem_applied = []
     predicted_ids = []
     predicted_types = []
     for index, best_position in enumerate(best_positions.tolist()):
+        if bool(unavailable_positions[index].all()) or not torch.isfinite(best_similarity[index]):
+            predicted_ids.append(-1)
+            predicted_types.append('unavailable')
+            scores.append(torch.tensor(0.0, device=device))
+            maps.append(torch.zeros(spatial_size, device=device))
+            mem_applied.append(0)
+            continue
         pseudo_class_id = int(cache['class_ids'][best_position])
         pseudo_class_type = cache['class_types'][best_position]
         predicted_ids.append(pseudo_class_id)
@@ -305,10 +684,24 @@ def compute_pseudoclass_memory_scores_for_batch(model,
             mem_applied.append(0)
             continue
         entry = entries[pseudo_class_id]
+        if int(entry.get('num_members', 0)) < min_class_members:
+            predicted_types[-1] = 'tail_unsupported'
+            scores.append(torch.tensor(0.0, device=device))
+            maps.append(torch.zeros(spatial_size, device=device))
+            mem_applied.append(0)
+            continue
+        query_memory_system = memory_system
+        if leave_one_out and query_sample_idx is not None:
+            query_memory_system = leave_one_out_memory_system(
+                memory_system,
+                pseudo_class_id,
+                int(query_sample_idx[index]),
+            )
+            entry = query_memory_system['class_entries'][pseudo_class_id]
         if not entry.get('has_memory_bank') or 'features' not in entry:
             raise ValueError('predicted tail pseudo-class has no memory bank: {}'.format(pseudo_class_id))
         memory_features = entry['features']
-        if device_memory_cache is not None:
+        if device_memory_cache is not None and query_memory_system is memory_system:
             memory_features = device_memory_cache.setdefault(
                 pseudo_class_id,
                 entry['features'].to(device),
@@ -346,6 +739,7 @@ def run_pseudoclass_memory_evaluation(model,
         gaussian_kernel = get_gaussian_kernel(kernel_size=5, sigma=4).to(device)
         rows: List[dict] = []
         lambda_value = float(getattr(args, 'tg_memory_fusion_lambda', 1.0))
+        route_margin_threshold = float(getattr(args, 'tg_memory_route_margin_threshold', float('-inf')))
         batch_size = int(args.batch_size)
         num_workers = int(args.num_workers)
         max_ratio = float(getattr(args, 'diag_max_ratio', getattr(args, 'max_ratio', 0.01)))
@@ -391,7 +785,13 @@ def run_pseudoclass_memory_evaluation(model,
                 memory_maps = resize_memory_map(
                     memory_result['memory_patch_maps'].to(device), recon_map.shape[-2:]
                 ).unsqueeze(1)
-                tail_mask = memory_result['mem_applied'].to(device=device, dtype=torch.bool)
+                route_eligible = memory_result['mem_applied'].to(device=device)
+                similarity_margin = memory_result['similarity_margin'].to(device=device)
+                tail_mask = route_evidence_mask(
+                    route_eligible,
+                    similarity_margin,
+                    route_margin_threshold,
+                )
                 fused_scores = torch.where(tail_mask, recon_scores + lambda_value * memory_scores, recon_scores)
                 fused_maps = torch.where(
                     tail_mask[:, None, None, None],
@@ -422,7 +822,8 @@ def run_pseudoclass_memory_evaluation(model,
                         'recon_score': float(recon_scores[index].item()),
                         'memory_score': float(memory_scores[index].item()),
                         'final_score': float(fused_scores[index].item()),
-                        'mem_applied': int(memory_result['mem_applied'][index].item()),
+                        'route_eligible': int(memory_result['mem_applied'][index].item()),
+                        'mem_applied': int(tail_mask[index].item()),
                         'predicted_pseudo_class_id': int(memory_result['predicted_pseudo_class_id'][index].item()),
                         'predicted_pseudo_class_type': memory_result['predicted_pseudo_class_type'][index],
                         'top1_similarity': float(memory_result['top1_similarity'][index].item()),
@@ -473,7 +874,10 @@ def run_pseudoclass_memory_evaluation(model,
             'num_head_pseudo_classes': int(memory_system['num_head_pseudo_classes']),
             'num_tail_pseudo_classes': int(memory_system['num_tail_pseudo_classes']),
             'num_tail_memory_banks': int(memory_system['num_tail_memory_banks']),
+            'route_eligible_ratio': float(score_df['route_eligible'].mean()) if len(score_df) > 0 else 0.0,
             'memory_applied_ratio': float(score_df['mem_applied'].mean()) if len(score_df) > 0 else 0.0,
+            'route_margin_threshold': route_margin_threshold,
+            'memory_min_class_members': int(getattr(args, 'tg_memory_min_class_members', 1)),
         })
     finally:
         if was_training:

@@ -26,7 +26,7 @@ os.makedirs(_WEIGHTS_DIR, exist_ok=True)
 # }
 
 
-def load(name):
+def load(name, pretrained=True):
     # if name in _BACKBONES.keys():
     #     return eval(_BACKBONES[name])
 
@@ -41,7 +41,9 @@ def load(name):
                                                                           interpolate_antialias=False,
                                                                           interpolate_offset=0.1)
 
-                if arch == "base":
+                if not pretrained:
+                    ckpt_pth = None
+                elif arch == "base":
                     ckpt_pth = download_cached_file(
                         f"https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb{patchsize}/dinov2_vitb{patchsize}_reg4_pretrain.pth")
                 elif arch == "small":
@@ -67,7 +69,7 @@ def load(name):
                 else:
                     raise ValueError("Invalid type of architecture. It must be either 'small' or 'base'.")
 
-            state_dict = torch.load(ckpt_pth, map_location='cpu')
+            state_dict = None if ckpt_pth is None else torch.load(ckpt_pth, map_location='cpu')
         else:  # dinov1
             if arch == "base":
                 ckpt_pth = download_cached_file(
@@ -130,7 +132,8 @@ def load(name):
     #     except FileNotFoundError:
     #         state_dict = torch.load(f"{_WEIGHTS_DIR}/vit_{arch}_patchsize_{patchsize}_224.pth")
 
-    model.load_state_dict(state_dict, strict=False)
+    if pretrained:
+        model.load_state_dict(state_dict, strict=False)
     return model
 
 

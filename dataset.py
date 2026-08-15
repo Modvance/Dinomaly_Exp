@@ -102,6 +102,68 @@ class TrainDiagDataset(_BaseImageFolderMetaDataset):
         return image, label, meta
 
 
+class TrainCalibrationDataset(TrainDiagDataset):
+    """Return deterministic normal and synthetic-corruption views for calibration."""
+
+    def __init__(self, dataset, data_root, class_name, class_id, sample_offset=0,
+                 corruption_grid=8, corruption_min_ratio=0.2, corruption_max_ratio=0.5,
+                 corruption_strength=1.0, corruption_seed=2027,
+                 sample_idx_by_base_idx=None):
+        super().__init__(
+            dataset,
+            data_root=data_root,
+            class_name=class_name,
+            class_id=class_id,
+            sample_offset=sample_offset,
+            contaminated_paths=None,
+        )
+        self.corruption_grid = int(corruption_grid)
+        self.corruption_min_ratio = float(corruption_min_ratio)
+        self.corruption_max_ratio = float(corruption_max_ratio)
+        self.corruption_strength = float(corruption_strength)
+        self.corruption_seed = int(corruption_seed)
+        self.sample_idx_by_base_idx = (
+            None if sample_idx_by_base_idx is None
+            else {int(key): int(value) for key, value in sample_idx_by_base_idx.items()}
+        )
+        if self.corruption_grid < 2:
+            raise ValueError('corruption_grid must be at least 2')
+        if not 0.0 < self.corruption_min_ratio <= self.corruption_max_ratio <= 1.0:
+            raise ValueError('corruption ratios must satisfy 0 < min <= max <= 1')
+        if not 0.0 < self.corruption_strength <= 1.0:
+            raise ValueError('corruption_strength must be in (0, 1]')
+
+    def _synthetic_corruption(self, image, sample_idx):
+        generator = torch.Generator(device='cpu')
+        generator.manual_seed(self.corruption_seed + int(sample_idx) * 104729)
+        _, height, width = image.shape
+        low_h = max(1, (height + self.corruption_grid - 1) // self.corruption_grid)
+        low_w = max(1, (width + self.corruption_grid - 1) // self.corruption_grid)
+        mask = torch.rand((1, low_h, low_w), generator=generator)
+        mask = torch.nn.functional.interpolate(
+            mask.unsqueeze(0), size=(height, width), mode='bilinear', align_corners=False
+        )[0]
+        ratio = self.corruption_min_ratio + (
+            self.corruption_max_ratio - self.corruption_min_ratio
+        ) * float(torch.rand((), generator=generator).item())
+        threshold = torch.quantile(mask.flatten(), max(0.0, 1.0 - ratio))
+        mask = (mask >= threshold).to(dtype=image.dtype)
+        noise = torch.randn(image.shape, generator=generator, dtype=image.dtype)
+        scale = image.flatten(1).std(dim=1, unbiased=False).view(-1, 1, 1).clamp_min(0.1)
+        corrupted = image + mask * noise * scale * self.corruption_strength
+        return corrupted, mask
+
+    def __getitem__(self, idx):
+        image, _, meta = super().__getitem__(idx)
+        if self.sample_idx_by_base_idx is not None:
+            base_idx = int(meta['base_idx'])
+            if base_idx not in self.sample_idx_by_base_idx:
+                raise ValueError('calibration sample has no registered sample_idx: {}'.format(base_idx))
+            meta['sample_idx'] = self.sample_idx_by_base_idx[base_idx]
+        corrupted, mask = self._synthetic_corruption(image, meta['sample_idx'])
+        return image, corrupted, mask, meta
+
+
 class TrainWeightDataset(_BaseImageFolderMetaDataset):
     def __getitem__(self, idx):
         image, label = self.dataset[idx]
