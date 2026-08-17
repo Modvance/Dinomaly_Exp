@@ -5,9 +5,15 @@ saved_results/
 *.md
 !README.md
 tests/
+!tests/
+tests/*
+!tests/test_tail_sampler_partition_guard.py
 .*/
 _tmp_precluster_smoke/
 tmp/
 scripts/
+!scripts/
+scripts/*
+!scripts/evaluate_tail_partition_guard.py
 paper/
 analysis*/

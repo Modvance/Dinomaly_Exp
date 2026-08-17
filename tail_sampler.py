@@ -11,6 +11,7 @@ from sklearn.neighbors import KernelDensity
 
 EPS = 1e-12
 _WITHIN_FACTOR = 2
+PLATEAU_GAP_GUARD_V1 = 'plateau_gap_v1'
 
 
 def compute_self_sim(features: torch.Tensor, normalize: bool = True) -> torch.Tensor:
@@ -54,7 +55,7 @@ def predict_num_samples_per_class(class_sizes: torch.Tensor, round_class_sizes: 
         class_sizes = torch.round(class_sizes).to(torch.long)
     class_sizes_sorted = torch.sort(class_sizes, descending=False)[0]
     class_sizes_sorted = torch.maximum(class_sizes_sorted, torch.ones_like(class_sizes_sorted))
-    class_sizes_sorted = class_sizes_sorted.squeeze()
+    class_sizes_sorted = class_sizes_sorted.reshape(-1)
 
     num_samples_per_class = []
     while len(class_sizes_sorted) > 0:
@@ -76,10 +77,102 @@ def predict_num_samples_per_class(class_sizes: torch.Tensor, round_class_sizes: 
     return torch.LongTensor(num_samples_per_class).sort(descending=True)[0]
 
 
-def predict_few_shot_class_samples(class_sizes: torch.Tensor, percentile: float = 0.15) -> torch.Tensor:
+def _apply_plateau_gap_guard(class_sizes: torch.Tensor,
+                             original_mask: torch.Tensor,
+                             original_cutoff,
+                             guard_name: Optional[str]):
+    class_sizes = class_sizes.reshape(-1)
+    original_mask = original_mask.reshape(-1).to(
+        device=class_sizes.device,
+        dtype=torch.long,
+    )
+    num_samples = int(class_sizes.numel())
+    num_selected_raw = int(original_mask.sum().item())
+    diagnostics = {
+        'guard_name': guard_name,
+        'enabled': guard_name is not None,
+        'triggered': False,
+        'status': 'disabled' if guard_name is None else 'unchanged',
+        'num_samples': num_samples,
+        'num_selected_raw': num_selected_raw,
+        'num_selected_final': num_selected_raw,
+        'num_removed_by_guard': 0,
+        'selected_ratio_raw': num_selected_raw / num_samples if num_samples > 0 else 0.0,
+        'selected_ratio_final': num_selected_raw / num_samples if num_samples > 0 else 0.0,
+        'original_cutoff': None if original_cutoff is None else float(original_cutoff),
+        'effective_cutoff': None if original_cutoff is None else float(original_cutoff),
+        'num_inferred_classes': 0,
+        'boundary_multiplicity': 0,
+        'gap_lower': None,
+        'gap_upper': None,
+        'dominant_log_gap': None,
+    }
+    if guard_name is None:
+        return original_mask, diagnostics
+    if guard_name != PLATEAU_GAP_GUARD_V1:
+        raise ValueError(f'unsupported tail partition guard: {guard_name}')
+    if num_selected_raw == 0 or original_cutoff is None:
+        diagnostics['status'] = 'unchanged_no_selection'
+        return original_mask, diagnostics
+
+    inferred_class_sizes = predict_num_samples_per_class(
+        class_sizes.detach().cpu()
+    ).sort()[0]
+    diagnostics['num_inferred_classes'] = int(inferred_class_sizes.numel())
+    if inferred_class_sizes.numel() < 2:
+        diagnostics['status'] = 'unchanged_too_few_inferred_classes'
+        return original_mask, diagnostics
+
+    log_class_sizes = torch.log(inferred_class_sizes.float().clamp_min(1.0))
+    log_gaps = log_class_sizes[1:] - log_class_sizes[:-1]
+    gap_index = int(torch.argmax(log_gaps).item())
+    gap_lower = int(inferred_class_sizes[gap_index].item())
+    gap_upper = int(inferred_class_sizes[gap_index + 1].item())
+    cutoff_value = int(round(float(original_cutoff)))
+    boundary_multiplicity = int((inferred_class_sizes == cutoff_value).sum().item())
+    diagnostics.update({
+        'boundary_multiplicity': boundary_multiplicity,
+        'gap_lower': float(gap_lower),
+        'gap_upper': float(gap_upper),
+        'dominant_log_gap': float(log_gaps[gap_index].item()),
+    })
+
+    if boundary_multiplicity < 2 or cutoff_value <= gap_lower:
+        diagnostics['status'] = 'unchanged_supported_boundary'
+        return original_mask, diagnostics
+
+    guarded_mask = (class_sizes <= gap_lower).to(torch.long)
+    num_selected_final = int(guarded_mask.sum().item())
+    if num_selected_final > num_selected_raw:
+        diagnostics['status'] = 'unchanged_non_monotonic_guard'
+        return original_mask, diagnostics
+    diagnostics.update({
+        'triggered': True,
+        'status': 'triggered',
+        'num_selected_final': num_selected_final,
+        'num_removed_by_guard': num_selected_raw - num_selected_final,
+        'selected_ratio_final': num_selected_final / num_samples if num_samples > 0 else 0.0,
+        'effective_cutoff': float(gap_lower),
+    })
+    return guarded_mask, diagnostics
+
+
+def predict_few_shot_class_samples(class_sizes: torch.Tensor,
+                                   percentile: float = 0.15,
+                                   partition_guard: Optional[str] = None,
+                                   return_partition_diagnostics: bool = False):
     num_samples_per_class = predict_num_samples_per_class(class_sizes)
     max_k = predict_max_k(num_samples_per_class, percentile=percentile)
-    return (class_sizes <= max_k).to(torch.long)
+    original_mask = (class_sizes <= max_k).to(torch.long)
+    selected_mask, diagnostics = _apply_plateau_gap_guard(
+        class_sizes,
+        original_mask,
+        max_k,
+        partition_guard,
+    )
+    if return_partition_diagnostics:
+        return selected_mask, diagnostics
+    return selected_mask
 
 
 def predict_max_k(num_samples_per_class: torch.Tensor, percentile: float = 0.15):
@@ -449,14 +542,25 @@ def adaptively_sample_few_shot(
     vote_type: str = 'none',
     percentile: float = 0.15,
     return_class_sizes: bool = False,
+    partition_guard: Optional[str] = None,
+    return_partition_diagnostics: bool = False,
 ):
     self_sim = compute_self_sim(X)
     class_sizes = predict_adaptive_class_sizes(self_sim, th_type, vote_type).squeeze()
     if return_class_sizes:
+        if return_partition_diagnostics:
+            raise ValueError('partition diagnostics require candidate selection')
         return class_sizes
 
-    is_few_shot = predict_few_shot_class_samples(class_sizes, percentile=percentile)
+    is_few_shot, diagnostics = predict_few_shot_class_samples(
+        class_sizes,
+        percentile=percentile,
+        partition_guard=partition_guard,
+        return_partition_diagnostics=True,
+    )
     sample_indices = torch.where(is_few_shot == 1)[0]
+    if return_partition_diagnostics:
+        return X[sample_indices], sample_indices, diagnostics
     return X[sample_indices], sample_indices
 
 
@@ -532,21 +636,27 @@ class AdaptiveTailSampler:
         threshold_type: str = 'double_max_step',
         vote_type: str = 'none',
         percentile: float = 0.15,
+        partition_guard: Optional[str] = None,
     ):
         self.threshold_type = threshold_type
         self.vote_type = vote_type
         self.percentile = float(percentile)
+        self.partition_guard = partition_guard
+        self.last_partition_diagnostics = None
 
     def run(self, features: torch.Tensor, feature_map_shape: Optional[torch.Tensor] = None, return_class_sizes: bool = False):
         if feature_map_shape is not None:
             raise ValueError('adaptive tail sampler image-level port does not support feature_map_shape')
 
-        tail_samples, tail_indices = adaptively_sample_few_shot(
+        tail_samples, tail_indices, partition_diagnostics = adaptively_sample_few_shot(
             X=features,
             th_type=self.threshold_type,
             vote_type=self.vote_type,
             percentile=self.percentile,
+            partition_guard=self.partition_guard,
+            return_partition_diagnostics=True,
         )
+        self.last_partition_diagnostics = partition_diagnostics
         if return_class_sizes:
             class_sizes_pred = adaptively_sample_few_shot(
                 X=features,
@@ -564,6 +674,7 @@ def build_tail_sampler(
     threshold_type: Optional[str] = None,
     vote_type: Optional[str] = None,
     percentile: float = 0.15,
+    plateau_gap_guard: bool = False,
 ):
     if sampler_type == 'tail':
         return TailSampler(
@@ -580,10 +691,17 @@ def build_tail_sampler(
         ), 'AdaptiveTailSampler'
 
     if sampler_type == 'adaptive_trim_mode':
+        effective_threshold_type = 'trim_min' if threshold_type is None else threshold_type
+        effective_vote_type = 'mode' if vote_type is None else vote_type
+        if plateau_gap_guard and (
+            effective_threshold_type != 'trim_min' or effective_vote_type != 'mode'
+        ):
+            raise ValueError('plateau-gap guard requires adaptive_trim_mode with trim_min and mode')
         return AdaptiveTailSampler(
-            threshold_type='trim_min' if threshold_type is None else threshold_type,
-            vote_type='mode' if vote_type is None else vote_type,
+            threshold_type=effective_threshold_type,
+            vote_type=effective_vote_type,
             percentile=percentile,
+            partition_guard=PLATEAU_GAP_GUARD_V1 if plateau_gap_guard else None,
         ), 'AdaptiveTailSampler(trim_min,mode)'
 
     raise ValueError(f'unsupported sampler_type: {sampler_type}')

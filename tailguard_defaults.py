@@ -1,7 +1,7 @@
 """Single source of truth for the canonical TailGuard configuration."""
 
 
-TAILGUARD_CONFIG_SCHEMA_VERSION = 6
+TAILGUARD_CONFIG_SCHEMA_VERSION = 7
 TAILGUARD_METHOD_NAME = 'tailguard'
 TAILGUARD_CONFIG_PROFILE = 'final'
 TAILGUARD_PRUNE_MODES = ('adaptive', 'fixed')
@@ -16,6 +16,7 @@ TAILGUARD_FINAL_DEFAULTS = {
     'tailsampler_th_type': None,
     'tailsampler_vote_type': None,
     'tailsampler_percentile': 0.15,
+    'tailsampler_plateau_gap_guard': True,
     'tailsampler_embedding_source': 'encoder_cls',
     'tailsampler_gt_mode': 'dataset_rule',
     'tailsampler_tail_count_thr': 8,

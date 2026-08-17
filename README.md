@@ -3482,8 +3482,133 @@ python dinomaly_visa_tailguard.py \
 并核验：
 
 - `final_model.pt` 的迭代数为 10000；
-- `tailguard_summary.json` 的 `schema_version == 6`、`method_mode == "full"`；
+- `tailguard_summary.json` 的 `schema_version == 7`、`method_mode == "full"`；
 - `memory_status == "completed"`；
 - P 未删除尾候选，即 `stage2_summary.num_tail_candidates_removed == 0`。
 
 这里的 `memory_status == "completed"` 只表示当前 P 校正后的精细 memory 分支已经完成。这 24 次训练同时保存了后续构建原始候选分支所需的 CLS/T0/H/P 产物；正式双粒度 Raw-only、Refined-only 与 Dual 分数将在统一 evaluator 完成后基于同一个 Full checkpoint 无训练重测，不需要额外运行 `h_raw_e`。
+
+## TailSampler 平台断点修复后的三组验证重训
+
+以下命令验证候选平台断点校验。新版本默认启用 `--tailsampler_plateau_gap_guard`；这里显式写出该参数，便于确认服务器使用的是修复后的代码。请保留旧结果，使用新的保存目录和名称。
+
+```bash
+# 1. VisA / Step-K1 / seed03
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed03 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed03/inject_defects.txt \
+  --save_dir ../results/tailguard/partition_guard_v1 \
+  --save_name visa_step_k1_seed03_full_guard \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tailsampler_plateau_gap_guard \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 0
+
+# 2. VisA / Step-K1 / seed05
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k1-seed05 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k1/seed05/inject_defects.txt \
+  --save_dir ../results/tailguard/partition_guard_v1 \
+  --save_name visa_step_k1_seed05_full_guard \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tailsampler_plateau_gap_guard \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 1
+
+# 3. VisA / Step-K4 / seed02
+python dinomaly_visa_tailguard.py \
+  --data_path ../LTN_visa/visa-step_k4-seed02 \
+  --diag_manifest_path ./manifest/visa-nlt/step_k4/seed02/inject_defects.txt \
+  --save_dir ../results/tailguard/partition_guard_v1 \
+  --save_name visa_step_k4_seed02_full_guard \
+  --total_iters 10000 \
+  --eval_interval 5000 \
+  --tg_method_mode full \
+  --tailsampler_type adaptive_trim_mode \
+  --tailsampler_plateau_gap_guard \
+  --tg_tail_embedding_source encoder_cls \
+  --tg_group_embedding_source encoder \
+  --gbps_auto_k \
+  --gbps_k_candidates 6,8,10,12,15,20 \
+  --tg_stage1_training_scope all_samples \
+  --gbps_postprocess_mode remove \
+  --gbps_prune_mode adaptive \
+  --gbps_prune_max_ratio 0.10 \
+  --gbps_prune_stable_window 3 \
+  --gbps_prune_stable_min_observations 1 \
+  --gbps_prune_min_active_ratio 0.50 \
+  --gbps_min_keep_per_group 20 \
+  --tg_attachment_membership_mode rgd \
+  --tg_rgd_split_mode segmented_bic \
+  --tg_stable_window 3 \
+  --tg_stable_min_observations 1 \
+  --tg_t_attached_noise_p_high_thr 1.0 \
+  --tg_save_grouping_embeddings \
+  --tg_save_cls_embeddings \
+  --tg_memory_enable \
+  --tg_memory_fusion_lambda 1.0 \
+  --tg_memory_topk_ratio 0.05 \
+  --tg_memory_route_margin_threshold=-inf \
+  --tg_memory_min_class_members 1 \
+  --gpus 2
+```
+
+三组在 prepare 阶段应分别出现：
+
+```text
+visa_step_k1_seed03: candidates 943 -> 4, cutoff 401 -> 1
+visa_step_k1_seed05: candidates 923 -> 5, cutoff 401 -> 1
+visa_step_k4_seed02: candidates 963 -> 20, cutoff 401 -> 3
+```

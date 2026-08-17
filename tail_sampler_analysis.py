@@ -131,7 +131,10 @@ def build_tail_candidate_partition(details_df: pd.DataFrame):
     return candidate_df, head_df
 
 
-def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
+def run_tail_sampler_analysis(embeddings,
+                              metadata_df: pd.DataFrame,
+                              args,
+                              plateau_gap_guard: bool = False):
     embeddings = np.asarray(embeddings, dtype=np.float32)
     if embeddings.ndim != 2:
         raise ValueError('embeddings must have shape [N, D]')
@@ -143,6 +146,7 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
         threshold_type=getattr(args, 'tailsampler_th_type', None),
         vote_type=getattr(args, 'tailsampler_vote_type', None),
         percentile=float(getattr(args, 'tailsampler_percentile', 0.15)),
+        plateau_gap_guard=bool(plateau_gap_guard),
     )
 
     feature_tensor = torch.from_numpy(embeddings)
@@ -151,6 +155,32 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
 
     selected = np.zeros(len(metadata_df), dtype=int)
     selected[tail_indices.detach().cpu().numpy()] = 1
+    partition_diagnostics = getattr(sampler, 'last_partition_diagnostics', None)
+    if partition_diagnostics is None:
+        partition_diagnostics = {
+            'guard_name': None,
+            'enabled': False,
+            'triggered': False,
+            'status': 'unavailable_for_sampler',
+            'num_selected_raw': int(selected.sum()),
+            'num_selected_final': int(selected.sum()),
+            'num_removed_by_guard': 0,
+            'selected_ratio_raw': float(selected.mean()) if len(selected) > 0 else 0.0,
+            'selected_ratio_final': float(selected.mean()) if len(selected) > 0 else 0.0,
+            'original_cutoff': None,
+            'effective_cutoff': None,
+            'num_inferred_classes': 0,
+            'boundary_multiplicity': 0,
+            'gap_lower': None,
+            'gap_upper': None,
+            'dominant_log_gap': None,
+        }
+
+    original_cutoff = partition_diagnostics.get('original_cutoff')
+    if original_cutoff is None:
+        selected_raw = selected.copy()
+    else:
+        selected_raw = (class_sizes_pred <= float(original_cutoff)).astype(int)
 
     gt_class_counts, is_gt_tail, class_counts, tail_max_count, gt_rule, gt_mode_name = build_tail_ground_truth(metadata_df, args)
     tail_score = -class_sizes_pred
@@ -173,7 +203,11 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
     details_df['is_gt_tail'] = is_gt_tail.astype(int)
     details_df['pred_class_size'] = class_sizes_pred.astype(float)
     details_df['tail_score'] = tail_score.astype(float)
+    details_df['is_selected_raw'] = selected_raw.astype(int)
     details_df['is_selected'] = selected.astype(int)
+    details_df['removed_by_partition_guard'] = (
+        (selected_raw == 1) & (selected == 0)
+    ).astype(int)
     details_df['is_noise_proxy'] = is_noise_proxy.astype(int)
 
     summary_row = {
@@ -206,6 +240,22 @@ def run_tail_sampler_analysis(embeddings, metadata_df: pd.DataFrame, args):
         'selected_gt_tail_noise_proxy_rate': float(selected_gt_tail_noise_proxy_rate),
         'selected_cutoff_max_pred_class_size': cutoff_summary['selected_cutoff_max_pred_class_size'],
         'selected_cutoff_min_tail_score': cutoff_summary['selected_cutoff_min_tail_score'],
+        'partition_guard_name': partition_diagnostics.get('guard_name'),
+        'partition_guard_enabled': bool(partition_diagnostics.get('enabled', False)),
+        'partition_guard_triggered': bool(partition_diagnostics.get('triggered', False)),
+        'partition_guard_status': partition_diagnostics.get('status'),
+        'partition_guard_num_selected_raw': int(partition_diagnostics.get('num_selected_raw', num_selected)),
+        'partition_guard_num_selected_final': int(partition_diagnostics.get('num_selected_final', num_selected)),
+        'partition_guard_num_removed': int(partition_diagnostics.get('num_removed_by_guard', 0)),
+        'partition_guard_selected_ratio_raw': float(partition_diagnostics.get('selected_ratio_raw', selection_metrics['selected_ratio'])),
+        'partition_guard_selected_ratio_final': float(partition_diagnostics.get('selected_ratio_final', selection_metrics['selected_ratio'])),
+        'partition_guard_original_cutoff': partition_diagnostics.get('original_cutoff'),
+        'partition_guard_effective_cutoff': partition_diagnostics.get('effective_cutoff'),
+        'partition_guard_num_inferred_classes': int(partition_diagnostics.get('num_inferred_classes', 0)),
+        'partition_guard_boundary_multiplicity': int(partition_diagnostics.get('boundary_multiplicity', 0)),
+        'partition_guard_gap_lower': partition_diagnostics.get('gap_lower'),
+        'partition_guard_gap_upper': partition_diagnostics.get('gap_upper'),
+        'partition_guard_dominant_log_gap': partition_diagnostics.get('dominant_log_gap'),
         'num_pred_class_size_le_1': _count_pred_class_size_le(class_sizes_pred, 1),
         'num_pred_class_size_le_5': _count_pred_class_size_le(class_sizes_pred, 5),
         'num_pred_class_size_le_10': _count_pred_class_size_le(class_sizes_pred, 10),

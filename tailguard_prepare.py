@@ -120,6 +120,11 @@ def _extract_tail_candidates(embeddings: np.ndarray, metadata_df: pd.DataFrame, 
         threshold_type=getattr(args, 'tailsampler_th_type', None),
         vote_type=getattr(args, 'tailsampler_vote_type', None),
         percentile=float(getattr(args, 'tailsampler_percentile', 0.15)),
+        plateau_gap_guard=bool(getattr(
+            args,
+            'tailsampler_plateau_gap_guard',
+            TAILGUARD_FINAL_DEFAULTS['tailsampler_plateau_gap_guard'],
+        )),
     )
     features = _as_float_tensor(embeddings)
     _, tail_indices, pred_class_sizes = sampler.run(features, return_class_sizes=True)
@@ -137,7 +142,33 @@ def _extract_tail_candidates(embeddings: np.ndarray, metadata_df: pd.DataFrame, 
     candidates_df['tail_score'] = tail_scores.astype(float)
     candidates_df['adaptive_angle'] = adaptive_angles.numpy().astype(float)
     candidates_df['adaptive_angle_source'] = angle_source
-    return candidates_df[TAILSAMPLER_CANDIDATE_COLUMNS].copy(), sampler_name, angle_source
+    partition_diagnostics = getattr(sampler, 'last_partition_diagnostics', None)
+    if partition_diagnostics is None:
+        partition_diagnostics = {
+            'guard_name': None,
+            'enabled': False,
+            'triggered': False,
+            'status': 'unavailable_for_sampler',
+            'num_samples': int(len(candidates_df)),
+            'num_selected_raw': int(tail_mask.sum()),
+            'num_selected_final': int(tail_mask.sum()),
+            'num_removed_by_guard': 0,
+            'selected_ratio_raw': float(tail_mask.mean()) if len(tail_mask) > 0 else 0.0,
+            'selected_ratio_final': float(tail_mask.mean()) if len(tail_mask) > 0 else 0.0,
+            'original_cutoff': None,
+            'effective_cutoff': None,
+            'num_inferred_classes': 0,
+            'boundary_multiplicity': 0,
+            'gap_lower': None,
+            'gap_upper': None,
+            'dominant_log_gap': None,
+        }
+    return (
+        candidates_df[TAILSAMPLER_CANDIDATE_COLUMNS].copy(),
+        sampler_name,
+        angle_source,
+        dict(partition_diagnostics),
+    )
 
 
 def _build_head_group_assignments(group_embeddings: np.ndarray, metadata_df: pd.DataFrame, candidates_df: pd.DataFrame, args):
@@ -216,7 +247,11 @@ def prepare_tailguard_metadata(model,
         if group_metadata_df['sample_idx'].astype(int).tolist() != metadata_df['sample_idx'].astype(int).tolist():
             raise ValueError('group embedding metadata mismatch during TailGuard prepare')
 
-    candidates_df, sampler_name, angle_source = _extract_tail_candidates(tail_embeddings, metadata_df, args)
+    candidates_df, sampler_name, angle_source, partition_diagnostics = _extract_tail_candidates(
+        tail_embeddings,
+        metadata_df,
+        args,
+    )
     head_group_assignments_df, group_info = _build_head_group_assignments(group_embeddings, metadata_df, candidates_df, args)
 
     full_metadata_df = metadata_df.merge(
@@ -278,15 +313,25 @@ def prepare_tailguard_metadata(model,
         try:
             if getattr(args, 'tailsampler_dataset_name', None) is None:
                 setattr(args, 'tailsampler_dataset_name', os.path.basename(os.path.normpath(str(getattr(args, 'data_path', '')))))
-            analysis_summary, analysis_details_df = run_tail_sampler_analysis(tail_embeddings, full_metadata_df, args)
+            analysis_summary, analysis_details_df = run_tail_sampler_analysis(
+                tail_embeddings,
+                full_metadata_df,
+                args,
+                plateau_gap_guard=bool(getattr(
+                    args,
+                    'tailsampler_plateau_gap_guard',
+                    TAILGUARD_FINAL_DEFAULTS['tailsampler_plateau_gap_guard'],
+                )),
+            )
             if output_dir is not None:
                 analysis_saved = save_tail_sampler_artifacts(
                     os.path.join(output_dir, 'tail_sampler_analysis_only'),
                     analysis_summary,
-                    analysis_details_df,
-                    metadata={
-                        'analysis_only': True,
-                        'not_used_by_tailguard_decision_logic': True,
+                analysis_details_df,
+                metadata={
+                    'analysis_only': True,
+                    'not_used_by_tailguard_decision_logic': True,
+                    'partition_matches_tailguard_decision_logic': True,
                         'tail_embedding_source': tail_embedding_source,
                         'gt_mode': getattr(args, 'tailsampler_gt_mode', 'dataset_rule'),
                         'dataset_name': getattr(args, 'tailsampler_dataset_name', None),
@@ -312,6 +357,7 @@ def prepare_tailguard_metadata(model,
         'tail_embedding_source': tail_embedding_source,
         'group_embedding_source': group_embedding_source,
         'adaptive_angle_source': angle_source,
+        'tail_partition_guard': partition_diagnostics,
         'analysis_metadata_provenance': {
             'manifest_path': manifest_path,
             'manifest_requested_path': manifest_requested_path,
@@ -329,6 +375,12 @@ def prepare_tailguard_metadata(model,
             'tailsampler_th_type': getattr(args, 'tailsampler_th_type', None),
             'tailsampler_vote_type': getattr(args, 'tailsampler_vote_type', None),
             'tailsampler_percentile': float(getattr(args, 'tailsampler_percentile', 0.15)),
+            'tailsampler_plateau_gap_guard': bool(getattr(
+                args,
+                'tailsampler_plateau_gap_guard',
+                TAILGUARD_FINAL_DEFAULTS['tailsampler_plateau_gap_guard'],
+            )),
+            'tail_partition_guard': partition_diagnostics,
             'tail_embedding_source': tail_embedding_source,
             'group_embedding_source': group_embedding_source,
             'grouping_method': getattr(args, 'gbps_grouping_method', 'kmeans'),

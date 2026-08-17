@@ -51,6 +51,7 @@ if __name__ == '__main__':
     parser.add_argument('--tailsampler_th_type', type=str, default=None)
     parser.add_argument('--tailsampler_vote_type', type=str, default=None)
     parser.add_argument('--tailsampler_percentile', type=float, default=0.15)
+    parser.add_argument('--tailsampler_plateau_gap_guard', action='store_true')
     parser.add_argument('--tailsampler_gt_mode', type=str, default='dataset_rule', choices=['true_class', 'dataset_rule'])
     parser.add_argument('--tailsampler_tail_count_thr', type=int, default=8)
     parser.add_argument('--tailsampler_dataset_name', type=str, default=None)
@@ -119,7 +120,12 @@ if __name__ == '__main__':
     if args.tailsampler_dataset_name is None:
         args.tailsampler_dataset_name = os.path.basename(os.path.normpath(args.data_path))
 
-    summary_row, details_df = run_tail_sampler_analysis(embeddings, metadata_df, args)
+    summary_row, details_df = run_tail_sampler_analysis(
+        embeddings,
+        metadata_df,
+        args,
+        plateau_gap_guard=bool(args.tailsampler_plateau_gap_guard),
+    )
 
     output_dir = args.diag_save_dir
     if not os.path.isabs(output_dir):
@@ -136,6 +142,7 @@ if __name__ == '__main__':
         'tailsampler_th_type': args.tailsampler_th_type,
         'tailsampler_vote_type': args.tailsampler_vote_type,
         'tailsampler_percentile': float(args.tailsampler_percentile),
+        'tailsampler_plateau_gap_guard': bool(args.tailsampler_plateau_gap_guard),
         'tailsampler_gt_mode': args.tailsampler_gt_mode,
         'tailsampler_tail_count_thr': int(args.tailsampler_tail_count_thr),
         'tailsampler_embedding_source': args.tailsampler_embedding_source,

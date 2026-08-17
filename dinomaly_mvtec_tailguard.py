@@ -366,6 +366,18 @@ def train(item_list):
         prepare_result['summary']['num_head_candidates'],
         prepare_result['summary']['num_head_groups'],
     ))
+    partition_guard_summary = prepare_result['summary'].get('tail_partition_guard', {})
+    if bool(partition_guard_summary.get('triggered', False)):
+        print_fn(
+            'tail partition guard triggered: candidates {} -> {}, cutoff {} -> {}, gap=({}, {})'.format(
+                partition_guard_summary.get('num_selected_raw'),
+                partition_guard_summary.get('num_selected_final'),
+                partition_guard_summary.get('original_cutoff'),
+                partition_guard_summary.get('effective_cutoff'),
+                partition_guard_summary.get('gap_lower'),
+                partition_guard_summary.get('gap_upper'),
+            )
+        )
     analysis_summary = prepare_result['summary'].get('tail_sampler_analysis_only_summary')
     if analysis_summary is not None and 'selection_precision' in analysis_summary:
         print_fn('tail sampler analysis-only: precision={:.4f}, recall={:.4f}, f1={:.4f}, noisy_proxy_rate={:.4f}'.format(
@@ -1031,6 +1043,8 @@ def build_parser(default_dataset_profile='mvtec'):
     parser.add_argument('--tailsampler_th_type', type=str, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_th_type'])
     parser.add_argument('--tailsampler_vote_type', type=str, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_vote_type'])
     parser.add_argument('--tailsampler_percentile', type=float, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_percentile'])
+    parser.add_argument('--tailsampler_plateau_gap_guard', dest='tailsampler_plateau_gap_guard', action='store_true', default=TAILGUARD_FINAL_DEFAULTS['tailsampler_plateau_gap_guard'])
+    parser.add_argument('--no-tailsampler_plateau_gap_guard', dest='tailsampler_plateau_gap_guard', action='store_false')
     parser.add_argument('--tailsampler_embedding_source', type=str, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_embedding_source'], choices=['encoder', 'encoder_cls'])
     parser.add_argument('--tailsampler_gt_mode', type=str, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_gt_mode'], choices=['true_class', 'dataset_rule'])
     parser.add_argument('--tailsampler_tail_count_thr', type=int, default=TAILGUARD_FINAL_DEFAULTS['tailsampler_tail_count_thr'])
