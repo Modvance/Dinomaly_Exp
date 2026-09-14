@@ -19,6 +19,7 @@ Inputs
 --noisy-manifest  text file listing defect images to inject (relative to dest)
 --prune-manifest  text file listing good images to delete (relative to dest)
 --symlink         (optional) use symbolic links for injected images instead of copying
+--symlink-all     (optional) link every image and safely convert identical existing copies
 ```
 
 Behaviour
@@ -36,9 +37,11 @@ what `make_noisy_mvtecad.py` produced (e.g.
 `bottle/train/good/broken_small_001.png`).
 """
 import argparse
+import filecmp
 import os
 import shutil
 import stat
+import tempfile
 from pathlib import Path
 from typing import Dict, List
 
@@ -69,14 +72,46 @@ def ensure_tree_writable(path: Path):
             ensure_writable(root_path / name)
 
 
+def _replace_identical_file_with_symlink(src: Path, dst: Path, link_target: Path | str):
+    """Atomically replace an identical materialized copy with a symbolic link."""
+    if not dst.is_file() or not filecmp.cmp(src, dst, shallow=False):
+        raise FileExistsError(
+            f"Refusing to replace non-identical destination while linking: {dst}"
+        )
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{dst.name}.", suffix=".symlink.tmp", dir=dst.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.unlink()
+        os.symlink(link_target, temporary)
+        os.replace(temporary, dst)
+    finally:
+        if temporary.exists() or temporary.is_symlink():
+            temporary.unlink()
+
+
 def copy_or_link(src: Path, dst: Path, symlink: bool, relative_symlink: bool = False):
     dst.parent.mkdir(parents=True, exist_ok=True)
     ensure_writable(dst.parent)
-    if dst.exists():
+    if dst.is_symlink():
+        if not dst.exists():
+            raise FileNotFoundError(f"Existing symbolic link is broken: {dst}")
+        if not filecmp.cmp(src.resolve(), dst.resolve(), shallow=False):
+            raise FileExistsError(
+                f"Existing symbolic link points to non-identical content: {dst}"
+            )
         return
     if symlink:
         link_target = os.path.relpath(src.resolve(), dst.parent.resolve()) if relative_symlink else src.resolve()
-        os.symlink(link_target, dst)
+        if dst.exists():
+            _replace_identical_file_with_symlink(src.resolve(), dst, link_target)
+        else:
+            os.symlink(link_target, dst)
+    elif dst.exists():
+        return
     else:
         shutil.copy2(src, dst)
         ensure_writable(dst)
@@ -145,7 +180,13 @@ def prune_good_samples(dest: Path, prune_manifest: Path):
         print(f"⚠ {missing} paths from prune manifest were not found (already absent)")
 
 
-def inject_defect_samples(source: Path, dest: Path, noisy_manifest: Path, symlink: bool):
+def inject_defect_samples(
+    source: Path,
+    dest: Path,
+    noisy_manifest: Path,
+    symlink: bool,
+    relative_symlink: bool = False,
+):
     if not noisy_manifest.is_file():
         raise FileNotFoundError(f"Noisy manifest not found: {noisy_manifest}")
 
@@ -169,7 +210,7 @@ def inject_defect_samples(source: Path, dest: Path, noisy_manifest: Path, symlin
                 missing_sources.append(str(src_img))
                 continue
             dst_img = dest / rel_dst
-            copy_or_link(src_img, dst_img, symlink)
+            copy_or_link(src_img, dst_img, symlink, relative_symlink)
             injected += 1
 
     if missing_sources:
@@ -194,7 +235,10 @@ def main():
     p.add_argument(
         "--symlink-all",
         action="store_true",
-        help="Build all dataset splits with symbolic links (useful for local calibration)",
+        help=(
+            "Build every split with symbolic links; identical existing copies are "
+            "atomically converted in place"
+        ),
     )
     args = p.parse_args()
 
@@ -224,6 +268,7 @@ def main():
         args.dest_dir,
         args.noisy_manifest,
         args.symlink or args.symlink_all,
+        relative_symlink=args.symlink_all,
     )
 
     print(f"✔ Long‑tail noisy dataset ready at {args.dest_dir}")

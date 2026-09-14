@@ -17,3 +17,4 @@ scripts/*
 !scripts/evaluate_tail_partition_guard.py
 paper/
 analysis*/
+output/
