@@ -43,7 +43,7 @@ import shutil
 import stat
 import tempfile
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Union
 
 ###############################################################################
 # Helpers
@@ -72,7 +72,9 @@ def ensure_tree_writable(path: Path):
             ensure_writable(root_path / name)
 
 
-def _replace_identical_file_with_symlink(src: Path, dst: Path, link_target: Path | str):
+def _replace_identical_file_with_symlink(
+    src: Path, dst: Path, link_target: Union[Path, str]
+):
     """Atomically replace an identical materialized copy with a symbolic link."""
     if not dst.is_file() or not filecmp.cmp(src, dst, shallow=False):
         raise FileExistsError(

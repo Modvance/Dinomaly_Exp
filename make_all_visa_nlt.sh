@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
 python convert_visa_to_mvtec_format.py \
     -s ../visa \
     -t ../visa_

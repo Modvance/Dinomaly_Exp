@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
 for seed in {01..05}; do
   python make_mvtecad_nlt.py \
